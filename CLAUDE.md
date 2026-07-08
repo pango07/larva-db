@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Vercel Blob into a small, durable SQL database — plus a Next.js 16 starter with a test dashboard used to prototype it. `LARVA-DESIGN.md` is the authoritative spec (Draft v1) and `LARVA-QUICKSTART.md` is the user-facing quickstart. Read `LARVA-DESIGN.md` before making any design or implementation decision; it records not just the chosen design but the rejected alternatives and why. Current focus: prototyping the commit protocol's conflict/retry logic (Design §6) in isolation via a concurrent-writer stress test, before any SQL-layer work.
+This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Vercel Blob into a small, durable SQL database — plus a Next.js 16 starter with a test dashboard used to prototype it. `LARVA-DESIGN.md` is the authoritative spec (Draft v1) and `LARVA-QUICKSTART.md` is the user-facing quickstart. Read `LARVA-DESIGN.md` before making any design or implementation decision; it records not just the chosen design but the rejected alternatives and why. The commit protocol (Design §6) is implemented and validated under concurrency (stress + property tests in `lib/larva/`); the SQL layer (schema API, §7-dialect parser, pruning executor, `larva()` public API in `lib/larva/sql/` and `lib/larva/db.ts`) sits on top of it. §3 of the design doc records three empirically-discovered Blob substrate behaviors the storage adapter must handle — read that before touching `storage.ts`.
 
 ## Commands
 
@@ -15,6 +15,7 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bunx tsc --noEmit` — typecheck
 - `bun scripts/stress.ts` — run the commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)
 - `bun scripts/property.ts` — property-based random-workload conflict test (same token requirement)
+- `bun scripts/sql-smoke.ts` — full v1 dialect walkthrough (parser error catalog offline, then live queries, pruning, time travel)
 - Deploy: `vercel deploy --prod --yes` (project `attentive/larva-db`, direct upload; GitHub repo is `pango07/larva-db` but is not connected to Vercel)
 
 ## Architecture (Path B — chunked storage, chosen over embedded SQLite)

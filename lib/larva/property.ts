@@ -1,4 +1,4 @@
-import { ConflictError, LarvaProto, Row, RowNotFoundError, Scalar, ulid } from "./core";
+import { ConflictError, LarvaProto, Row, RowNotFoundError, ulid } from "./core";
 import { VercelBlobAdapter } from "./storage";
 import type { Check } from "./stress";
 

@@ -3,10 +3,20 @@ import { CasConflictError, isTransientStorageError, StorageAdapter } from "./sto
 export type Scalar = string | number | boolean | null;
 export type Row = Record<string, Scalar>;
 
+/** Zone-map statistics for one chunk (Design §5): min/max of the primary key
+ * and, when the table declares one, of the partition column. */
+export interface ChunkStats {
+  pkMin: Scalar;
+  pkMax: Scalar;
+  partMin?: Scalar;
+  partMax?: Scalar;
+}
+
 export interface ChunkRef {
   id: string;
   path: string;
   rows: number;
+  stats?: ChunkStats;
 }
 
 export interface Manifest {
@@ -16,6 +26,11 @@ export interface Manifest {
    * CAS outcome was ambiguous (transient error, SDK-internal retry answered
    * with 412) discover that its own commit actually landed. */
   commitId: string;
+  /** ISO timestamp of the commit — the index for asOf() time travel. */
+  committedAt: string;
+  /** Embedded schema (serialized DatabaseSchema); absent for schemaless
+   * prototype databases created via init(). */
+  schema?: unknown;
   tables: Record<string, { chunks: ChunkRef[] }>;
 }
 
@@ -83,6 +98,16 @@ export function ulid(): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Total order over scalars of one column type; null sorts first. */
+export function cmpScalar(a: Scalar, b: Scalar): number {
+  if (a === null && b === null) return 0;
+  if (a === null) return -1;
+  if (b === null) return 1;
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "boolean" && typeof b === "boolean") return Number(a) - Number(b);
+  return String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0;
+}
+
 /** Full-jitter exponential backoff: random in [0, min(50 * 2^attempt, 5000)].
  * The cap is deliberately generous: under N-way contention Blob rejects
  * overlapping in-flight conditional writes outright, so rounds can have no
@@ -112,11 +137,13 @@ export class LarvaProto {
   }
 
   /** Create the empty database. Fails if one already exists at this prefix. */
-  async init(tables: string[]): Promise<void> {
+  async init(tables: string[], schema?: unknown): Promise<void> {
     const manifest: Manifest = {
       formatVersion: 1,
       version: 0,
       commitId: ulid(),
+      committedAt: new Date().toISOString(),
+      schema,
       tables: Object.fromEntries(tables.map((t) => [t, { chunks: [] }])),
     };
     await this.store.put(this.manifestPath(), JSON.stringify(manifest), {
@@ -131,15 +158,36 @@ export class LarvaProto {
     return { manifest: JSON.parse(res.body) as Manifest, etag: res.etag };
   }
 
-  private async stageChunk(table: string, rows: Row[]): Promise<ChunkRef> {
+  /** Stage one immutable chunk. When statsCols is given, rows are sorted by
+   * pk and zone-map min/max recorded for pruning. */
+  async stageChunk(
+    table: string,
+    rows: Row[],
+    statsCols?: { pk: string; part?: string },
+  ): Promise<ChunkRef> {
     const id = ulid();
     const path = `${this.prefix}tables/${table}/chunk_${id}.json`;
+    let stats: ChunkStats | undefined;
+    if (statsCols && rows.length > 0) {
+      const sorted = [...rows].sort((a, b) =>
+        cmpScalar(a[statsCols.pk], b[statsCols.pk]),
+      );
+      rows = sorted;
+      stats = { pkMin: sorted[0][statsCols.pk], pkMax: sorted[sorted.length - 1][statsCols.pk] };
+      if (statsCols.part) {
+        const parts = sorted.map((r) => r[statsCols.part as string]).filter((v) => v !== null);
+        if (parts.length > 0) {
+          stats.partMin = parts.reduce((a, b) => (cmpScalar(a, b) <= 0 ? a : b));
+          stats.partMax = parts.reduce((a, b) => (cmpScalar(a, b) >= 0 ? a : b));
+        }
+      }
+    }
     await this.store.put(path, JSON.stringify(rows), { createOnly: true });
-    return { id, path, rows: rows.length };
+    return { id, path, rows: rows.length, ...(stats ? { stats } : {}) };
   }
 
   /** Chunks are immutable, so the cache can never be stale. */
-  private async readChunk(ref: ChunkRef): Promise<Row[]> {
+  async readChunk(ref: ChunkRef): Promise<Row[]> {
     const cached = this.chunkCache.get(ref.path);
     if (cached) return cached;
     const res = await this.store.get(ref.path);
@@ -199,6 +247,7 @@ export class LarvaProto {
       }
       next.version = snap.manifest.version + 1;
       next.commitId = lastCommitId = ulid();
+      next.committedAt = new Date().toISOString();
 
       try {
         await this.store.put(this.manifestPath(), JSON.stringify(next), {
@@ -302,6 +351,13 @@ export class LarvaProto {
   /** Increment a counter row's value — a mutateRow convenience used by the stress harness. */
   increment(table: string, by = 1, opts?: { maxAttempts?: number }): Promise<CommitResult> {
     return this.mutateRow(table, "main", (row) => ({ ...row, value: Number(row.value) + by }), opts);
+  }
+
+  /** Fetch a retained past manifest (time travel). Null when outside retention
+   * or when the history write for that commit was lost (they are best-effort). */
+  async historyManifest(version: number): Promise<Manifest | null> {
+    const res = await this.store.get(`${this.prefix}history/manifest.v${version}.json`);
+    return res ? (JSON.parse(res.body) as Manifest) : null;
   }
 
   /** Delete every blob under this database's prefix. */
