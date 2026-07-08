@@ -62,8 +62,8 @@ jobs:
         with:
           node-version: 22
 
-      - name: Upgrade npm (OIDC trusted publishing needs >= 11.5)
-        run: npm install -g npm@latest && npm --version
+      - name: Upgrade npm (OIDC trusted publishing needs >= 11.5; pinned to 11.x)
+        run: npm install -g npm@11 && npm --version
 
       - name: Install
         run: bun install --frozen-lockfile
@@ -79,8 +79,8 @@ jobs:
             CANARY="$VERSION-canary.${{ github.run_number }}.$(git rev-parse --short HEAD)"
             echo "version $VERSION of $NAME already on npm — publishing $CANARY under the canary tag"
             npm version "$CANARY" --no-git-tag-version
-            npm publish --tag canary --access public --provenance
+            npm publish --tag canary --access public
           else
             echo "publishing $NAME@$VERSION as latest"
-            npm publish --access public --provenance
+            npm publish --access public
           fi
