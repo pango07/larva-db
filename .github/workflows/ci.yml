@@ -72,6 +72,8 @@ jobs:
       # workflow identity directly — no token to store or rotate.
       - name: Publish to npm
         working-directory: packages/larvadb
+        env:
+          NPM_CONFIG_LOGLEVEL: verbose
         run: |
           NAME=$(jq -r .name package.json)
           VERSION=$(jq -r .version package.json)
