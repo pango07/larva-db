@@ -70,17 +70,19 @@ jobs:
 
       # Auth is npm Trusted Publishing (OIDC): the registry trusts this repo's
       # workflow identity directly — no token to store or rotate.
+      #
+      # The canary bump edits package.json with jq rather than `npm version`,
+      # which would invoke arborist to reconcile workspaces and crash on the
+      # root's `workspace:*` dependency (a bun protocol npm can't resolve).
       - name: Publish to npm
         working-directory: packages/larvadb
-        env:
-          NPM_CONFIG_LOGLEVEL: verbose
         run: |
           NAME=$(jq -r .name package.json)
           VERSION=$(jq -r .version package.json)
           if npm view "$NAME@$VERSION" version > /dev/null 2>&1; then
             CANARY="$VERSION-canary.${{ github.run_number }}.$(git rev-parse --short HEAD)"
             echo "version $VERSION of $NAME already on npm — publishing $CANARY under the canary tag"
-            npm version "$CANARY" --no-git-tag-version
+            jq --arg v "$CANARY" '.version = $v' package.json > package.json.tmp && mv package.json.tmp package.json
             npm publish --tag canary --access public
           else
             echo "publishing $NAME@$VERSION as latest"
