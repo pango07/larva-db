@@ -45,6 +45,13 @@ export class ConflictError extends Error {
   }
 }
 
+export class RowNotFoundError extends Error {
+  constructor(table: string, id: string) {
+    super(`No row with id "${id}" in table "${table}"`);
+    this.name = "RowNotFoundError";
+  }
+}
+
 interface CommitPlan {
   /**
    * Try to apply this plan's change to a (possibly fresher) manifest.
@@ -247,28 +254,54 @@ export class LarvaProto {
   }
 
   /**
-   * Read-modify-write of a single-chunk counter table: every concurrent
-   * increment overlaps at the row level, forcing the re-execution path.
-   * This is the classic lost-update scenario the stress test asserts against.
+   * Read-modify-write of one row by id — the Design §5 chunk-replacement path:
+   * the chunk holding the row is retired and a rewritten copy staged in its
+   * place (updates and deletes never modify a chunk). mutate returning null
+   * deletes the row; a chunk left empty is dropped from the manifest.
+   * Concurrent mutations of rows in the same chunk overlap and force the
+   * re-execution path — the classic lost-update scenario.
    */
-  increment(table: string, by = 1, opts?: { maxAttempts?: number }): Promise<CommitResult> {
+  mutateRow(
+    table: string,
+    id: string,
+    mutate: (row: Row) => Row | null,
+    opts?: { maxAttempts?: number },
+  ): Promise<CommitResult> {
     return this.commit(async (snap) => {
       const refs = snap.manifest.tables[table]?.chunks ?? [];
-      if (refs.length !== 1) {
-        throw new Error(`counter table "${table}" must have exactly one chunk, has ${refs.length}`);
+      let retired: ChunkRef | undefined;
+      let oldRows: Row[] | undefined;
+      for (const ref of refs) {
+        const rows = await this.readChunk(ref);
+        if (rows.some((r) => r.id === id)) {
+          retired = ref;
+          oldRows = rows;
+          break;
+        }
       }
-      const retired = refs[0];
-      const [row] = await this.readChunk(retired);
-      const ref = await this.stageChunk(table, [{ ...row, value: Number(row.value) + by }]);
+      if (!retired || !oldRows) throw new RowNotFoundError(table, id);
+
+      const next = mutate(oldRows.find((r) => r.id === id) as Row);
+      const newRows =
+        next === null ? oldRows.filter((r) => r.id !== id) : oldRows.map((r) => (r.id === id ? next : r));
+      const replacement = newRows.length > 0 ? await this.stageChunk(table, newRows) : null;
+
       return {
         apply: (m) => {
           const t = m.tables[table];
-          if (!t || t.chunks.length !== 1 || t.chunks[0].id !== retired.id) return null;
-          t.chunks = [ref];
+          const idx = t?.chunks.findIndex((c) => c.id === retired.id) ?? -1;
+          if (!t || idx < 0) return null; // chunk was replaced underneath us — re-execute
+          if (replacement) t.chunks[idx] = replacement;
+          else t.chunks.splice(idx, 1);
           return m;
         },
       };
     }, opts);
+  }
+
+  /** Increment a counter row's value — a mutateRow convenience used by the stress harness. */
+  increment(table: string, by = 1, opts?: { maxAttempts?: number }): Promise<CommitResult> {
+    return this.mutateRow(table, "main", (row) => ({ ...row, value: Number(row.value) + by }), opts);
   }
 
   /** Delete every blob under this database's prefix. */

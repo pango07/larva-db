@@ -14,6 +14,8 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bun run lint` — eslint
 - `bunx tsc --noEmit` — typecheck
 - `bun scripts/stress.ts` — run the commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)
+- `bun scripts/property.ts` — property-based random-workload conflict test (same token requirement)
+- Deploy: `vercel deploy --prod --yes` (project `attentive/larva-db`, direct upload; GitHub repo is `pango07/larva-db` but is not connected to Vercel)
 
 ## Architecture (Path B — chunked storage, chosen over embedded SQLite)
 
