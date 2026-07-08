@@ -10,7 +10,7 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 
 ## Commands
 
-- `bun install` — bun is the package manager (workspace root; the library lives in `packages/larvadb`, imported as `larvadb` via tsconfig paths)
+- `bun install` — bun is the package manager (workspace root; the library lives in `packages/larvadb`, imported as `@larva-db/core` via tsconfig paths)
 - `bun run lint` — eslint
 - `bunx tsc --noEmit` — typecheck (includes `scripts/type-tests.ts`, the compile-only inference tests)
 - `bun scripts/stress.ts` — commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)

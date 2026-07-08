@@ -3,11 +3,11 @@
 **A tiny SQL database that lives inside your Vercel Blob store.** No signup, no new vendor, no server. When your app grows up, export to a bigger database with one command — that's why it's called Larva.
 
 ```bash
-npm install larvadb
+npm install @larva-db/core
 ```
 
 ```ts
-import { defineSchema, larva, t } from "larvadb";
+import { defineSchema, larva, t } from "@larva-db/core";
 
 const schema = defineSchema({
   customers: {

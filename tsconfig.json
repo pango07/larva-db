@@ -20,8 +20,8 @@
     ],
     "paths": {
       "@/*": ["./*"],
-      "larvadb": ["./packages/larvadb/src/index.ts"],
-      "larvadb/testing": ["./packages/larvadb/src/testing/index.ts"]
+      "@larva-db/core": ["./packages/larvadb/src/index.ts"],
+      "@larva-db/core/testing": ["./packages/larvadb/src/testing/index.ts"]
     }
   },
   "include": [

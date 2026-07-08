@@ -6,7 +6,7 @@
  *
  * Requires BLOB_READ_WRITE_TOKEN (bun auto-loads .env.local).
  */
-import { runStress, DEFAULTS, StressConfig } from "larvadb/testing";
+import { runStress, DEFAULTS, StressConfig } from "@larva-db/core/testing";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);

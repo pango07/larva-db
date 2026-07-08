@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import type { Scalar } from "larvadb";
+import type { Scalar } from "@larva-db/core";
 
 interface SqlResult {
   rows: Record<string, Scalar>[];

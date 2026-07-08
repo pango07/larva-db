@@ -5,8 +5,8 @@
  *
  *   bun scripts/api-smoke.ts
  */
-import { ulid } from "larvadb";
-import { defineSchema, larva, SqlError, t } from "larvadb";
+import { ulid } from "@larva-db/core";
+import { defineSchema, larva, SqlError, t } from "@larva-db/core";
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
   console.error("BLOB_READ_WRITE_TOKEN is not set. Run: vercel env pull .env.local");

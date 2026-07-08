@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { SchemaError, SqlError } from "larvadb";
+import { SchemaError, SqlError } from "@larva-db/core";
 import { demoDb } from "@/app/lib/demo";
 
 export const maxDuration = 60;

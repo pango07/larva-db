@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { StressConfig, StressReport } from "larvadb/testing";
+import type { StressConfig, StressReport } from "@larva-db/core/testing";
 import { Console } from "./console";
 
 type Mode = StressConfig["mode"];

@@ -3,13 +3,13 @@
 **A tiny SQL database that lives inside your Vercel Blob store.** No signup, no new vendor, no server, no connection string. When your app grows up, export to a bigger database with one command — that's why it's called Larva.
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/larvadb)](https://www.npmjs.com/package/larvadb)
+[![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
 [![test checks](https://img.shields.io/badge/test_checks-95_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```ts
-import { defineSchema, larva, t } from "larvadb";
+import { defineSchema, larva, t } from "@larva-db/core";
 
 const schema = defineSchema({
   customers: {
@@ -70,7 +70,7 @@ await db.vacuum();                     // reclaim storage outside retention
 ### Typed rows
 
 ```ts
-import type { InferRow } from "larvadb";
+import type { InferRow } from "@larva-db/core";
 
 type Customer = InferRow<typeof schema, "customers">;
 // { id: string; name: string | null; email: string | null; createdAt: string | null }
@@ -83,7 +83,7 @@ const rows = await db.sql<Customer>`SELECT * FROM customers`;
 Vercel Blob is the default, but the storage contract is four operations, so the same database runs on AWS S3 or Cloudflare R2 — zero extra dependencies:
 
 ```ts
-import { larva, S3Adapter } from "larvadb";
+import { larva, S3Adapter } from "@larva-db/core";
 
 const db = larva({
   schema,

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { runStress, StressConfig } from "larvadb/testing";
+import { runStress, StressConfig } from "@larva-db/core/testing";
 
 export const maxDuration = 300;
 

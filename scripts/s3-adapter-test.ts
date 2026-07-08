@@ -9,8 +9,8 @@
  *
  *   bun scripts/s3-adapter-test.ts
  */
-import { CasConflictError, defineSchema, larva, S3Adapter, t } from "larvadb";
-import { runStress } from "larvadb/testing";
+import { CasConflictError, defineSchema, larva, S3Adapter, t } from "@larva-db/core";
+import { runStress } from "@larva-db/core/testing";
 
 let passed = 0;
 let failed = 0;

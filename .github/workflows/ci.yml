@@ -75,13 +75,14 @@ jobs:
             echo "::notice::NPM_TOKEN secret not set — skipping publish. Create an automation token (npmjs.com -> Access Tokens) and add it: gh secret set NPM_TOKEN"
             exit 0
           fi
+          NAME=$(jq -r .name package.json)
           VERSION=$(jq -r .version package.json)
-          if npm view "larvadb@$VERSION" version > /dev/null 2>&1; then
+          if npm view "$NAME@$VERSION" version > /dev/null 2>&1; then
             CANARY="$VERSION-canary.${{ github.run_number }}.$(git rev-parse --short HEAD)"
-            echo "version $VERSION already on npm — publishing $CANARY under the canary tag"
+            echo "version $VERSION of $NAME already on npm — publishing $CANARY under the canary tag"
             npm version "$CANARY" --no-git-tag-version
             npm publish --tag canary --access public --provenance
           else
-            echo "publishing larvadb@$VERSION as latest"
+            echo "publishing $NAME@$VERSION as latest"
             npm publish --access public --provenance
           fi

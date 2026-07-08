@@ -3,7 +3,7 @@
  * typechecked (bunx tsc --noEmit). Every line here failing to compile is a
  * regression; every @ts-expect-error compiling is one too.
  */
-import { defineSchema, InferRow, larva, t } from "larvadb";
+import { defineSchema, InferRow, larva, t } from "@larva-db/core";
 
 const schema = defineSchema({
   customers: {

@@ -4,7 +4,7 @@
  *
  *   bun scripts/property.ts --writers 8 --ops 25
  */
-import { PROPERTY_DEFAULTS, runProperty } from "larvadb/testing";
+import { PROPERTY_DEFAULTS, runProperty } from "@larva-db/core/testing";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);

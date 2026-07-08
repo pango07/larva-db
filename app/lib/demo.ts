@@ -1,4 +1,4 @@
-import { defineSchema, larva, LarvaDb, t } from "larvadb";
+import { defineSchema, larva, LarvaDb, t } from "@larva-db/core";
 
 /** The demo database behind the SQL console — quickstart schema, seeded. */
 export const demoSchema = defineSchema({
