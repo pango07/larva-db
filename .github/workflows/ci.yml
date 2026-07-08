@@ -61,20 +61,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm (OIDC trusted publishing needs >= 11.5)
+        run: npm install -g npm@latest && npm --version
 
       - name: Install
         run: bun install --frozen-lockfile
 
+      # Auth is npm Trusted Publishing (OIDC): the registry trusts this repo's
+      # workflow identity directly — no token to store or rotate.
       - name: Publish to npm
         working-directory: packages/larvadb
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::notice::NPM_TOKEN secret not set — skipping publish. Create an automation token (npmjs.com -> Access Tokens) and add it: gh secret set NPM_TOKEN"
-            exit 0
-          fi
           NAME=$(jq -r .name package.json)
           VERSION=$(jq -r .version package.json)
           if npm view "$NAME@$VERSION" version > /dev/null 2>&1; then
