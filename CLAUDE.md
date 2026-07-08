@@ -10,13 +10,15 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 
 ## Commands
 
-- `bun install` — bun is the package manager for this repo
+- `bun install` — bun is the package manager (workspace root; the library lives in `packages/larvadb`, imported as `larvadb` via tsconfig paths)
 - `bun run lint` — eslint
-- `bunx tsc --noEmit` — typecheck
-- `bun scripts/stress.ts` — run the commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)
+- `bunx tsc --noEmit` — typecheck (includes `scripts/type-tests.ts`, the compile-only inference tests)
+- `bun scripts/stress.ts` — commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)
 - `bun scripts/property.ts` — property-based random-workload conflict test (same token requirement)
 - `bun scripts/sql-smoke.ts` — full v1 dialect walkthrough (parser error catalog offline, then live queries, pruning, time travel)
 - `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite), vacuum retention
+- `bun scripts/s3-adapter-test.ts` — S3Adapter contract + stress harness over an in-process fake S3 with 409/500 chaos injection (no credentials needed)
+- `bun run --cwd packages/larvadb build` — build the npm package (bundle + d.ts); `npm pack --dry-run` there to inspect the tarball. Do not `npm publish` without the user's explicit go-ahead.
 - Deploy: `vercel deploy --prod --yes` (project `attentive/larva-db`, direct upload; GitHub repo is `pango07/larva-db` but is not connected to Vercel)
 
 ## Architecture (Path B — chunked storage, chosen over embedded SQLite)

@@ -5,8 +5,8 @@
  *
  *   bun scripts/api-smoke.ts
  */
-import { ulid } from "../lib/larva/core";
-import { defineSchema, larva, SqlError, t } from "../lib/larva";
+import { ulid } from "larvadb";
+import { defineSchema, larva, SqlError, t } from "larvadb";
 
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
   console.error("BLOB_READ_WRITE_TOKEN is not set. Run: vercel env pull .env.local");
@@ -98,8 +98,7 @@ ok(
 );
 const sqliteBytes = await db.export({ format: "sqlite" });
 ok("sqlite export is a real SQLite file", new TextDecoder().decode(sqliteBytes.slice(0, 15)) === "SQLite format 3");
-// @ts-expect-error bun-only module; this script runs under Bun
-const { Database } = (await import("bun:sqlite")) as {
+const { Database } = (await import("bun:sqlite")) as unknown as {
   Database: { deserialize(bytes: Uint8Array): { prepare(sql: string): { get(): unknown } } };
 };
 const reopened = Database.deserialize(sqliteBytes);

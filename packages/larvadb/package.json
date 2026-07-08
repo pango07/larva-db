@@ -1,0 +1,31 @@
+{
+  "name": "larvadb",
+  "version": "0.1.0",
+  "description": "A tiny SQL database that lives inside your Vercel Blob store. Real SQL, atomic transactions, time travel, and a guaranteed exit path when you outgrow it.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pango07/larva-db.git",
+    "directory": "packages/larvadb"
+  },
+  "keywords": ["database", "sql", "vercel", "blob", "serverless", "sqlite", "s3", "r2"],
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/types/testing/index.d.ts",
+      "default": "./dist/testing.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "rm -rf dist && bun build src/index.ts --outfile dist/index.js --target node --format esm --external '@vercel/blob' && bun build src/testing/index.ts --outfile dist/testing.js --target node --format esm --external '@vercel/blob' && tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.6.1"
+  }
+}

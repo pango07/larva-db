@@ -37,16 +37,20 @@ export class SchemaError extends Error {
   }
 }
 
-export class ColumnBuilder {
+/** Carries the column's TypeScript value type as a phantom, so row types can
+ * be inferred from the schema (see InferTables / InferRow). Columns are
+ * nullable by default; primaryKey() removes null. */
+export class ColumnBuilder<T> {
+  declare readonly $type: T;
   private def: ColumnDef;
 
   constructor(type: ColumnType) {
     this.def = { type, primaryKey: false, unique: false, partitionBy: false };
   }
 
-  primaryKey(): this {
+  primaryKey(): ColumnBuilder<NonNullable<T>> {
     this.def.primaryKey = true;
-    return this;
+    return this as unknown as ColumnBuilder<NonNullable<T>>;
   }
 
   unique(): this {
@@ -71,11 +75,11 @@ export class ColumnBuilder {
 }
 
 export const t = {
-  text: () => new ColumnBuilder("text"),
-  integer: () => new ColumnBuilder("integer"),
-  real: () => new ColumnBuilder("real"),
-  boolean: () => new ColumnBuilder("boolean"),
-  timestamp: () => new ColumnBuilder("timestamp"),
+  text: () => new ColumnBuilder<string | null>("text"),
+  integer: () => new ColumnBuilder<number | null>("integer"),
+  real: () => new ColumnBuilder<number | null>("real"),
+  boolean: () => new ColumnBuilder<boolean | null>("boolean"),
+  timestamp: () => new ColumnBuilder<string | null>("timestamp"),
   json: (): never => {
     throw new SchemaError(
       "UNSUPPORTED_COLUMN_TYPE",
@@ -84,7 +88,29 @@ export const t = {
   },
 };
 
-export function defineSchema(spec: Record<string, Record<string, ColumnBuilder>>): DatabaseSchema {
+type SchemaSpec = Record<string, Record<string, ColumnBuilder<unknown>>>;
+
+/** What defineSchema returns: the runtime DatabaseSchema plus a phantom brand
+ * carrying the spec's types, so InferRow/InferTables can read them back. */
+export type TypedSchema<S extends SchemaSpec = SchemaSpec> = DatabaseSchema & {
+  readonly "~spec": S;
+};
+
+/** Row types inferred from a defineSchema() result.
+ * Note: a table with no declared primary key gets an implicit `id: string`
+ * column at runtime that inference cannot see — declare it for typed rows. */
+export type InferTables<TSchema extends TypedSchema> = {
+  [T in keyof TSchema["~spec"]]: {
+    [C in keyof TSchema["~spec"][T]]: TSchema["~spec"][T][C] extends ColumnBuilder<infer V> ? V : never;
+  };
+};
+
+export type InferRow<
+  TSchema extends TypedSchema,
+  T extends keyof TSchema["~spec"],
+> = InferTables<TSchema>[T];
+
+export function defineSchema<S extends SchemaSpec>(spec: S): TypedSchema<S> {
   const schema: DatabaseSchema = {};
   for (const [table, cols] of Object.entries(spec)) {
     const columns: Record<string, ColumnDef> = {};
@@ -114,7 +140,7 @@ export function defineSchema(spec: Record<string, Record<string, ColumnBuilder>>
 
     schema[table] = { columns, primaryKey, partitionColumn: parts[0]?.[0] };
   }
-  return schema;
+  return schema as TypedSchema<S>;
 }
 
 const typeOk = (type: ColumnType, v: Scalar): boolean => {

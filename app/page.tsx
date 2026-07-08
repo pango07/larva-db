@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { StressConfig, StressReport } from "@/lib/larva/stress";
+import type { StressConfig, StressReport } from "larvadb/testing";
+import { Console } from "./console";
 
 type Mode = StressConfig["mode"];
 
@@ -52,14 +53,25 @@ export default function Home() {
     <main className="mx-auto w-full max-w-4xl flex-1 px-6 py-10">
       <header className="mb-8">
         <h1 className="text-2xl font-semibold tracking-tight">
-          Larva <span className="text-ink-muted font-normal">/ commit-protocol stress lab</span>
+          Larva <span className="text-ink-muted font-normal">/ test lab</span>
         </h1>
         <p className="text-ink-secondary mt-2 max-w-2xl text-sm leading-relaxed">
-          Concurrent writers hammer one Larva database on Vercel Blob — appends exercise the
-          rebase path, shared-counter increments force full re-execution — then the final state is
-          audited for lost updates, duplicates, and version drift. Design §6, tested for real.
+          A SQL database living entirely inside Vercel Blob storage. Try the dialect in the
+          console, export the escape hatch, then hammer the commit protocol with concurrent
+          writers below.
         </p>
       </header>
+
+      <Console />
+
+      <h2 className="text-ink-secondary mt-10 mb-3 text-sm font-medium tracking-wide uppercase">
+        Commit-protocol stress lab
+      </h2>
+      <p className="text-ink-secondary mb-4 max-w-2xl text-sm leading-relaxed">
+        Concurrent writers hammer one Larva database — appends exercise the rebase path,
+        shared-counter increments force full re-execution — then the final state is audited for
+        lost updates, duplicates, and version drift. Design §6, tested for real.
+      </p>
 
       <section className="border-hairline bg-surface rounded-xl border p-5">
         <div className="flex flex-wrap items-end gap-4">

@@ -25,14 +25,16 @@ await db.export({ format: "sqlite" }); // the escape hatch
 await db.vacuum();                     // reclaim storage outside retention
 ```
 
-- `lib/larva/storage.ts` — the four-operation `StorageAdapter` contract + Vercel Blob implementation (`ifMatch` CAS, conflict classification, weak-ETag normalization, transient-error retry)
-- `lib/larva/core.ts` — manifest with zone-map chunk statistics, immutable chunks, the stage → CAS → rebase/re-execute/backoff commit loop with ambiguous-outcome reconciliation via `commitId`, and row-level insert/update/delete by chunk replacement
-- `lib/larva/schema.ts` — `defineSchema` / `t` code-first schema, validation, drift detection
-- `lib/larva/sql/` — lexer, hand-written parser for the v1 dialect (every exclusion rejected by name with an alternative), executor with zone-map pruning
-- `lib/larva/db.ts` — the public API: `larva()`, `db.sql` tagged template, `db.query`, `db.transaction`, `asOf`, `rollbackTo`, `export`, `vacuum`
-- `lib/larva/stress.ts` / `lib/larva/property.ts` — concurrent-writer stress harness and property-based random-workload test (Design §14)
-- `scripts/stress.ts`, `scripts/property.ts`, `scripts/sql-smoke.ts`, `scripts/api-smoke.ts` — CLI runners
-- `app/` — Next.js 16 test dashboard ("stress lab") to run and visualize stress tests
+- `packages/larvadb/` — **the `larvadb` npm package** (bun workspace; builds to a 35 kB tarball with full type declarations)
+  - `src/storage.ts` — the four-operation `StorageAdapter` contract + Vercel Blob implementation (`ifMatch` CAS, conflict classification, weak-ETag normalization, transient-error retry)
+  - `src/adapters/s3.ts` — `S3Adapter` for AWS S3 / Cloudflare R2: zero-dependency SigV4 signing, conditional writes (`If-Match` / `If-None-Match: *`), 412/409 conflict mapping
+  - `src/core.ts` — manifest with zone-map chunk statistics, immutable chunks, the stage → CAS → rebase/re-execute/backoff commit loop with ambiguous-outcome reconciliation via `commitId`, row-level mutation by chunk replacement
+  - `src/schema.ts` — `defineSchema` / `t` code-first schema with **typed row inference** (`InferRow<typeof schema, "customers">`), validation, drift detection
+  - `src/sql/` — lexer, hand-written parser for the v1 dialect (every exclusion rejected by name with an alternative), executor with zone-map pruning
+  - `src/db.ts` — the §13 public API: `larva()`, `db.sql`, `db.query`, `db.transaction`, `asOf`, `rollbackTo`, `export`, `vacuum`
+  - `src/testing/` — stress + property harnesses, published as `larvadb/testing`
+- `scripts/` — CLI runners: `stress`, `property`, `sql-smoke`, `api-smoke`, `s3-adapter-test` (fake S3 with chaos injection), `type-tests` (compile-only)
+- `app/` — Next.js 16 test dashboard: SQL console over a seeded demo database (with JSON/CSV export) + the commit-protocol stress lab
 
 ## Running
 

@@ -146,9 +146,7 @@ export class LarvaProto {
       schema,
       tables: Object.fromEntries(tables.map((t) => [t, { chunks: [] }])),
     };
-    await this.store.put(this.manifestPath(), JSON.stringify(manifest), {
-      createOnly: true,
-    });
+    await this.putCreateOnly(this.manifestPath(), JSON.stringify(manifest));
   }
 
   /** Fetch the manifest fresh from origin. Pins a consistent snapshot. */
@@ -182,8 +180,34 @@ export class LarvaProto {
         }
       }
     }
-    await this.store.put(path, JSON.stringify(rows), { createOnly: true });
+    await this.putCreateOnly(path, JSON.stringify(rows));
     return { id, path, rows: rows.length, ...(stats ? { stats } : {}) };
+  }
+
+  /**
+   * Create-only put with retry, for objects whose names are never reused
+   * (ULID chunk paths, first manifest at a prefix). A conflict is either a
+   * spurious in-flight rejection (retry) or our own earlier attempt having
+   * landed (verify content, accept); transient errors retry — createOnly
+   * makes re-sending safe.
+   */
+  private async putCreateOnly(path: string, body: string): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.store.put(path, body, { createOnly: true });
+        return;
+      } catch (err) {
+        const conflict = err instanceof CasConflictError;
+        if (!conflict && !isTransientStorageError(err)) throw err;
+        if (conflict) {
+          const existing = await this.store.get(path);
+          if (existing?.body === body) return;
+          if (existing) throw err; // genuinely taken by different content
+        }
+        if (attempt >= 6) throw err;
+        await sleep(backoffMs(attempt));
+      }
+    }
   }
 
   /** Chunks are immutable, so the cache can never be stale. */

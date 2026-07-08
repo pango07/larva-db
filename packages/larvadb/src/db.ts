@@ -25,11 +25,11 @@ export class LarvaTx {
     private baseOpts: ExecOptions,
   ) {}
 
-  sql = (strings: TemplateStringsArray, ...values: Scalar[]): Promise<Row[]> =>
-    this.query(strings.join("?"), values);
+  sql = <T extends Row = Row>(strings: TemplateStringsArray, ...values: Scalar[]): Promise<T[]> =>
+    this.query<T>(strings.join("?"), values);
 
-  async query(text: string, params: Scalar[] = [], opts: ExecOptions = {}): Promise<Row[]> {
-    return this.executor.executeInTx(
+  async query<T extends Row = Row>(text: string, params: Scalar[] = [], opts: ExecOptions = {}): Promise<T[]> {
+    return (await this.executor.executeInTx(
       parse(text),
       params,
       { ...this.baseOpts, ...opts },
@@ -40,7 +40,7 @@ export class LarvaTx {
         this.state.manifest = next;
         this.state.applies.push(apply);
       },
-    );
+    )) as T[];
   }
 }
 
@@ -64,15 +64,15 @@ export class LarvaSnapshot {
     return this.snap.manifest.version;
   }
 
-  sql = (strings: TemplateStringsArray, ...values: Scalar[]): Promise<Row[]> =>
-    this.query(strings.join("?"), values);
+  sql = <T extends Row = Row>(strings: TemplateStringsArray, ...values: Scalar[]): Promise<T[]> =>
+    this.query<T>(strings.join("?"), values);
 
-  async query(text: string, params: Scalar[] = []): Promise<Row[]> {
+  async query<T extends Row = Row>(text: string, params: Scalar[] = []): Promise<T[]> {
     const stmt = parse(text);
     if (stmt.kind !== "select") {
       throw new SqlError("READ_ONLY", `asOf() snapshots are read-only; run ${stmt.kind.toUpperCase()} against the live database (or rollbackTo this version first)`);
     }
-    return this.executor.execute(stmt, params, {}, this.snap);
+    return (await this.executor.execute(stmt, params, {}, this.snap)) as T[];
   }
 }
 
@@ -137,14 +137,15 @@ export class LarvaDb {
     }
   }
 
-  /** Primary API: tagged template with automatic parameterization (Design §11). */
-  sql = (strings: TemplateStringsArray, ...values: Scalar[]): Promise<Row[]> =>
-    this.query(strings.join("?"), values);
+  /** Primary API: tagged template with automatic parameterization (Design §11).
+   * Type rows with InferRow: db.sql<InferRow<typeof schema, "customers">>`...` */
+  sql = <T extends Row = Row>(strings: TemplateStringsArray, ...values: Scalar[]): Promise<T[]> =>
+    this.query<T>(strings.join("?"), values);
 
   /** Raw string + positional ? params. Prefer db.sql`...` — it parameterizes for you. */
-  async query(text: string, params: Scalar[] = [], opts: ExecOptions = {}): Promise<Row[]> {
+  async query<T extends Row = Row>(text: string, params: Scalar[] = [], opts: ExecOptions = {}): Promise<T[]> {
     await this.ensureReady();
-    return this.executor.execute(parse(text), params, opts);
+    return (await this.executor.execute(parse(text), params, opts)) as T[];
   }
 
   /**

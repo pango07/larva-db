@@ -1,5 +1,5 @@
-import { ConflictError, LarvaProto, Row, RowNotFoundError, ulid } from "./core";
-import { VercelBlobAdapter } from "./storage";
+import { ConflictError, LarvaProto, Row, RowNotFoundError, ulid } from "../core";
+import { StorageAdapter, VercelBlobAdapter } from "../storage";
 import type { Check } from "./stress";
 
 /**
@@ -59,11 +59,12 @@ const randInt = (n: number) => Math.floor(Math.random() * n);
 export async function runProperty(
   overrides: Partial<PropertyConfig> = {},
   log: (msg: string) => void = () => {},
+  store: StorageAdapter = new VercelBlobAdapter(),
 ): Promise<PropertyReport> {
   const config: PropertyConfig = { ...PROPERTY_DEFAULTS, ...overrides };
   const runId = ulid();
   const prefix = `property/${runId}/`;
-  const db = new LarvaProto(new VercelBlobAdapter(), prefix);
+  const db = new LarvaProto(store, prefix);
 
   log(`run ${runId}: init db at ${prefix}`);
   await db.init(["rows", "hot"]);

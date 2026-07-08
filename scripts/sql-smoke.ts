@@ -4,9 +4,9 @@
  *
  *   bun scripts/sql-smoke.ts
  */
-import { ulid } from "../lib/larva/core";
-import { defineSchema, larva, SqlError, t } from "../lib/larva";
-import { parse } from "../lib/larva/sql/parser";
+import { ulid } from "larvadb";
+import { defineSchema, larva, SqlError, t } from "larvadb";
+import { parse } from "larvadb";
 
 let passed = 0;
 let failed = 0;

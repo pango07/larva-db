@@ -1,5 +1,5 @@
-import { CommitStats, ConflictError, LarvaProto, Row, ulid } from "./core";
-import { VercelBlobAdapter } from "./storage";
+import { CommitStats, ConflictError, LarvaProto, Row, ulid } from "../core";
+import { StorageAdapter, VercelBlobAdapter } from "../storage";
 
 export interface StressConfig {
   writers: number;
@@ -66,11 +66,12 @@ interface WriterOutcome {
 export async function runStress(
   overrides: Partial<StressConfig> = {},
   log: (msg: string) => void = () => {},
+  store: StorageAdapter = new VercelBlobAdapter(),
 ): Promise<StressReport> {
   const config: StressConfig = { ...DEFAULTS, ...overrides };
   const runId = ulid();
   const prefix = `stress/${runId}/`;
-  const db = new LarvaProto(new VercelBlobAdapter(), prefix);
+  const db = new LarvaProto(store, prefix);
 
   log(`run ${runId}: init db at ${prefix}`);
   await db.init(["events", "counters"]);
