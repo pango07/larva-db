@@ -125,7 +125,7 @@ export class LarvaProto {
   private chunkCache = new Map<string, Row[]>();
 
   constructor(
-    private store: StorageAdapter,
+    readonly store: StorageAdapter,
     /** Blob-path prefix this database lives under, e.g. "stress/01H.../". */
     readonly prefix: string,
     /** Optional per-attempt trace hook for debugging the commit loop. */
@@ -362,7 +362,7 @@ export class LarvaProto {
 
   /** Delete every blob under this database's prefix. */
   async destroy(): Promise<void> {
-    const paths = await this.store.list(this.prefix);
-    await this.store.del(paths);
+    const objects = await this.store.list(this.prefix);
+    await this.store.del(objects.map((o) => o.path));
   }
 }

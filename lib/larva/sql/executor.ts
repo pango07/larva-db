@@ -28,6 +28,14 @@ export interface QueryStats {
 /** alias/table name → current row, for expression evaluation across a join */
 type Ctx = Record<string, Row>;
 
+/** A staged write: chunks are already on Blob; apply re-points a manifest at
+ * them (returning null when the touched data changed — re-execute). rows are
+ * the RETURNING projection. */
+export interface PlanOutcome {
+  apply: (m: Manifest) => Manifest | null;
+  rows: Row[];
+}
+
 export class Executor {
   /** Pruning stats of the most recent table fetch — used by tests and curious users. */
   lastStats: QueryStats = { chunksTotal: 0, chunksFetched: 0 };
@@ -47,19 +55,45 @@ export class Executor {
   }
 
   async execute(stmt: Statement, params: Scalar[], opts: ExecOptions, snap?: Snapshot): Promise<Row[]> {
+    if (stmt.kind === "select") return this.select(stmt, params, snap ?? (await this.proto.snapshot()));
+    // Single-statement write: plan against each (re)fetched snapshot, one CAS.
+    let rows: Row[] = [];
+    await this.proto.commit(async (s) => {
+      const plan = await this.plan(stmt, params, opts, s);
+      rows = plan.rows;
+      return { apply: plan.apply };
+    }, opts);
+    return rows;
+  }
+
+  /** Execute one statement inside a transaction, against its virtual snapshot. */
+  async executeInTx(
+    stmt: Statement,
+    params: Scalar[],
+    opts: ExecOptions,
+    snap: Snapshot,
+    record: (apply: PlanOutcome["apply"]) => void,
+  ): Promise<Row[]> {
+    if (stmt.kind === "select") return this.select(stmt, params, snap);
+    const plan = await this.plan(stmt, params, opts, snap);
+    record(plan.apply);
+    return plan.rows;
+  }
+
+  private plan(stmt: Statement, params: Scalar[], opts: ExecOptions, snap: Snapshot): Promise<PlanOutcome> {
     switch (stmt.kind) {
       case "select":
-        return this.select(stmt, params, snap ?? (await this.proto.snapshot()));
+        throw new SqlError("PARSE_ERROR", "SELECT has no write plan"); // unreachable
       case "insert":
-        return this.insert(stmt, params, opts);
+        return this.planInsert(stmt, params, snap);
       case "update":
-        return this.update(stmt, params, opts);
+        return this.planUpdate(stmt, params, opts, snap);
       case "delete":
-        return this.delete(stmt, params, opts);
+        return this.planDelete(stmt, params, opts, snap);
       case "create":
-        return this.createTable(stmt, opts);
+        return this.planCreate(stmt, snap);
       case "drop":
-        return this.dropTable(stmt.table, opts);
+        return this.planDrop(stmt.table, snap);
     }
   }
 
@@ -450,11 +484,10 @@ export class Executor {
     });
   }
 
-  private async insert(stmt: InsertStmt, params: Scalar[], opts: ExecOptions): Promise<Row[]> {
-    let inserted: Row[] = [];
-    await this.proto.commit(async (snap) => {
+  private async planInsert(stmt: InsertStmt, params: Scalar[], snap: Snapshot): Promise<PlanOutcome> {
+    {
       const schema = this.schemaOf(snap.manifest, stmt.table);
-      inserted = stmt.rows.map((values) => {
+      const inserted: Row[] = stmt.rows.map((values) => {
         const raw: Row = {};
         stmt.columns.forEach((col, i) => {
           raw[col] = this.evalExpr(values[i], {}, params);
@@ -499,13 +532,13 @@ export class Executor {
           t.chunks.push(...refs);
           return m;
         },
+        rows: this.returningRows(inserted, stmt.returning, stmt.table),
       };
-    }, opts);
-    return this.returningRows(inserted, stmt.returning, stmt.table);
+    }
   }
 
-  private async update(stmt: UpdateStmt, params: Scalar[], opts: ExecOptions): Promise<Row[]> {
-    return this.rewrite(stmt.table, stmt.where, opts, stmt.returning, (row, schema) => {
+  private async planUpdate(stmt: UpdateStmt, params: Scalar[], opts: ExecOptions, snap: Snapshot): Promise<PlanOutcome> {
+    return this.planRewrite(snap, stmt.table, stmt.where, opts, stmt.returning, (row, schema) => {
       const next = { ...row };
       for (const { column, value } of stmt.set) {
         if (!(column in schema.columns)) {
@@ -521,12 +554,13 @@ export class Executor {
     }, params, "UPDATE");
   }
 
-  private async delete(stmt: DeleteStmt, params: Scalar[], opts: ExecOptions): Promise<Row[]> {
-    return this.rewrite(stmt.table, stmt.where, opts, stmt.returning, () => null, params, "DELETE");
+  private async planDelete(stmt: DeleteStmt, params: Scalar[], opts: ExecOptions, snap: Snapshot): Promise<PlanOutcome> {
+    return this.planRewrite(snap, stmt.table, stmt.where, opts, stmt.returning, () => null, params, "DELETE");
   }
 
   /** Shared UPDATE/DELETE path: rewrite every chunk containing affected rows. */
-  private async rewrite(
+  private async planRewrite(
+    snap: Snapshot,
     table: string,
     where: Expr | undefined,
     opts: ExecOptions,
@@ -534,18 +568,17 @@ export class Executor {
     transform: (row: Row, schema: TableSchema) => Row | null,
     params: Scalar[],
     verb: string,
-  ): Promise<Row[]> {
+  ): Promise<PlanOutcome> {
     if (!where && !opts.allowFullTable) {
       throw new SqlError(
         "MISSING_WHERE",
         `${verb} without a WHERE clause affects every row in "${table}"; pass { allowFullTable: true } if that is intended`,
       );
     }
-    let affected: Row[] = [];
-    await this.proto.commit(async (snap) => {
+    {
       const schema = this.schemaOf(snap.manifest, table);
       const chunks = await this.fetchTable(snap, table, schema, where, table, params);
-      affected = [];
+      const affected: Row[] = [];
       const replacements: { retired: ChunkRef; replacement: ChunkRef | null }[] = [];
       const statsCols = { pk: schema.primaryKey, part: schema.partitionColumn };
 
@@ -590,14 +623,14 @@ export class Executor {
           }
           return m;
         },
+        rows: this.returningRows(affected, returning, table),
       };
-    }, opts);
-    return this.returningRows(affected, returning, table);
+    }
   }
 
   // ---------- DDL ----------
 
-  private async createTable(stmt: Extract<Statement, { kind: "create" }>, opts: ExecOptions): Promise<Row[]> {
+  private async planCreate(stmt: Extract<Statement, { kind: "create" }>, snap: Snapshot): Promise<PlanOutcome> {
     const TYPES: Record<string, "text" | "integer" | "real" | "boolean" | "timestamp"> = {
       text: "text", varchar: "text", integer: "integer", int: "integer", real: "real",
       float: "real", double: "real", boolean: "boolean", bool: "boolean",
@@ -618,37 +651,33 @@ export class Executor {
     }
     const tableSchema: TableSchema = { columns, primaryKey: pks[0]?.name ?? "id" };
 
-    await this.proto.commit(async (snap) => {
-      if (snap.manifest.tables[stmt.table]) {
-        throw new SqlError("TABLE_EXISTS", `table "${stmt.table}" already exists`);
-      }
-      return {
-        apply: (m) => {
-          if (m.tables[stmt.table]) return null;
-          m.tables[stmt.table] = { chunks: [] };
-          m.schema = { ...((m.schema ?? {}) as DatabaseSchema), [stmt.table]: tableSchema };
-          return m;
-        },
-      };
-    }, opts);
-    return [];
+    if (snap.manifest.tables[stmt.table]) {
+      throw new SqlError("TABLE_EXISTS", `table "${stmt.table}" already exists`);
+    }
+    return {
+      apply: (m) => {
+        if (m.tables[stmt.table]) return null;
+        m.tables[stmt.table] = { chunks: [] };
+        m.schema = { ...((m.schema ?? {}) as DatabaseSchema), [stmt.table]: tableSchema };
+        return m;
+      },
+      rows: [],
+    };
   }
 
-  private async dropTable(table: string, opts: ExecOptions): Promise<Row[]> {
-    await this.proto.commit(async (snap) => {
-      this.schemaOf(snap.manifest, table); // throws UNKNOWN_TABLE
-      return {
-        apply: (m) => {
-          if (!m.tables[table]) return null;
-          delete m.tables[table];
-          const schema = { ...((m.schema ?? {}) as DatabaseSchema) };
-          delete schema[table];
-          m.schema = schema;
-          return m;
-        },
-      };
-    }, opts);
-    return [];
+  private async planDrop(table: string, snap: Snapshot): Promise<PlanOutcome> {
+    this.schemaOf(snap.manifest, table); // throws UNKNOWN_TABLE
+    return {
+      apply: (m) => {
+        if (!m.tables[table]) return null;
+        delete m.tables[table];
+        const schema = { ...((m.schema ?? {}) as DatabaseSchema) };
+        delete schema[table];
+        m.schema = schema;
+        return m;
+      },
+      rows: [],
+    };
   }
 }
 

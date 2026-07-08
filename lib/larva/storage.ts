@@ -24,6 +24,11 @@ export interface GetResult {
   etag: string;
 }
 
+export interface ListedObject {
+  path: string;
+  uploadedAt: Date;
+}
+
 /**
  * Blob GETs return a weak ETag (W/"...") once the response is large enough to
  * be served gzip-transformed. A weak ETag never satisfies ifMatch, so using it
@@ -59,7 +64,7 @@ export interface StorageAdapter {
   get(path: string, opts?: { fresh?: boolean }): Promise<GetResult | null>;
   put(path: string, body: string, opts?: PutOptions): Promise<{ etag: string }>;
   del(paths: string[]): Promise<void>;
-  list(prefix: string): Promise<string[]>;
+  list(prefix: string): Promise<ListedObject[]>;
 }
 
 export class VercelBlobAdapter implements StorageAdapter {
@@ -109,18 +114,19 @@ export class VercelBlobAdapter implements StorageAdapter {
   }
 
   async del(paths: string[]): Promise<void> {
-    if (paths.length === 0) return;
-    await blobDel(paths);
+    for (let i = 0; i < paths.length; i += 100) {
+      await blobDel(paths.slice(i, i + 100));
+    }
   }
 
-  async list(prefix: string): Promise<string[]> {
-    const paths: string[] = [];
+  async list(prefix: string): Promise<ListedObject[]> {
+    const objects: ListedObject[] = [];
     let cursor: string | undefined;
     do {
       const page = await blobList({ prefix, cursor });
-      paths.push(...page.blobs.map((b) => b.pathname));
+      objects.push(...page.blobs.map((b) => ({ path: b.pathname, uploadedAt: b.uploadedAt })));
       cursor = page.cursor;
     } while (cursor);
-    return paths;
+    return objects;
   }
 }
