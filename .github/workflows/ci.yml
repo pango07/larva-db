@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (includes compile-only inference tests)
+        run: bunx tsc --noEmit
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Build larvadb package
+        run: bun run --cwd packages/larvadb build
+
+      - name: S3 adapter contract + chaos test (offline)
+        run: bun scripts/s3-adapter-test.ts
+
+      - name: Live Blob-store tests
+        env:
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: |
+          if [ -z "$BLOB_READ_WRITE_TOKEN" ]; then
+            echo "::notice::BLOB_READ_WRITE_TOKEN secret not set — skipping live tests"
+            exit 0
+          fi
+          bun scripts/sql-smoke.ts
+          bun scripts/api-smoke.ts
+          bun scripts/stress.ts --writers 4 --commits 6 --mode mixed
+          bun scripts/property.ts --writers 4 --ops 10
+
+  publish:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Publish to npm
+        working-directory: packages/larvadb
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN secret not set — skipping publish. Create an automation token (npmjs.com -> Access Tokens) and add it: gh secret set NPM_TOKEN"
+            exit 0
+          fi
+          VERSION=$(jq -r .version package.json)
+          if npm view "larvadb@$VERSION" version > /dev/null 2>&1; then
+            CANARY="$VERSION-canary.${{ github.run_number }}.$(git rev-parse --short HEAD)"
+            echo "version $VERSION already on npm — publishing $CANARY under the canary tag"
+            npm version "$CANARY" --no-git-tag-version
+            npm publish --tag canary --access public --provenance
+          else
+            echo "publishing larvadb@$VERSION as latest"
+            npm publish --access public --provenance
+          fi
