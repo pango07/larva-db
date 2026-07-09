@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-95_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-129_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -110,13 +110,20 @@ When you get there, congratulations: run the export and graduate.
 
 ## SQL dialect
 
-Real SQL strings, deliberately scoped: `SELECT` with `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, two-table `INNER`/`LEFT JOIN`, basic arithmetic; `INSERT` (multi-row, `RETURNING`), `UPDATE`/`DELETE ... WHERE`, `CREATE`/`DROP TABLE`.
+Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, and scalar functions `UPPER`/`LOWER`/`LENGTH`/`TRIM`/`ROUND`/`ABS`/`COALESCE`/`SUBSTR`; `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (incl. `COUNT(DISTINCT …)`) and `HAVING`, two-table `INNER`/`LEFT JOIN`; `INSERT` (multi-row, `RETURNING`) with upsert:
 
-Not in v1: subqueries, `HAVING`, window functions, `UNION`, self-joins, 3+ table joins, `ALTER TABLE`, views, triggers. Every exclusion is rejected **by name, with an alternative** — because agents self-correct from specific errors:
+```ts
+await db.sql`INSERT INTO counters (slug, count) VALUES (${"visits"}, ${1})
+             ON CONFLICT (slug) DO UPDATE SET count = count + ${1}`;
+```
+
+plus `UPDATE`/`DELETE ... WHERE` and `CREATE`/`DROP TABLE`.
+
+Not supported: subqueries, window functions, `UNION`, self-joins, 3+ table joins, `ALTER TABLE`, views, triggers. Every exclusion is rejected **by name, with an alternative** — because agents self-correct from specific errors:
 
 ```
-UNSUPPORTED_FEATURE: HAVING is not supported in Larva v1; filter the grouped
-results in application code, or restructure with WHERE before grouping
+UNSUPPORTED_FEATURE: subqueries are not supported in Larva v1 (found one in IN);
+run the inner query first and interpolate its result
 ```
 
 `UPDATE`/`DELETE` without a `WHERE` clause requires an explicit `{ allowFullTable: true }` — the most common catastrophic agent mistake becomes a specific error instead.
@@ -133,7 +140,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **95 checks across five suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **129 checks across six suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|
@@ -142,6 +149,7 @@ Correctness risk concentrates in the conflict/retry path, so that's where the te
 | `scripts/sql-smoke.ts` | the full dialect + the machine-readable error catalog + pruning + time travel, live |
 | `scripts/api-smoke.ts` | transaction atomicity, concurrent read-modify-write transactions, export round-trip through a real SQLite engine, vacuum retention |
 | `scripts/s3-adapter-test.ts` | the S3 adapter under an in-process fake S3 with injected 409s and 500s — chaos the engine must absorb |
+| `scripts/group-commit-test.ts` | same-instance commit coalescing, batch error isolation, and the conflict matrix over the chaos-injected fake S3 |
 
 CI publishes to npm on every `main` push: a new `package.json` version ships as `latest`; every other commit ships a unique `canary`.
 

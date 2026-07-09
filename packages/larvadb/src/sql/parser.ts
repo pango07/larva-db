@@ -1,8 +1,11 @@
 import {
-  Aggregate,
+  AggFunc,
   ColumnRef,
   CompareOp,
   Expr,
+  hasAggregate,
+  OnConflict,
+  ScalarFunc,
   SelectItem,
   SelectStmt,
   Statement,
@@ -12,9 +15,22 @@ import { SqlError, unsupported } from "./errors";
 import { Token, tokenize } from "./lexer";
 
 const AGG_FUNCS = new Set(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
+/** name → [min arity, max arity] */
+const SCALAR_FUNCS: Record<string, [number, number]> = {
+  UPPER: [1, 1],
+  LOWER: [1, 1],
+  LENGTH: [1, 1],
+  TRIM: [1, 1],
+  ABS: [1, 1],
+  ROUND: [1, 2],
+  SUBSTR: [2, 3],
+  COALESCE: [2, Infinity],
+};
+const FUNC_LIST =
+  "aggregates COUNT, SUM, AVG, MIN, MAX and scalar functions UPPER, LOWER, LENGTH, TRIM, ROUND, ABS, COALESCE, SUBSTR";
 
 /**
- * Hand-written recursive-descent / Pratt parser for the Larva v1 dialect
+ * Hand-written recursive-descent / Pratt parser for the Larva dialect
  * (Design §7). Chosen over an off-the-shelf parser for error-message quality:
  * every deliberate exclusion is rejected by name with a suggested alternative.
  */
@@ -26,6 +42,7 @@ class Parser {
   private tokens: Token[];
   private i = 0;
   private paramCount = 0;
+  private aggDepth = 0;
 
   constructor(private sql: string) {
     this.tokens = tokenize(sql);
@@ -68,7 +85,7 @@ class Parser {
   parseStatement(): Statement {
     const t = this.peek();
     if (t.type !== "keyword") throw this.err("expected a SQL statement");
-    for (const feature of ["HAVING", "UNION", "INTERSECT", "EXCEPT", "ALTER"]) {
+    for (const feature of ["UNION", "INTERSECT", "EXCEPT", "ALTER"]) {
       if (t.text === feature) throw unsupported(feature);
     }
 
@@ -109,9 +126,7 @@ class Parser {
   // --- statements ---
   private select(): SelectStmt {
     this.expect("keyword", "SELECT");
-    if (this.eat("keyword", "DISTINCT")) {
-      throw new SqlError("UNSUPPORTED_FEATURE", "SELECT DISTINCT is not supported in Larva v1; deduplicate in application code");
-    }
+    const distinct = this.eat("keyword", "DISTINCT");
 
     let items: SelectItem[] | null = null;
     if (!this.eat("punct", "*")) {
@@ -122,7 +137,7 @@ class Parser {
     this.expect("keyword", "FROM");
     this.rejectSubquery("FROM");
     const from = this.tableRef();
-    const stmt: SelectStmt = { kind: "select", items, from };
+    const stmt: SelectStmt = { kind: "select", items, distinct, from };
 
     // joins
     const joinKeyword = this.peek();
@@ -152,14 +167,19 @@ class Parser {
       }
     }
 
-    if (this.eat("keyword", "WHERE")) stmt.where = this.expr();
+    if (this.eat("keyword", "WHERE")) {
+      stmt.where = this.expr();
+      if (hasAggregate(stmt.where)) {
+        throw new SqlError("AGGREGATE_IN_WHERE", "aggregate functions are not allowed in WHERE (it filters individual rows); use HAVING after GROUP BY");
+      }
+    }
 
     if (this.eat("keyword", "GROUP")) {
       this.expect("keyword", "BY");
       stmt.groupBy = [this.columnRef()];
       while (this.eat("punct", ",")) stmt.groupBy.push(this.columnRef());
     }
-    if (this.at("keyword", "HAVING")) throw unsupported("HAVING");
+    if (this.eat("keyword", "HAVING")) stmt.having = this.expr();
 
     if (this.eat("keyword", "ORDER")) {
       this.expect("keyword", "BY");
@@ -202,7 +222,47 @@ class Parser {
       rows.push(row);
     } while (this.eat("punct", ","));
 
-    return { kind: "insert", table, columns, rows, returning: this.returning() };
+    return { kind: "insert", table, columns, rows, onConflict: this.onConflict(), returning: this.returning() };
+  }
+
+  private onConflict(): OnConflict | undefined {
+    if (!this.eat("keyword", "ON")) return undefined;
+    this.expect("keyword", "CONFLICT");
+    let column: string | undefined;
+    if (this.eat("punct", "(")) {
+      column = this.ident("conflict target column");
+      if (this.at("punct", ",")) {
+        throw new SqlError(
+          "UNSUPPORTED_FEATURE",
+          "multi-column conflict targets are not supported; target the primary key or a single UNIQUE column",
+        );
+      }
+      this.expect("punct", ")");
+    }
+    this.expect("keyword", "DO");
+    if (this.eat("keyword", "NOTHING")) return { column, action: "nothing" };
+
+    this.expect("keyword", "UPDATE");
+    if (column === undefined) {
+      throw new SqlError(
+        "PARSE_ERROR",
+        "ON CONFLICT DO UPDATE requires a conflict target, e.g. ON CONFLICT (id) DO UPDATE SET …",
+      );
+    }
+    this.expect("keyword", "SET");
+    const set: { column: string; value: Expr }[] = [];
+    do {
+      const col = this.ident("column name");
+      this.expect("op", "=");
+      set.push({ column: col, value: this.additive() });
+    } while (this.eat("punct", ","));
+    if (this.at("keyword", "WHERE")) {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "a WHERE clause on ON CONFLICT DO UPDATE is not supported; the update applies to every conflicting row",
+      );
+    }
+    return { column, action: { set } };
   }
 
   private update(): Statement {
@@ -297,23 +357,7 @@ class Parser {
   }
 
   private selectItem(): SelectItem {
-    let expr: ColumnRef | Aggregate;
-    if (this.at("ident") && this.peek(1).type === "punct" && this.peek(1).text === "(") {
-      const func = this.next().text.toUpperCase();
-      if (!AGG_FUNCS.has(func)) {
-        throw new SqlError(
-          "UNKNOWN_FUNCTION",
-          `function "${func}" is not available; Larva v1 supports COUNT, SUM, AVG, MIN, MAX`,
-        );
-      }
-      this.expect("punct", "(");
-      const arg = this.eat("punct", "*") ? null : this.columnRef();
-      this.expect("punct", ")");
-      if (this.at("keyword", "OVER")) throw unsupported("OVER");
-      expr = { kind: "aggregate", func: func as Aggregate["func"], arg };
-    } else {
-      expr = this.columnRef();
-    }
+    const expr = this.expr();
     const alias = this.eat("keyword", "AS") ? this.ident("alias") : undefined;
     return { expr, alias };
   }
@@ -327,7 +371,7 @@ class Parser {
     }
   }
 
-  // --- expressions (Pratt: OR < AND < NOT < comparison) ---
+  // --- expressions (Pratt: OR < AND < NOT < comparison < additive/|| < multiplicative < primary) ---
   private expr(): Expr {
     return this.orExpr();
   }
@@ -385,8 +429,8 @@ class Parser {
 
   private additive(): Expr {
     let left = this.multiplicative();
-    while (this.at("op") && (this.peek().text === "+" || this.peek().text === "-")) {
-      const op = this.next().text as "+" | "-";
+    while (this.at("op") && ["+", "-", "||"].includes(this.peek().text)) {
+      const op = this.next().text as "+" | "-" | "||";
       left = { kind: "binary", op, left, right: this.multiplicative() };
     }
     return left;
@@ -408,6 +452,7 @@ class Parser {
       this.expect("punct", ")");
       return inner;
     }
+    if (this.eat("keyword", "CASE")) return this.caseExpr();
     if (this.at("param")) {
       this.next();
       return { kind: "param", index: this.paramCount++ };
@@ -420,10 +465,75 @@ class Parser {
     if (this.at("punct", "-") || (this.at("op") && this.peek().text === "-")) {
       throw this.err("negative literals: write the sign inside the number, e.g. -5 as a parameter");
     }
+    if (this.at("ident") && this.peek(1).type === "punct" && this.peek(1).text === "(") {
+      return this.functionCall();
+    }
     if (this.at("ident")) return this.columnRef();
     if (this.at("keyword", "SELECT")) {
       throw new SqlError("UNSUPPORTED_FEATURE", "subqueries are not supported in Larva v1; run the inner query first and interpolate its result");
     }
     throw this.err("expected a value, column, or parenthesized expression");
+  }
+
+  private functionCall(): Expr {
+    const func = this.next().text.toUpperCase();
+    this.expect("punct", "(");
+
+    if (AGG_FUNCS.has(func)) {
+      if (this.aggDepth > 0) {
+        throw new SqlError(
+          "UNSUPPORTED_FEATURE",
+          `aggregates cannot be nested (found ${func} inside another aggregate); compute the inner aggregate in a separate query`,
+        );
+      }
+      const distinct = this.eat("keyword", "DISTINCT");
+      let arg: Expr | null = null;
+      if (this.eat("punct", "*")) {
+        if (func !== "COUNT") throw this.err(`${func}(*) is not valid; ${func} needs a column or expression`);
+        if (distinct) throw this.err("COUNT(DISTINCT *) is not valid; name a column");
+      } else {
+        this.aggDepth++;
+        arg = this.expr();
+        this.aggDepth--;
+      }
+      this.expect("punct", ")");
+      if (this.at("keyword", "OVER")) throw unsupported("OVER");
+      return { kind: "aggregate", func: func as AggFunc, arg, distinct };
+    }
+
+    const arity = SCALAR_FUNCS[func];
+    if (arity) {
+      const args: Expr[] = [];
+      if (!this.at("punct", ")")) {
+        do {
+          args.push(this.expr());
+        } while (this.eat("punct", ","));
+      }
+      this.expect("punct", ")");
+      const [min, max] = arity;
+      if (args.length < min || args.length > max) {
+        const want = min === max ? `${min}` : max === Infinity ? `at least ${min}` : `${min} to ${max}`;
+        throw new SqlError("WRONG_ARGUMENT_COUNT", `${func} takes ${want} argument${min === 1 && max === 1 ? "" : "s"}, got ${args.length}`);
+      }
+      return { kind: "func", name: func as ScalarFunc, args };
+    }
+
+    throw new SqlError("UNKNOWN_FUNCTION", `function "${func}" is not available; Larva supports ${FUNC_LIST}`);
+  }
+
+  private caseExpr(): Expr {
+    // Simple CASE (CASE x WHEN v THEN …) desugars to searched CASE (WHEN x = v THEN …).
+    const operand = this.at("keyword", "WHEN") ? undefined : this.expr();
+    const branches: { when: Expr; then: Expr }[] = [];
+    while (this.eat("keyword", "WHEN")) {
+      let when = this.expr();
+      this.expect("keyword", "THEN");
+      if (operand) when = { kind: "binary", op: "=", left: operand, right: when };
+      branches.push({ when, then: this.expr() });
+    }
+    if (branches.length === 0) throw this.err("CASE requires at least one WHEN … THEN branch");
+    const els = this.eat("keyword", "ELSE") ? this.expr() : undefined;
+    this.expect("keyword", "END");
+    return { kind: "case", branches, else: els };
   }
 }

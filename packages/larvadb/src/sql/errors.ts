@@ -15,7 +15,6 @@ export class SqlError extends Error {
 
 /** The catalog of deliberate v1 exclusions, keyed by the feature's keyword. */
 export const UNSUPPORTED: Record<string, string> = {
-  HAVING: "HAVING is not supported in Larva v1; filter the grouped results in application code, or restructure with WHERE before grouping",
   UNION: "UNION is not supported in Larva v1; run the queries separately and concatenate in application code",
   INTERSECT: "INTERSECT is not supported in Larva v1; run the queries separately and intersect in application code",
   EXCEPT: "EXCEPT is not supported in Larva v1; run the queries separately and subtract in application code",
