@@ -151,6 +151,13 @@ export function Console() {
         )}
         <span className="grow" />
         <a
+          href="/api/export?format=postgres"
+          title="pg_dump-shaped .sql — load with: psql $DATABASE_URL < larva-demo.sql"
+          className="border-hairline text-ink-secondary hover:text-foreground rounded-md border px-3 py-1.5 text-xs"
+        >
+          Export Postgres
+        </a>
+        <a
           href="/api/export?format=json"
           className="border-hairline text-ink-secondary hover:text-foreground rounded-md border px-3 py-1.5 text-xs"
         >

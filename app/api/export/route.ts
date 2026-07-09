@@ -32,8 +32,17 @@ export async function GET(req: NextRequest) {
       },
     });
   }
+  if (format === "postgres") {
+    const sql = await db.export({ format: "postgres" });
+    return new NextResponse(sql, {
+      headers: {
+        "content-type": "application/sql",
+        "content-disposition": 'attachment; filename="larva-demo.sql"',
+      },
+    });
+  }
   return NextResponse.json(
-    { error: { code: "UNKNOWN_FORMAT", message: "format must be json or csv (sqlite export runs via the CLI: bun scripts/api-smoke.ts shows how)" } },
+    { error: { code: "UNKNOWN_FORMAT", message: "format must be json, csv, or postgres (sqlite export runs via the CLI: bun scripts/api-smoke.ts shows how)" } },
     { status: 400 },
   );
 }

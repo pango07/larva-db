@@ -192,7 +192,10 @@ export class LarvaDb {
   async export(opts: { format: "json" }): Promise<Record<string, Row[]>>;
   async export(opts: { format: "csv" }): Promise<Record<string, string>>;
   async export(opts: { format: "sqlite" }): Promise<Uint8Array>;
-  async export(opts: { format: "json" | "csv" | "sqlite" }): Promise<Record<string, Row[]> | Record<string, string> | Uint8Array> {
+  async export(opts: { format: "postgres" }): Promise<string>;
+  async export(opts: {
+    format: "json" | "csv" | "sqlite" | "postgres";
+  }): Promise<Record<string, Row[]> | Record<string, string> | Uint8Array | string> {
     await this.ensureReady();
     const snap = await this.proto.snapshot();
     const schema = (snap.manifest.schema ?? {}) as DatabaseSchema;
@@ -204,6 +207,8 @@ export class LarvaDb {
 
     const columnsOf = (table: string): string[] =>
       schema[table] ? Object.keys(schema[table].columns) : [...new Set(tables[table].flatMap(Object.keys))];
+
+    if (opts.format === "postgres") return this.exportPostgres(tables, schema, columnsOf);
 
     if (opts.format === "csv") {
       const cell = (v: Scalar | undefined): string => {
@@ -252,6 +257,78 @@ export class LarvaDb {
       }
     }
     return file.serialize();
+  }
+
+  /**
+   * A single .sql file in pg_dump's shape: CREATE TABLE for every table,
+   * data as COPY ... FROM stdin blocks (far faster to load than INSERTs),
+   * and FOREIGN KEY constraints added at the very end — after all data —
+   * so table load order never has to satisfy references. Load with:
+   * `psql $DATABASE_URL < export.sql`.
+   */
+  private exportPostgres(
+    tables: Record<string, Row[]>,
+    schema: DatabaseSchema,
+    columnsOf: (table: string) => string[],
+  ): string {
+    const PG_TYPE: Record<string, string> = {
+      text: "text",
+      integer: "bigint",
+      real: "double precision",
+      boolean: "boolean",
+      timestamp: "timestamptz", // ISO 8601 strings parse directly
+    };
+    const q = (ident: string) => `"${ident.replace(/"/g, '""')}"`;
+    // COPY text format: \N for NULL, backslash-escape the delimiter and line breaks.
+    const copyCell = (v: Scalar | undefined): string => {
+      if (v === null || v === undefined) return "\\N";
+      if (typeof v === "boolean") return v ? "t" : "f";
+      return String(v).replace(/\\/g, "\\\\").replace(/\t/g, "\\t").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+    };
+
+    const ddl: string[] = [];
+    const data: string[] = [];
+    const constraints: string[] = [];
+    for (const [table, rows] of Object.entries(tables)) {
+      const cols = columnsOf(table);
+      const defs = cols.map((c) => {
+        const def = schema[table]?.columns[c];
+        const parts = [q(c), PG_TYPE[def?.type ?? "text"]];
+        if (def?.primaryKey) parts.push("PRIMARY KEY");
+        if (def?.unique) parts.push("UNIQUE");
+        return `  ${parts.join(" ")}`;
+      });
+      ddl.push(`CREATE TABLE ${q(table)} (\n${defs.join(",\n")}\n);`);
+
+      const lines = rows.map((r) => cols.map((c) => copyCell(r[c])).join("\t"));
+      data.push(`COPY ${q(table)} (${cols.map(q).join(", ")}) FROM stdin;\n${lines.map((l) => l + "\n").join("")}\\.`);
+
+      for (const c of cols) {
+        const target = schema[table]?.columns[c]?.references;
+        if (!target) continue;
+        const [refTable, refCol] = target.split(".");
+        if (!refTable || !refCol || !(refTable in tables)) continue; // referenced table not in this export
+        constraints.push(
+          `ALTER TABLE ${q(table)} ADD CONSTRAINT ${q(`${table}_${c}_fkey`)} FOREIGN KEY (${q(c)}) REFERENCES ${q(refTable)} (${q(refCol)});`,
+        );
+      }
+    }
+
+    return [
+      "-- Larva export → PostgreSQL",
+      `-- Generated ${new Date().toISOString()} by @larva-db/core (Design §12, the escape hatch)`,
+      "-- Load with:  psql $DATABASE_URL < export.sql",
+      "",
+      "BEGIN;",
+      "",
+      ...ddl,
+      "",
+      ...data,
+      ...(constraints.length ? ["", "-- Foreign keys last, after all data, so load order never matters.", ...constraints] : []),
+      "",
+      "COMMIT;",
+      "",
+    ].join("\n");
   }
 
   /**
