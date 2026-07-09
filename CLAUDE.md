@@ -18,6 +18,8 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bun scripts/sql-smoke.ts` — full v1 dialect walkthrough (parser error catalog offline, then live queries, pruning, time travel)
 - `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite), vacuum retention
 - `bun scripts/s3-adapter-test.ts` — S3Adapter contract + stress harness over an in-process fake S3 with 409/500 chaos injection (no credentials needed)
+- `bun scripts/group-commit-test.ts` — group-commit coalescing, batch error isolation, nested-commit deadlock guard, and the property conflict harness, all over the chaos fake S3 (no credentials needed)
+- `bun scripts/bench.ts` — write-throughput benchmark over latency-simulated fake S3; compares per-instance coalescing against cross-instance contention (`--latency`, `--writers`, `--ops`)
 - `bun run --cwd packages/larvadb build` — build the npm package (bundle + d.ts); `npm pack --dry-run` there to inspect the tarball. Do not `npm publish` without the user's explicit go-ahead.
 - Deploy: `vercel deploy --prod --yes` (direct upload)
 
@@ -27,7 +29,7 @@ Larva is a deliberate miniaturization of the Delta Lake / Iceberg pattern on top
 
 - **Immutable chunk blobs** hold rows (~1,000–5,000 rows or ~256 KB gzipped JSON each, ULID-named, content never modified). Updates/deletes produce replacement chunks; old ones stay until vacuum.
 - **One mutable `manifest.json`** describes the entire database: schema, per-table ordered chunk lists, and per-chunk zone-map statistics (row count, min/max of primary key and partition column). The manifest's Blob ETag is the concurrency token for the whole database.
-- **Commit protocol** (Design §6 — the heart of the system; understand it before touching write-path code): stage new chunks (touches nothing live) → CAS-swap the manifest via `put(..., { ifMatch: etag })` → on `BlobPreconditionFailedError`, rebase if disjoint, re-execute if overlapping, jittered backoff up to 5 attempts, then throw `ConflictError` loudly.
+- **Commit protocol** (Design §6 — the heart of the system; understand it before touching write-path code): stage new chunks (touches nothing live) → CAS-swap the manifest via `put(..., { ifMatch: etag })` → on `BlobPreconditionFailedError`, rebase if disjoint, re-execute if overlapping, jittered backoff up to 15 attempts (default), then throw `ConflictError` loudly. `LarvaDb` additionally enables group commit: concurrent commits from one instance coalesce into a single CAS (queued, planned sequentially against a virtual manifest), so same-instance writers never contend — see the group-commit subsection of Design §6.
 - **Snapshot isolation falls out of the architecture**: one manifest fetch pins a consistent snapshot; concurrent commits are invisible to running queries. Not full serializability — write skew is accepted and documented for v1.
 - **Time travel is a byproduct**: old manifests in `history/` are complete snapshots. `rollbackTo` is itself a new commit (non-destructive, itself rollbackable). Retention: 7 days or 50 versions, whichever is larger.
 - **Caching**: chunks are immutable so cache entries keyed by pathname can never be stale; only the manifest needs freshness (always fetched with cache-busting).
