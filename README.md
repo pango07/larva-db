@@ -222,7 +222,7 @@ A miniaturization of the Delta Lake / Iceberg pattern, sized for object storage 
 - A commit stages new chunks (touching nothing live), then atomically swaps the manifest with a conditional write. Losers rebase if disjoint, re-execute if overlapping — **no lost updates, ever, or the commit fails loudly**. Writers inside one process coalesce into group commits, so same-instance concurrency never contends.
 - Old manifests are complete snapshots, which is why time travel is nearly free.
 
-The full design — including the rejected alternative, the consistency model, and three empirically-discovered object-store behaviors the adapter must handle — is in [LARVA-DESIGN.md](LARVA-DESIGN.md).
+The full design — including the rejected alternative, the consistency model, and three empirically-discovered object-store behaviors the adapter must handle — is in [LARVA-DESIGN.md](LARVA-DESIGN.md). Prefer pictures? [LARVA-ARCHITECTURE.excalidraw](LARVA-ARCHITECTURE.excalidraw) is a visual walkthrough of all three stories — the layer cake, the two-writer conflict dance, and the Postgres graduation. Open it at [excalidraw.com](https://excalidraw.com) (File → Open) or with the Excalidraw VS Code extension.
 
 ## The testing story
 
