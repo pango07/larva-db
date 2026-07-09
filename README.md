@@ -152,38 +152,15 @@ const db = larva({
 
 ## Give this to your AI agent
 
-Larva is built for apps where an agent writes the SQL. Paste this into your agent's instructions (CLAUDE.md, .cursorrules, a system prompt — wherever yours reads):
+Larva is built for apps where an agent writes the SQL. The prompt that teaches an agent the dialect, the guardrails, and the performance rules lives in **[docs/larva-for-agents.md](docs/larva-for-agents.md)** — paste its contents into your agent's instructions (CLAUDE.md, AGENTS.md, .cursorrules, a system prompt), or point the agent at a deployed test lab's **`/llms.txt`**, which serves the same file raw. The deployed lab's `/docs` page has a one-click copy button.
 
-```text
-This project uses Larva (@larva-db/core), a SQL database on Vercel Blob.
+The short version of what it teaches:
 
-- Query with db.sql tagged templates. ALWAYS interpolate values with ${...}
-  (parameterized automatically); never build SQL by string concatenation.
-- Supported SQL: SELECT (DISTINCT) over expressions — arithmetic, ||, CASE WHEN,
-  CAST(x AS text/integer/real/boolean), UPPER, LOWER, LENGTH, TRIM, ROUND, ABS,
-  COALESCE, NULLIF, IFNULL, REPLACE, CEIL, FLOOR, MOD, SUBSTR, NOW(),
-  CURRENT_TIMESTAMP, DATE(x), STRFTIME('%Y-%m', x), JSON_EXTRACT(col, '$.a.b[0]'),
-  col ->> 'key'; WHERE (=, !=, <, >, <=, >=, AND, OR, NOT, IN, BETWEEN, LIKE,
-  IS NULL); ORDER BY (columns or aliases); LIMIT/OFFSET; GROUP BY over
-  expressions or aliases with COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT and HAVING;
-  two-table INNER/LEFT JOIN on equality; INSERT ... RETURNING with upsert via
-  ON CONFLICT (col) DO NOTHING / DO UPDATE SET col = excluded.col (target must
-  be the primary key or a UNIQUE column); UPDATE/DELETE ... WHERE;
-  CREATE/DROP TABLE.
-- NOT supported (do not emit): subqueries, window functions, UNION, self-joins,
-  3+ table joins, ALTER TABLE, views, triggers, nested aggregates. Fetch the
-  data and compute in application code instead — tables here are small.
-- UPDATE or DELETE without WHERE is rejected unless { allowFullTable: true }.
-- Use db.transaction(async (tx) => { ... }) for multi-statement changes.
-- Writes can throw ConflictError under concurrency after retries — surface it,
-  never swallow it.
-- Filters on the primary key or the .partitionBy() column are fast; wrap
-  nothing around them (createdAt >= '2026-07-01' prunes; DATE(createdAt) >= ...
-  scans). Other columns scan the table, which is fine at this scale.
-- Timestamps are ISO 8601 text; compare them directly as strings.
-- If a query is rejected, read the error message — it names what is
-  unsupported and says exactly what to do instead.
-```
+- always interpolate with `${…}` (parameterized automatically) — never concatenate SQL
+- the supported dialect, and what to do instead for everything outside it
+- `UPDATE`/`DELETE` without `WHERE` needs `{ allowFullTable: true }`; multi-statement changes go in `db.transaction`
+- filter on raw pk/partition columns for pruning (`createdAt >= '…'`, not `DATE(createdAt) >= '…'`)
+- surface `ConflictError`, never swallow it — and `db.rollbackTo()` undoes mistakes
 
 Errors are machine-readable on purpose — agents self-correct from specific messages:
 
@@ -222,7 +199,21 @@ A miniaturization of the Delta Lake / Iceberg pattern, sized for object storage 
 - A commit stages new chunks (touching nothing live), then atomically swaps the manifest with a conditional write. Losers rebase if disjoint, re-execute if overlapping — **no lost updates, ever, or the commit fails loudly**. Writers inside one process coalesce into group commits, so same-instance concurrency never contends.
 - Old manifests are complete snapshots, which is why time travel is nearly free.
 
-The full design — including the rejected alternative, the consistency model, and three empirically-discovered object-store behaviors the adapter must handle — is in [LARVA-DESIGN.md](LARVA-DESIGN.md).
+The whole story in three pictures:
+
+**The layers** — SQL goes in at the top; everything below is just files in your object store:
+
+![How LarvaDB works — the layer cake: your app's SQL, LarvaDB the orchestrator, and the object store holding one mutable manifest plus immutable chunks](docs/how-larva-db-works-1.png)
+
+**Concurrency** — two writers race one compare-and-swap; the loser rebases or re-executes, and nothing is ever lost:
+
+![How LarvaDB works — two writers, one manifest: the CAS race, the 412 loser, rebase vs re-execute recovery, and the zero-lost-updates guarantee](docs/how-larva-db-works-2.png)
+
+**Growing up** — one command out of Larva, one command into Postgres:
+
+![How LarvaDB works — the escape hatch: export to a pg_dump-shaped .sql file and load it with psql](docs/how-larva-db-works-3.png)
+
+The editable source for these lives at [docs/larva-architecture.excalidraw](docs/larva-architecture.excalidraw) — open it at [excalidraw.com](https://excalidraw.com). The full design — including the rejected alternative, the consistency model, and three empirically-discovered object-store behaviors the adapter must handle — is in [LARVA-DESIGN.md](LARVA-DESIGN.md).
 
 ## The testing story
 
@@ -268,7 +259,7 @@ bun run --cwd packages/larvadb build   # build the npm package
 
 ## Try it in a browser
 
-The repo doubles as a test lab — a Next.js dashboard with a SQL console over a seeded demo database (with JSON/CSV export) and a commit-protocol stress lab. Deploy it to your own Vercel account:
+The repo doubles as a test lab — a Next.js dashboard with a SQL console over a seeded demo database (with Postgres/JSON/CSV export), a commit-protocol stress lab, and a `/docs` page that serves the agent prompt (raw at `/llms.txt`, with a copy button). [docs/test-lab.md](docs/test-lab.md) explains all of it. Deploy it to your own Vercel account:
 
 ```bash
 git clone https://github.com/pango07/larva-db && cd larva-db

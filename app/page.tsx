@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { StressConfig, StressReport } from "@larva-db/core/testing";
 import { Console } from "./console";
@@ -52,9 +53,17 @@ export default function Home() {
   return (
     <main className="mx-auto w-full max-w-4xl flex-1 px-6 py-10">
       <header className="mb-8">
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Larva <span className="text-ink-muted font-normal">/ test lab</span>
-        </h1>
+        <div className="flex items-baseline gap-4">
+          <h1 className="grow text-2xl font-semibold tracking-tight">
+            Larva <span className="text-ink-muted font-normal">/ test lab</span>
+          </h1>
+          <Link
+            href="/docs"
+            className="text-ink-secondary hover:text-foreground text-sm underline underline-offset-4"
+          >
+            docs & agent prompt
+          </Link>
+        </div>
         <p className="text-ink-secondary mt-2 max-w-2xl text-sm leading-relaxed">
           A SQL database living entirely inside Vercel Blob storage. Try the dialect in the
           console, export the escape hatch, then hammer the commit protocol with concurrent
