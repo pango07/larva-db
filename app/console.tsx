@@ -33,8 +33,16 @@ const EXAMPLES: { label: string; sql: string }[] = [
     sql: `INSERT INTO customers (name, email, city, createdAt)\nVALUES ('Annie Easley', 'annie@example.com', 'Cleveland', '2026-07-08T12:00:00Z')\nRETURNING *`,
   },
   {
+    label: "HAVING + CASE",
+    sql: `SELECT customerId, SUM(total) AS revenue,\n  CASE WHEN SUM(total) > 500 THEN 'vip' ELSE 'standard' END AS tier\nFROM orders\nGROUP BY customerId\nHAVING revenue > 100\nORDER BY revenue DESC`,
+  },
+  {
+    label: "upsert",
+    sql: `INSERT INTO customers (name, email, city, createdAt)\nVALUES ('Annie Easley', 'annie@example.com', 'Cleveland', '2026-07-08T12:00:00Z')\nON CONFLICT (email) DO UPDATE SET city = excluded.city\nRETURNING *`,
+  },
+  {
     label: "an agent-grade error",
-    sql: `SELECT status, COUNT(*) FROM orders\nGROUP BY status\nHAVING COUNT(*) > 2`,
+    sql: `SELECT name FROM customers\nWHERE id IN (SELECT customerId FROM orders)`,
   },
 ];
 

@@ -5,10 +5,13 @@ import {
   ColumnRef,
   DeleteStmt,
   Expr,
+  hasAggregate,
   InsertStmt,
+  mapColumnRefs,
   SelectItem,
   SelectStmt,
   Statement,
+  ungroupedColumns,
   UpdateStmt,
 } from "./ast";
 import { SqlError } from "./errors";
@@ -151,8 +154,8 @@ export class Executor {
     }
 
     let output: Row[];
-    const hasAggregates = stmt.items?.some((i) => i.expr.kind === "aggregate") ?? false;
-    if (stmt.groupBy || hasAggregates) {
+    const hasAggregates = stmt.items?.some((i) => hasAggregate(i.expr)) ?? false;
+    if (stmt.groupBy || stmt.having || hasAggregates) {
       output = this.grouped(stmt, contexts, params);
       if (stmt.orderBy) {
         for (const { column } of stmt.orderBy) {
@@ -167,15 +170,33 @@ export class Executor {
       }
     } else {
       if (stmt.orderBy) {
+        // An unqualified ORDER BY name that matches a select-item alias sorts
+        // by that item's expression; anything else sorts by the source column.
+        const aliased = new Map<string, Expr>();
+        for (const item of stmt.items ?? []) if (item.alias) aliased.set(item.alias, item.expr);
+        const sortKey = (column: ColumnRef, ctx: Ctx): Scalar => {
+          const viaAlias = !column.table ? aliased.get(column.name) : undefined;
+          return viaAlias ? this.evalExpr(viaAlias, ctx, params) : this.resolveColumn(column, ctx);
+        };
         contexts.sort((a, b) => {
           for (const { column, desc } of stmt.orderBy as { column: ColumnRef; desc: boolean }[]) {
-            const c = cmpScalar(this.resolveColumn(column, a), this.resolveColumn(column, b));
+            const c = cmpScalar(sortKey(column, a), sortKey(column, b));
             if (c !== 0) return desc ? -c : c;
           }
           return 0;
         });
       }
-      output = contexts.map((ctx) => this.project(stmt.items, ctx));
+      output = contexts.map((ctx) => this.project(stmt.items, ctx, params));
+    }
+
+    if (stmt.distinct) {
+      const seen = new Set<string>();
+      output = output.filter((row) => {
+        const key = JSON.stringify(Object.values(row));
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
     }
 
     const limit = stmt.limit !== undefined ? this.intOf(stmt.limit, params, "LIMIT") : undefined;
@@ -185,18 +206,28 @@ export class Executor {
 
   private grouped(stmt: SelectStmt, contexts: Ctx[], params: Scalar[]): Row[] {
     const items = stmt.items;
-    if (!items) throw new SqlError("PARSE_ERROR", "SELECT * cannot be combined with GROUP BY or aggregates; list columns explicitly");
+    if (!items) throw new SqlError("PARSE_ERROR", "SELECT * cannot be combined with GROUP BY, HAVING, or aggregates; list columns explicitly");
     const groupCols = stmt.groupBy ?? [];
-    for (const item of items) {
-      if (item.expr.kind === "column") {
-        const name = item.expr.name;
-        if (!groupCols.some((g) => g.name === name)) {
+    const requireGrouped = (expr: Expr, where: string) => {
+      for (const col of ungroupedColumns(expr)) {
+        if (!groupCols.some((g) => g.name === col.name)) {
           throw new SqlError(
             "NOT_GROUPED",
-            `column "${name}" must appear in GROUP BY or inside an aggregate`,
+            `column "${col.name}" in ${where} must appear in GROUP BY or inside an aggregate`,
           );
         }
       }
+    };
+    for (const item of items) requireGrouped(item.expr, "the SELECT list");
+
+    // An unqualified name in HAVING that matches a select-item alias refers to
+    // that item's expression (so HAVING revenue > 100 works).
+    let having = stmt.having;
+    if (having) {
+      const aliased = new Map<string, Expr>();
+      for (const item of items) if (item.alias) aliased.set(item.alias, item.expr);
+      having = mapColumnRefs(having, (c) => (!c.table && aliased.has(c.name) ? (aliased.get(c.name) as Expr) : null));
+      requireGrouped(having, "HAVING");
     }
 
     const groups = new Map<string, Ctx[]>();
@@ -206,24 +237,26 @@ export class Executor {
     }
     if (groups.size === 0 && groupCols.length === 0) groups.set("[]", []); // aggregate over empty table
 
-    return [...groups.values()].map((rows) => {
+    let rowsets = [...groups.values()];
+    if (having) {
+      const h = having;
+      rowsets = rowsets.filter((rows) => this.truthy(this.evalExpr(h, rows[0] ?? {}, params, rows)));
+    }
+    return rowsets.map((rows) => {
       const out: Row = {};
-      for (const item of items) {
-        const name = item.alias ?? (item.expr.kind === "aggregate" ? item.expr.func.toLowerCase() : item.expr.name);
-        out[name] =
-          item.expr.kind === "aggregate"
-            ? this.aggregate(item.expr, rows, params)
-            : this.resolveColumn(item.expr, rows[0]);
-      }
+      items.forEach((item, i) => {
+        out[this.outputName(item, i)] = this.evalExpr(item.expr, rows[0] ?? {}, params, rows);
+      });
       return out;
     });
   }
 
   private aggregate(agg: Aggregate, rows: Ctx[], params: Scalar[]): Scalar {
-    void params;
     if (agg.func === "COUNT" && agg.arg === null) return rows.length;
-    if (agg.arg === null) throw new SqlError("PARSE_ERROR", `${agg.func}(*) is not valid; ${agg.func} needs a column`);
-    const values = rows.map((ctx) => this.resolveColumn(agg.arg as ColumnRef, ctx)).filter((v) => v !== null);
+    if (agg.arg === null) throw new SqlError("PARSE_ERROR", `${agg.func}(*) is not valid; ${agg.func} needs a column or expression`);
+    const arg = agg.arg;
+    let values = rows.map((ctx) => this.evalExpr(arg, ctx, params)).filter((v) => v !== null);
+    if (agg.distinct) values = [...new Set(values)];
     switch (agg.func) {
       case "COUNT":
         return values.length;
@@ -234,7 +267,7 @@ export class Executor {
       case "SUM":
       case "AVG": {
         if (values.some((v) => typeof v !== "number")) {
-          throw new SqlError("TYPE_MISMATCH", `${agg.func}(${agg.arg.name}) requires a numeric column`);
+          throw new SqlError("TYPE_MISMATCH", `${agg.func}(…) requires a numeric argument`);
         }
         if (values.length === 0) return null;
         const sum = (values as number[]).reduce((a, b) => a + b, 0);
@@ -243,7 +276,17 @@ export class Executor {
     }
   }
 
-  private project(items: SelectItem[] | null, ctx: Ctx): Row {
+  /** Output column name: alias, else the column/function name, else a positional fallback. */
+  private outputName(item: SelectItem, index: number): string {
+    if (item.alias) return item.alias;
+    const e = item.expr;
+    if (e.kind === "column") return e.name;
+    if (e.kind === "aggregate") return e.func.toLowerCase();
+    if (e.kind === "func") return e.name.toLowerCase();
+    return `column${index + 1}`;
+  }
+
+  private project(items: SelectItem[] | null, ctx: Ctx, params: Scalar[]): Row {
     if (items === null) {
       // SELECT *: merge tables; colliding join columns get qualified keys.
       const tables = Object.keys(ctx);
@@ -254,10 +297,9 @@ export class Executor {
       return out;
     }
     const out: Row = {};
-    for (const item of items) {
-      if (item.expr.kind === "aggregate") throw new SqlError("PARSE_ERROR", "aggregates require GROUP BY handling"); // unreachable
-      out[item.alias ?? item.expr.name] = this.resolveColumn(item.expr, ctx);
-    }
+    items.forEach((item, i) => {
+      out[this.outputName(item, i)] = this.evalExpr(item.expr, ctx, params);
+    });
     return out;
   }
 
@@ -397,8 +439,26 @@ export class Executor {
     return v === true || (typeof v === "number" && v !== 0);
   }
 
-  private evalExpr(e: Expr, ctx: Ctx, params: Scalar[]): Scalar {
+  /** `group` carries the rows of the current group so aggregate nodes can evaluate; absent outside GROUP BY/HAVING contexts. */
+  private evalExpr(e: Expr, ctx: Ctx, params: Scalar[], group?: Ctx[]): Scalar {
     switch (e.kind) {
+      case "aggregate": {
+        if (!group) {
+          throw new SqlError(
+            "AGGREGATE_MISPLACED",
+            `${e.func} is an aggregate and only works in a SELECT list or HAVING clause; it cannot be used here`,
+          );
+        }
+        return this.aggregate(e, group, params);
+      }
+      case "func":
+        return this.scalarFunc(e.name, e.args.map((a) => this.evalExpr(a, ctx, params, group)));
+      case "case": {
+        for (const b of e.branches) {
+          if (this.truthy(this.evalExpr(b.when, ctx, params, group))) return this.evalExpr(b.then, ctx, params, group);
+        }
+        return e.else !== undefined ? this.evalExpr(e.else, ctx, params, group) : null;
+      }
       case "literal":
         return e.value;
       case "param": {
@@ -410,36 +470,43 @@ export class Executor {
       case "column":
         return this.resolveColumn(e, ctx);
       case "not":
-        return !this.truthy(this.evalExpr(e.expr, ctx, params));
+        return !this.truthy(this.evalExpr(e.expr, ctx, params, group));
       case "isnull": {
-        const v = this.evalExpr(e.expr, ctx, params);
+        const v = this.evalExpr(e.expr, ctx, params, group);
         return e.negated ? v !== null : v === null;
       }
       case "in": {
-        const v = this.evalExpr(e.expr, ctx, params);
-        const hit = v !== null && e.list.some((item) => this.evalExpr(item, ctx, params) === v);
+        const v = this.evalExpr(e.expr, ctx, params, group);
+        const hit = v !== null && e.list.some((item) => this.evalExpr(item, ctx, params, group) === v);
         return e.negated ? !hit : hit;
       }
       case "between": {
-        const v = this.evalExpr(e.expr, ctx, params);
+        const v = this.evalExpr(e.expr, ctx, params, group);
         if (v === null) return false;
         const hit =
-          cmpScalar(v, this.evalExpr(e.lo, ctx, params)) >= 0 &&
-          cmpScalar(v, this.evalExpr(e.hi, ctx, params)) <= 0;
+          cmpScalar(v, this.evalExpr(e.lo, ctx, params, group)) >= 0 &&
+          cmpScalar(v, this.evalExpr(e.hi, ctx, params, group)) <= 0;
         return e.negated ? !hit : hit;
       }
       case "like": {
-        const v = this.evalExpr(e.expr, ctx, params);
-        const pattern = this.evalExpr(e.pattern, ctx, params);
+        const v = this.evalExpr(e.expr, ctx, params, group);
+        const pattern = this.evalExpr(e.pattern, ctx, params, group);
         if (typeof v !== "string" || typeof pattern !== "string") return e.negated;
         const re = new RegExp(`^${pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".")}$`, "s");
         return e.negated ? !re.test(v) : re.test(v);
       }
       case "binary": {
-        if (e.op === "AND") return this.truthy(this.evalExpr(e.left, ctx, params)) && this.truthy(this.evalExpr(e.right, ctx, params));
-        if (e.op === "OR") return this.truthy(this.evalExpr(e.left, ctx, params)) || this.truthy(this.evalExpr(e.right, ctx, params));
-        const l = this.evalExpr(e.left, ctx, params);
-        const r = this.evalExpr(e.right, ctx, params);
+        if (e.op === "AND") return this.truthy(this.evalExpr(e.left, ctx, params, group)) && this.truthy(this.evalExpr(e.right, ctx, params, group));
+        if (e.op === "OR") return this.truthy(this.evalExpr(e.left, ctx, params, group)) || this.truthy(this.evalExpr(e.right, ctx, params, group));
+        const l = this.evalExpr(e.left, ctx, params, group);
+        const r = this.evalExpr(e.right, ctx, params, group);
+        if (e.op === "||") {
+          if (l === null || r === null) return null; // SQL: NULL propagates through concat
+          if (typeof l === "boolean" || typeof r === "boolean") {
+            throw new SqlError("TYPE_MISMATCH", `|| concatenates text and numbers, got ${JSON.stringify(l)} || ${JSON.stringify(r)}`);
+          }
+          return String(l) + String(r);
+        }
         if (["+", "-", "*", "/"].includes(e.op)) {
           if (l === null || r === null) return null;
           if (typeof l !== "number" || typeof r !== "number") {
@@ -468,6 +535,47 @@ export class Executor {
     }
   }
 
+  /** SQLite-compatible scalar functions; NULL in → NULL out (except COALESCE, whose job is NULLs). */
+  private scalarFunc(name: string, args: Scalar[]): Scalar {
+    const str = (v: Scalar, i = 0): string => {
+      if (typeof v !== "string") throw new SqlError("TYPE_MISMATCH", `${name} expects text for argument ${i + 1}, got ${JSON.stringify(v)}`);
+      return v;
+    };
+    const num = (v: Scalar, i = 0): number => {
+      if (typeof v !== "number") throw new SqlError("TYPE_MISMATCH", `${name} expects a number for argument ${i + 1}, got ${JSON.stringify(v)}`);
+      return v;
+    };
+    if (name === "COALESCE") return args.find((v) => v !== null) ?? null;
+    if (args[0] === null) return null;
+    switch (name) {
+      case "UPPER":
+        return str(args[0]).toUpperCase();
+      case "LOWER":
+        return str(args[0]).toLowerCase();
+      case "TRIM":
+        return str(args[0]).trim();
+      case "LENGTH":
+        return str(args[0]).length;
+      case "ABS":
+        return Math.abs(num(args[0]));
+      case "ROUND": {
+        const digits = args.length > 1 && args[1] !== null ? num(args[1], 1) : 0;
+        const f = 10 ** digits;
+        return Math.round(num(args[0]) * f) / f;
+      }
+      case "SUBSTR": {
+        const s = str(args[0]);
+        if (args[1] === null || (args.length > 2 && args[2] === null)) return null;
+        const start = num(args[1], 1); // 1-based; negative counts from the end (SQLite semantics)
+        const begin = start > 0 ? start - 1 : Math.max(0, s.length + start);
+        const len = args.length > 2 ? Math.max(0, num(args[2], 2)) : undefined;
+        return s.slice(begin, len === undefined ? undefined : begin + len);
+      }
+      default:
+        throw new SqlError("UNKNOWN_FUNCTION", `function "${name}" is not available`); // unreachable — parser gates the set
+    }
+  }
+
   // ---------- writes ----------
 
   private returningRows(rows: Row[], returning: SelectItem[] | null | undefined, table: string): Row[] {
@@ -485,56 +593,179 @@ export class Executor {
   }
 
   private async planInsert(stmt: InsertStmt, params: Scalar[], snap: Snapshot): Promise<PlanOutcome> {
-    {
-      const schema = this.schemaOf(snap.manifest, stmt.table);
-      const inserted: Row[] = stmt.rows.map((values) => {
-        const raw: Row = {};
-        stmt.columns.forEach((col, i) => {
-          raw[col] = this.evalExpr(values[i], {}, params);
-        });
-        return validateInsert(stmt.table, schema, raw);
+    const schema = this.schemaOf(snap.manifest, stmt.table);
+    const incoming: Row[] = stmt.rows.map((values) => {
+      const raw: Row = {};
+      stmt.columns.forEach((col, i) => {
+        raw[col] = this.evalExpr(values[i], {}, params);
       });
+      return validateInsert(stmt.table, schema, raw);
+    });
 
-      // Primary-key uniqueness against the snapshot (pruned lookup). Note:
-      // snapshot-isolated — two concurrent inserts of the same pk are write
-      // skew (Design §6) and not detected; ULID defaults make this moot.
-      const pks = inserted.map((r) => r[schema.primaryKey]);
-      if (new Set(pks).size !== pks.length) {
-        throw new SqlError("PRIMARY_KEY_CONFLICT", `duplicate primary key within the inserted rows`);
+    const oc = stmt.onConflict;
+    const target = oc ? (oc.column ?? schema.primaryKey) : null;
+    if (oc && target) {
+      if (!(target in schema.columns)) {
+        throw new SqlError("UNKNOWN_COLUMN", `ON CONFLICT target "${target}" does not exist in table "${stmt.table}"`);
       }
-      const uniqueCols = Object.entries(schema.columns).filter(([, c]) => c.unique).map(([n]) => n);
-      const candidates = (snap.manifest.tables[stmt.table]?.chunks ?? []).filter((ref) => {
-        if (!ref.stats || uniqueCols.length > 0) return true; // unique columns force full scan
-        return pks.some((pk) => cmpScalar(ref.stats!.pkMin, pk) <= 0 && cmpScalar(ref.stats!.pkMax, pk) >= 0);
-      });
-      for (const ref of candidates) {
-        for (const row of await this.proto.readChunk(ref)) {
-          if (pks.includes(row[schema.primaryKey])) {
-            throw new SqlError("PRIMARY_KEY_CONFLICT", `primary key ${JSON.stringify(row[schema.primaryKey])} already exists in "${stmt.table}"`);
-          }
-          for (const col of uniqueCols) {
-            if (row[col] !== null && inserted.some((r) => r[col] === row[col])) {
-              throw new SqlError("UNIQUE_CONFLICT", `value ${JSON.stringify(row[col])} already exists in unique column "${stmt.table}.${col}"`);
-            }
+      if (target !== schema.primaryKey && !schema.columns[target].unique) {
+        throw new SqlError(
+          "INVALID_CONFLICT_TARGET",
+          `ON CONFLICT target "${target}" must be the primary key or a UNIQUE column — conflicts are only detectable where uniqueness is enforced`,
+        );
+      }
+    }
+
+    // Conflict detection against the snapshot (pruned lookup). Note:
+    // snapshot-isolated — two concurrent inserts of the same pk are write
+    // skew (Design §6) and not detected; ULID defaults make this moot.
+    const uniqueCols = Object.entries(schema.columns).filter(([, c]) => c.unique).map(([n]) => n);
+    const pks = incoming.map((r) => r[schema.primaryKey]);
+    const candidates = (snap.manifest.tables[stmt.table]?.chunks ?? []).filter((ref) => {
+      if (!ref.stats || uniqueCols.length > 0) return true; // unique columns force full scan
+      return pks.some((pk) => cmpScalar(ref.stats!.pkMin, pk) <= 0 && cmpScalar(ref.stats!.pkMax, pk) >= 0);
+    });
+    const loaded = await Promise.all(
+      candidates.map(async (ref) => ({ ref, rows: [...(await this.proto.readChunk(ref))] })),
+    );
+
+    // Rows are processed in statement order, each seeing the effect of the
+    // previous ones (SQLite upsert semantics): a row can conflict with an
+    // earlier row of the same INSERT.
+    type Loc = { kind: "chunk"; chunk: number; idx: number } | { kind: "pending"; idx: number };
+    const pkMap = new Map<Scalar, Loc>();
+    const uniqMaps = new Map<string, Map<Scalar, Loc>>(uniqueCols.map((c) => [c, new Map()]));
+    loaded.forEach((c, ci) =>
+      c.rows.forEach((row, ri) => {
+        pkMap.set(row[schema.primaryKey], { kind: "chunk", chunk: ci, idx: ri });
+        for (const u of uniqueCols) {
+          if (row[u] !== null) uniqMaps.get(u)!.set(row[u], { kind: "chunk", chunk: ci, idx: ri });
+        }
+      }),
+    );
+
+    const pending: Row[] = [];
+    const dirty = new Set<number>();
+    const resultRows: Row[] = [];
+    const getRow = (loc: Loc): Row => (loc.kind === "pending" ? pending[loc.idx] : loaded[loc.chunk].rows[loc.idx]);
+    const setRow = (loc: Loc, row: Row): void => {
+      if (loc.kind === "pending") pending[loc.idx] = row;
+      else {
+        loaded[loc.chunk].rows[loc.idx] = row;
+        dirty.add(loc.chunk);
+      }
+    };
+
+    for (const row of incoming) {
+      let conflictCol: string | null = null;
+      let loc = pkMap.get(row[schema.primaryKey]);
+      if (loc) conflictCol = schema.primaryKey;
+      else {
+        for (const u of uniqueCols) {
+          const l = row[u] !== null ? uniqMaps.get(u)!.get(row[u]) : undefined;
+          if (l) {
+            conflictCol = u;
+            loc = l;
+            break;
           }
         }
       }
 
-      const statsCols = { pk: schema.primaryKey, part: schema.partitionColumn };
-      const refs: ChunkRef[] = [];
-      for (let i = 0; i < inserted.length; i += CHUNK_TARGET_ROWS) {
-        refs.push(await this.proto.stageChunk(stmt.table, inserted.slice(i, i + CHUNK_TARGET_ROWS), statsCols));
+      if (!conflictCol || !loc) {
+        const ploc: Loc = { kind: "pending", idx: pending.length };
+        pending.push(row);
+        pkMap.set(row[schema.primaryKey], ploc);
+        for (const u of uniqueCols) if (row[u] !== null) uniqMaps.get(u)!.set(row[u], ploc);
+        resultRows.push(row);
+        continue;
       }
-      return {
-        apply: (m) => {
-          const t = m.tables[stmt.table];
-          if (!t) return null;
-          t.chunks.push(...refs);
-          return m;
-        },
-        rows: this.returningRows(inserted, stmt.returning, stmt.table),
-      };
+
+      if (!oc || conflictCol !== target) {
+        const hint = oc ? `; the ON CONFLICT target is "${target}", which does not cover this conflict` : "";
+        if (conflictCol === schema.primaryKey) {
+          throw new SqlError(
+            "PRIMARY_KEY_CONFLICT",
+            loc.kind === "pending"
+              ? `duplicate primary key within the inserted rows${hint}`
+              : `primary key ${JSON.stringify(row[schema.primaryKey])} already exists in "${stmt.table}"${hint}`,
+          );
+        }
+        throw new SqlError(
+          "UNIQUE_CONFLICT",
+          `value ${JSON.stringify(row[conflictCol])} already exists in unique column "${stmt.table}.${conflictCol}"${hint}`,
+        );
+      }
+
+      if (oc.action === "nothing") continue;
+
+      // DO UPDATE SET: bare columns read the existing row; excluded.col reads
+      // the row that failed to insert.
+      const existing = getRow(loc);
+      const next = { ...existing };
+      for (const { column, value } of oc.action.set) {
+        if (!(column in schema.columns)) {
+          throw new SqlError("UNKNOWN_COLUMN", `column "${column}" does not exist in table "${stmt.table}"`);
+        }
+        if (column === schema.primaryKey) {
+          throw new SqlError("UNSUPPORTED_FEATURE", "updating the primary key in ON CONFLICT DO UPDATE is not supported; DELETE and re-INSERT instead");
+        }
+        const substituted = mapColumnRefs(value, (c) => {
+          if (c.table !== "excluded") return null;
+          if (!(c.name in schema.columns)) {
+            throw new SqlError("UNKNOWN_COLUMN", `excluded.${c.name} does not exist in table "${stmt.table}"`);
+          }
+          return { kind: "literal", value: row[c.name] ?? null };
+        });
+        next[column] = this.evalExpr(substituted, { [stmt.table]: existing }, params);
+      }
+      const invalid = Object.entries(schema.columns).find(([n, def]) => {
+        const v = next[n] ?? null;
+        return v !== null && !validTypeQuick(def.type, v);
+      });
+      if (invalid) {
+        throw new SqlError("TYPE_MISMATCH", `column "${stmt.table}.${invalid[0]}" is ${invalid[1].type}, got ${JSON.stringify(next[invalid[0]])}`);
+      }
+      for (const u of uniqueCols) {
+        if (existing[u] === next[u]) continue;
+        if (existing[u] !== null) uniqMaps.get(u)!.delete(existing[u]);
+        if (next[u] !== null) {
+          if (uniqMaps.get(u)!.has(next[u])) {
+            throw new SqlError("UNIQUE_CONFLICT", `ON CONFLICT DO UPDATE would duplicate value ${JSON.stringify(next[u])} in unique column "${stmt.table}.${u}"`);
+          }
+          uniqMaps.get(u)!.set(next[u], loc);
+        }
+      }
+      setRow(loc, next);
+      resultRows.push(next);
     }
+
+    const statsCols = { pk: schema.primaryKey, part: schema.partitionColumn };
+    const replacements: { retired: ChunkRef; replacement: ChunkRef }[] = [];
+    for (const ci of dirty) {
+      replacements.push({
+        retired: loaded[ci].ref,
+        replacement: await this.proto.stageChunk(stmt.table, loaded[ci].rows, statsCols),
+      });
+    }
+    const appended: ChunkRef[] = [];
+    for (let i = 0; i < pending.length; i += CHUNK_TARGET_ROWS) {
+      appended.push(await this.proto.stageChunk(stmt.table, pending.slice(i, i + CHUNK_TARGET_ROWS), statsCols));
+    }
+
+    return {
+      apply: (m) => {
+        const t = m.tables[stmt.table];
+        if (!t) return null;
+        for (const { retired, replacement } of replacements) {
+          const idx = t.chunks.findIndex((c) => c.id === retired.id);
+          if (idx < 0) return null; // a touched chunk changed underneath us — re-execute
+          t.chunks[idx] = replacement;
+        }
+        t.chunks.push(...appended);
+        return m;
+      },
+      rows: this.returningRows(resultRows, stmt.returning, stmt.table),
+    };
   }
 
   private async planUpdate(stmt: UpdateStmt, params: Scalar[], opts: ExecOptions, snap: Snapshot): Promise<PlanOutcome> {
