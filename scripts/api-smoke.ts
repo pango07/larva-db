@@ -85,7 +85,14 @@ await Promise.all(
 );
 const gadget = Number((await db.sql`SELECT count FROM inventory WHERE sku = ${"gadget"}`)[0].count);
 ok(`18 concurrent stale-read decrements lose nothing`, gadget === 100 - WRITERS * TXS, `count=${gadget}, expected ${100 - WRITERS * TXS}`);
-ok("each tx bumped exactly one version", (await db.currentVersion()) === v2 + WRITERS * TXS, `v=${await db.currentVersion()}, expected ${v2 + WRITERS * TXS}`);
+// Concurrent txs through one LarvaDb instance coalesce (group commit), so the
+// version advances once per batch — anywhere from 1 to one-per-tx.
+const vAfter = await db.currentVersion();
+ok(
+  "concurrent txs advance the version once per coalesced batch",
+  vAfter > v2 && vAfter <= v2 + WRITERS * TXS,
+  `v=${vAfter}, bounds=(${v2}, ${v2 + WRITERS * TXS}]`,
+);
 
 // --- export ---
 const json = await db.export({ format: "json" });
