@@ -82,7 +82,14 @@ export class LarvaDb {
   private ready?: Promise<void>;
 
   constructor(private opts: LarvaOptions = {}) {
-    this.proto = new LarvaProto(opts.store ?? new VercelBlobAdapter(), opts.prefix ?? "larva/");
+    // Group commit on: concurrent writes through one LarvaDb instance coalesce
+    // into a single CAS instead of contending with each other. This matters on
+    // Fluid Compute, where one warm function instance serves many concurrent
+    // requests — those writers share this instance and stop fighting over the
+    // manifest entirely.
+    this.proto = new LarvaProto(opts.store ?? new VercelBlobAdapter(), opts.prefix ?? "larva/", undefined, {
+      groupCommit: true,
+    });
     this.executor = new Executor(this.proto);
   }
 

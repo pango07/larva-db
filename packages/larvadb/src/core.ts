@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { CasConflictError, isTransientStorageError, StorageAdapter } from "./storage";
 
 export type Scalar = string | number | boolean | null;
@@ -45,6 +47,9 @@ export interface CommitStats {
   rebases: number;
   reExecutions: number;
   ms: number;
+  /** How many queued commits this CAS carried (group commit). Absent when the
+   * commit went to storage alone. */
+  coalesced?: number;
 }
 
 export interface CommitResult {
@@ -116,6 +121,28 @@ function backoffMs(attempt: number): number {
   return Math.random() * Math.min(50 * 2 ** attempt, 5000);
 }
 
+/** Default commit retry budget. Measured at 40ms-latency storage: 5 attempts
+ * loses ~17% of commits loudly at 10 mixed writers (33% on a hot counter);
+ * 15 keeps loud failures out of ordinary contention while still failing fast
+ * under deliberate hammering (the stress harness uses 50). */
+const DEFAULT_MAX_ATTEMPTS = 15;
+
+/** One queued commit awaiting the group-commit drain loop. */
+interface QueuedCommit {
+  plan: Planner;
+  maxAttempts: number;
+  resolve: (result: CommitResult) => void;
+  reject: (err: unknown) => void;
+}
+
+/** Internal signal: every commit in a batch was rejected at planning time. */
+class EmptyBatch extends Error {}
+
+/** Tracks whether the current async context is inside a draining planner, so
+ * a commit issued from within another commit's planner (e.g. db.sql inside a
+ * transaction callback) bypasses the queue instead of deadlocking on it. */
+const draining = new AsyncLocalStorage<boolean>();
+
 /**
  * Prototype of the Larva storage engine: manifest + immutable chunks +
  * the Design §6 commit protocol (stage → CAS → rebase/re-execute/backoff).
@@ -123,6 +150,8 @@ function backoffMs(attempt: number): number {
  */
 export class LarvaProto {
   private chunkCache = new Map<string, Row[]>();
+  private commitQueue: QueuedCommit[] = [];
+  private drainRunning = false;
 
   constructor(
     readonly store: StorageAdapter,
@@ -130,6 +159,12 @@ export class LarvaProto {
     readonly prefix: string,
     /** Optional per-attempt trace hook for debugging the commit loop. */
     private trace?: (msg: string) => void,
+    private opts?: {
+      /** Coalesce concurrent commits from this instance into one CAS (group
+       * commit). LarvaDb enables it; off by default so the stress/property
+       * harnesses keep exercising one CAS per commit. */
+      groupCommit?: boolean;
+    },
   ) {}
 
   private manifestPath(): string {
@@ -235,9 +270,100 @@ export class LarvaProto {
    * 3. Conflict: refetch; rebase if the plan still applies cleanly (disjoint
    *    change), otherwise re-execute the planner on the fresh snapshot.
    *    Jittered exponential backoff; after maxAttempts, throw ConflictError.
+   *
+   * With groupCommit enabled, concurrent calls from this instance coalesce:
+   * commits queue while one is in flight, and the drain loop lands each queued
+   * batch as a single CAS (planning each member against a virtual manifest
+   * that includes the members before it, so a batch has transaction-like
+   * internal consistency). Writers inside one instance then never contend
+   * with each other — only with other instances.
    */
-  async commit(plan: Planner, opts?: { maxAttempts?: number }): Promise<CommitResult> {
-    const maxAttempts = opts?.maxAttempts ?? 5;
+  commit(plan: Planner, opts?: { maxAttempts?: number }): Promise<CommitResult> {
+    const maxAttempts = opts?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+    // Nested commit (issued from inside a draining planner): bypass the queue,
+    // which is busy running us — waiting on it would deadlock.
+    if (!this.opts?.groupCommit || draining.getStore()) return this.commitAlone(plan, maxAttempts);
+    return new Promise<CommitResult>((resolve, reject) => {
+      this.commitQueue.push({ plan, maxAttempts, resolve, reject });
+      void this.drainCommits();
+    });
+  }
+
+  /** Serialize this instance's queued commits: one batch per CAS, FIFO. */
+  private async drainCommits(): Promise<void> {
+    if (this.drainRunning) return;
+    this.drainRunning = true;
+    try {
+      while (this.commitQueue.length > 0) {
+        const batch = this.commitQueue.splice(0);
+        if (batch.length === 1) {
+          const { plan, maxAttempts, resolve, reject } = batch[0];
+          await draining.run(true, () => this.commitAlone(plan, maxAttempts)).then(resolve, reject);
+        } else {
+          await this.commitBatch(batch);
+        }
+      }
+    } finally {
+      this.drainRunning = false;
+    }
+  }
+
+  /**
+   * Land a batch of queued commits as one CAS. Members are planned in order,
+   * each against a virtual manifest carrying the members before it, so
+   * intra-batch effects are visible (a second INSERT of the same primary key
+   * fails at planning exactly as it would have failed at commit). A member
+   * whose planner throws is rejected alone; the rest of the batch proceeds.
+   */
+  private async commitBatch(batch: QueuedCommit[]): Promise<void> {
+    const alive = new Set(batch);
+    // Reassigned on every (re)planning pass; the apply below always chains the
+    // latest pass's plans, and resolution uses it to know who actually landed.
+    let planned: { member: QueuedCommit; plan: CommitPlan }[] = [];
+
+    const combined: Planner = async (snap) => {
+      planned = [];
+      let virtual = snap.manifest;
+      for (const member of [...alive]) {
+        try {
+          const plan = await member.plan({ manifest: virtual, etag: snap.etag });
+          const next = plan.apply(structuredClone(virtual));
+          if (next === null) throw new Error("batched plan does not apply to its own snapshot");
+          virtual = next;
+          planned.push({ member, plan });
+        } catch (err) {
+          alive.delete(member);
+          member.reject(err);
+        }
+      }
+      if (planned.length === 0) throw new EmptyBatch();
+      return {
+        apply: (m) => {
+          let cur: Manifest | null = m;
+          for (const { plan } of planned) {
+            cur = plan.apply(cur);
+            if (cur === null) return null;
+          }
+          return cur;
+        },
+      };
+    };
+
+    try {
+      const maxAttempts = batch.reduce((acc, m) => Math.max(acc, m.maxAttempts), 1);
+      const result = await draining.run(true, () => this.commitAlone(combined, maxAttempts));
+      this.trace?.(`batch of ${planned.length} coalesced into v${result.version}`);
+      for (const { member } of planned) {
+        member.resolve({ ...result, stats: { ...result.stats, coalesced: planned.length } });
+      }
+    } catch (err) {
+      if (err instanceof EmptyBatch) return; // every member already rejected individually
+      for (const member of alive) member.reject(err);
+    }
+  }
+
+  /** The CAS loop itself — one commit, alone, against storage. */
+  private async commitAlone(plan: Planner, maxAttempts: number): Promise<CommitResult> {
     const started = Date.now();
     const stats: CommitStats = {
       attempts: 0,
