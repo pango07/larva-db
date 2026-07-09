@@ -19,8 +19,13 @@ export interface Param {
 export type CompareOp = "=" | "!=" | "<" | ">" | "<=" | ">=";
 export type ArithOp = "+" | "-" | "*" | "/";
 
-export type AggFunc = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX";
-export type ScalarFunc = "UPPER" | "LOWER" | "LENGTH" | "TRIM" | "ROUND" | "ABS" | "COALESCE" | "SUBSTR";
+export type AggFunc = "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT";
+export type ScalarFunc =
+  | "UPPER" | "LOWER" | "LENGTH" | "TRIM" | "ROUND" | "ABS" | "COALESCE" | "SUBSTR"
+  | "DATE" | "STRFTIME" | "NOW"
+  | "NULLIF" | "IFNULL" | "REPLACE" | "CEIL" | "FLOOR" | "MOD"
+  | "JSON_EXTRACT";
+export type CastType = "text" | "integer" | "real" | "boolean";
 
 export interface Aggregate {
   kind: "aggregate";
@@ -28,6 +33,8 @@ export interface Aggregate {
   /** null = COUNT(*) */
   arg: Expr | null;
   distinct: boolean;
+  /** GROUP_CONCAT only: the separator (defaults to ",") */
+  sep?: Expr;
 }
 
 export type Expr =
@@ -35,14 +42,15 @@ export type Expr =
   | Literal
   | Param
   | Aggregate
-  | { kind: "binary"; op: CompareOp | ArithOp | "AND" | "OR" | "||"; left: Expr; right: Expr }
+  | { kind: "binary"; op: CompareOp | ArithOp | "AND" | "OR" | "||" | "->>"; left: Expr; right: Expr }
   | { kind: "not"; expr: Expr }
   | { kind: "in"; expr: Expr; list: Expr[]; negated: boolean }
   | { kind: "between"; expr: Expr; lo: Expr; hi: Expr; negated: boolean }
   | { kind: "like"; expr: Expr; pattern: Expr; negated: boolean }
   | { kind: "isnull"; expr: Expr; negated: boolean }
   | { kind: "func"; name: ScalarFunc; args: Expr[] }
-  | { kind: "case"; branches: { when: Expr; then: Expr }[]; else?: Expr };
+  | { kind: "case"; branches: { when: Expr; then: Expr }[]; else?: Expr }
+  | { kind: "cast"; expr: Expr; to: CastType };
 
 export interface SelectItem {
   expr: Expr;
@@ -62,7 +70,8 @@ export interface SelectStmt {
   from: TableRef;
   join?: { type: "inner" | "left"; table: TableRef; leftCol: ColumnRef; rightCol: ColumnRef };
   where?: Expr;
-  groupBy?: ColumnRef[];
+  /** Full expressions: GROUP BY DATE(createdAt) and GROUP BY <select alias> are both legal. */
+  groupBy?: Expr[];
   having?: Expr;
   orderBy?: { column: ColumnRef; desc: boolean }[];
   limit?: Expr;
@@ -113,7 +122,7 @@ export interface DropTableStmt {
 
 export type Statement = SelectStmt | InsertStmt | UpdateStmt | DeleteStmt | CreateTableStmt | DropTableStmt;
 
-/** True if the expression contains an aggregate anywhere (not descending into nothing — aggregates cannot nest). */
+/** True if the expression contains an aggregate anywhere (aggregates cannot nest). */
 export function hasAggregate(e: Expr): boolean {
   switch (e.kind) {
     case "aggregate":
@@ -121,6 +130,9 @@ export function hasAggregate(e: Expr): boolean {
     case "binary":
       return hasAggregate(e.left) || hasAggregate(e.right);
     case "not":
+    case "isnull":
+      return hasAggregate(e.expr);
+    case "cast":
       return hasAggregate(e.expr);
     case "in":
       return hasAggregate(e.expr) || e.list.some(hasAggregate);
@@ -128,8 +140,6 @@ export function hasAggregate(e: Expr): boolean {
       return hasAggregate(e.expr) || hasAggregate(e.lo) || hasAggregate(e.hi);
     case "like":
       return hasAggregate(e.expr) || hasAggregate(e.pattern);
-    case "isnull":
-      return hasAggregate(e.expr);
     case "func":
       return e.args.some(hasAggregate);
     case "case":
@@ -145,8 +155,8 @@ export function hasAggregate(e: Expr): boolean {
 /**
  * Rewrite an expression, replacing each column reference for which `fn`
  * returns a substitute (return null to keep the reference). Aggregate
- * arguments are rewritten too. Used for HAVING alias resolution and for
- * substituting excluded.* in ON CONFLICT DO UPDATE.
+ * arguments are rewritten too. Used for HAVING / GROUP BY alias resolution
+ * and for substituting excluded.* in ON CONFLICT DO UPDATE.
  */
 export function mapColumnRefs(e: Expr, fn: (c: ColumnRef) => Expr | null): Expr {
   const m = (x: Expr): Expr => mapColumnRefs(x, fn);
@@ -157,10 +167,12 @@ export function mapColumnRefs(e: Expr, fn: (c: ColumnRef) => Expr | null): Expr 
     case "param":
       return e;
     case "aggregate":
-      return { ...e, arg: e.arg === null ? null : m(e.arg) };
+      return { ...e, arg: e.arg === null ? null : m(e.arg), sep: e.sep === undefined ? undefined : m(e.sep) };
     case "binary":
       return { ...e, left: m(e.left), right: m(e.right) };
     case "not":
+      return { ...e, expr: m(e.expr) };
+    case "cast":
       return { ...e, expr: m(e.expr) };
     case "in":
       return { ...e, expr: m(e.expr), list: e.list.map(m) };
@@ -194,6 +206,10 @@ export function ungroupedColumns(e: Expr, out: ColumnRef[] = []): ColumnRef[] {
       ungroupedColumns(e.right, out);
       break;
     case "not":
+    case "isnull":
+      ungroupedColumns(e.expr, out);
+      break;
+    case "cast":
       ungroupedColumns(e.expr, out);
       break;
     case "in":
@@ -209,9 +225,6 @@ export function ungroupedColumns(e: Expr, out: ColumnRef[] = []): ColumnRef[] {
       ungroupedColumns(e.expr, out);
       ungroupedColumns(e.pattern, out);
       break;
-    case "isnull":
-      ungroupedColumns(e.expr, out);
-      break;
     case "func":
       e.args.forEach((x) => ungroupedColumns(x, out));
       break;
@@ -224,4 +237,43 @@ export function ungroupedColumns(e: Expr, out: ColumnRef[] = []): ColumnRef[] {
       break;
   }
   return out;
+}
+
+/**
+ * Is `e` fully determined by the GROUP BY expressions? True when every path
+ * to a column either passes through an aggregate or is (part of) a structural
+ * match of a grouping expression. Bare grouping columns match by name so that
+ * `GROUP BY customerId` covers `orders.customerId`.
+ */
+export function coveredByGroupBy(e: Expr, groupBy: Expr[]): boolean {
+  const keys = new Set(groupBy.map((g) => JSON.stringify(g)));
+  const ok = (x: Expr): boolean => {
+    if (keys.has(JSON.stringify(x))) return true;
+    switch (x.kind) {
+      case "literal":
+      case "param":
+      case "aggregate":
+        return true;
+      case "column":
+        return groupBy.some((g) => g.kind === "column" && g.name === x.name);
+      case "binary":
+        return ok(x.left) && ok(x.right);
+      case "not":
+      case "isnull":
+        return ok(x.expr);
+      case "cast":
+        return ok(x.expr);
+      case "in":
+        return ok(x.expr) && x.list.every(ok);
+      case "between":
+        return ok(x.expr) && ok(x.lo) && ok(x.hi);
+      case "like":
+        return ok(x.expr) && ok(x.pattern);
+      case "func":
+        return x.args.every(ok);
+      case "case":
+        return x.branches.every((b) => ok(b.when) && ok(b.then)) && (x.else === undefined || ok(x.else));
+    }
+  };
+  return ok(e);
 }

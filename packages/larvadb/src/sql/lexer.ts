@@ -17,6 +17,7 @@ const KEYWORDS = new Set([
   "REFERENCES", "TRUE", "FALSE", "HAVING", "UNION", "INTERSECT", "EXCEPT", "OVER",
   "ALTER", "VIEW", "TRIGGER", "INDEX", "DISTINCT",
   "CASE", "WHEN", "THEN", "ELSE", "END", "CONFLICT", "DO", "NOTHING",
+  "CURRENT_TIMESTAMP",
 ]);
 
 export function tokenize(sql: string): Token[] {
@@ -74,6 +75,9 @@ export function tokenize(sql: string): Token[] {
       );
     } else if (c === "?") {
       tokens.push({ type: "param", text: "?", pos: i++ });
+    } else if (c === "-" && sql[i + 1] === ">" && sql[i + 2] === ">") {
+      tokens.push({ type: "op", text: "->>", pos: i });
+      i += 3;
     } else if (c === "|" && sql[i + 1] === "|") {
       tokens.push({ type: "op", text: "||", pos: i });
       i += 2;

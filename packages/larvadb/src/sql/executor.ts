@@ -2,7 +2,9 @@ import { ChunkRef, cmpScalar, LarvaProto, Manifest, Row, Scalar, Snapshot } from
 import { DatabaseSchema, TableSchema, validateInsert } from "../schema";
 import {
   Aggregate,
+  CastType,
   ColumnRef,
+  coveredByGroupBy,
   DeleteStmt,
   Expr,
   hasAggregate,
@@ -107,11 +109,13 @@ export class Executor {
     const fromSchema = this.schemaOf(snap.manifest, stmt.from.table);
     const leftChunks = await this.fetchTable(snap, stmt.from.table, fromSchema, stmt.where, fromName, params);
     const leftRows = leftChunks.flatMap((c) => c.rows);
+    const realCols = new Set(Object.keys(fromSchema.columns));
 
     let contexts: Ctx[];
     if (stmt.join) {
       const joinName = stmt.join.table.alias ?? stmt.join.table.table;
       const joinSchema = this.schemaOf(snap.manifest, stmt.join.table.table);
+      Object.keys(joinSchema.columns).forEach((c) => realCols.add(c));
       const rightRows = (
         await this.fetchTable(snap, stmt.join.table.table, joinSchema, undefined, joinName, params)
       ).flatMap((c) => c.rows);
@@ -156,7 +160,7 @@ export class Executor {
     let output: Row[];
     const hasAggregates = stmt.items?.some((i) => hasAggregate(i.expr)) ?? false;
     if (stmt.groupBy || stmt.having || hasAggregates) {
-      output = this.grouped(stmt, contexts, params);
+      output = this.grouped(stmt, contexts, params, realCols);
       if (stmt.orderBy) {
         for (const { column } of stmt.orderBy) {
           if (output.length > 0 && !(column.name in output[0])) {
@@ -204,38 +208,42 @@ export class Executor {
     return output.slice(offset, limit !== undefined ? offset + limit : undefined);
   }
 
-  private grouped(stmt: SelectStmt, contexts: Ctx[], params: Scalar[]): Row[] {
+  private grouped(stmt: SelectStmt, contexts: Ctx[], params: Scalar[], realCols: Set<string>): Row[] {
     const items = stmt.items;
     if (!items) throw new SqlError("PARSE_ERROR", "SELECT * cannot be combined with GROUP BY, HAVING, or aggregates; list columns explicitly");
-    const groupCols = stmt.groupBy ?? [];
+
+    // A bare name in GROUP BY or HAVING that matches a select-item alias (and
+    // is not a real column — columns win) refers to that item's expression,
+    // so GROUP BY month and HAVING revenue > 100 both work.
+    const aliased = new Map<string, Expr>();
+    for (const item of items) if (item.alias) aliased.set(item.alias, item.expr);
+    const dealias = (e: Expr): Expr =>
+      mapColumnRefs(e, (c) => (!c.table && !realCols.has(c.name) && aliased.has(c.name) ? (aliased.get(c.name) as Expr) : null));
+
+    const groupBy = (stmt.groupBy ?? []).map(dealias);
     const requireGrouped = (expr: Expr, where: string) => {
-      for (const col of ungroupedColumns(expr)) {
-        if (!groupCols.some((g) => g.name === col.name)) {
-          throw new SqlError(
-            "NOT_GROUPED",
-            `column "${col.name}" in ${where} must appear in GROUP BY or inside an aggregate`,
-          );
-        }
-      }
+      if (coveredByGroupBy(expr, groupBy)) return;
+      const names = new Set(groupBy.filter((g) => g.kind === "column").map((g) => (g as ColumnRef).name));
+      const offender = ungroupedColumns(expr).find((c) => !names.has(c.name));
+      throw new SqlError(
+        "NOT_GROUPED",
+        `column "${offender?.name ?? "?"}" in ${where} must appear in GROUP BY or inside an aggregate`,
+      );
     };
     for (const item of items) requireGrouped(item.expr, "the SELECT list");
 
-    // An unqualified name in HAVING that matches a select-item alias refers to
-    // that item's expression (so HAVING revenue > 100 works).
     let having = stmt.having;
     if (having) {
-      const aliased = new Map<string, Expr>();
-      for (const item of items) if (item.alias) aliased.set(item.alias, item.expr);
-      having = mapColumnRefs(having, (c) => (!c.table && aliased.has(c.name) ? (aliased.get(c.name) as Expr) : null));
+      having = dealias(having);
       requireGrouped(having, "HAVING");
     }
 
     const groups = new Map<string, Ctx[]>();
     for (const ctx of contexts) {
-      const key = JSON.stringify(groupCols.map((g) => this.resolveColumn(g, ctx)));
+      const key = JSON.stringify(groupBy.map((g) => this.evalExpr(g, ctx, params)));
       groups.set(key, [...(groups.get(key) ?? []), ctx]);
     }
-    if (groups.size === 0 && groupCols.length === 0) groups.set("[]", []); // aggregate over empty table
+    if (groups.size === 0 && groupBy.length === 0) groups.set("[]", []); // aggregate over empty table
 
     let rowsets = [...groups.values()];
     if (having) {
@@ -272,6 +280,12 @@ export class Executor {
         if (values.length === 0) return null;
         const sum = (values as number[]).reduce((a, b) => a + b, 0);
         return agg.func === "SUM" ? sum : sum / values.length;
+      }
+      case "GROUP_CONCAT": {
+        if (values.length === 0) return null;
+        const sep = agg.sep ? this.evalExpr(agg.sep, rows[0] ?? {}, params) : ",";
+        if (typeof sep !== "string") throw new SqlError("TYPE_MISMATCH", "the GROUP_CONCAT separator must be text");
+        return values.map((v) => (typeof v === "boolean" ? (v ? "true" : "false") : String(v))).join(sep);
       }
     }
   }
@@ -459,6 +473,8 @@ export class Executor {
         }
         return e.else !== undefined ? this.evalExpr(e.else, ctx, params, group) : null;
       }
+      case "cast":
+        return this.castValue(this.evalExpr(e.expr, ctx, params, group), e.to);
       case "literal":
         return e.value;
       case "param": {
@@ -507,6 +523,17 @@ export class Executor {
           }
           return String(l) + String(r);
         }
+        if (e.op === "->>") {
+          if (l === null || r === null) return null;
+          const doc = this.parseJsonDoc(l, "the left side of ->>");
+          if (typeof r === "string") {
+            return this.jsonScalar(doc !== null && typeof doc === "object" && !Array.isArray(doc) ? (doc as Record<string, unknown>)[r] : undefined);
+          }
+          if (typeof r === "number" && Number.isInteger(r)) {
+            return this.jsonScalar(Array.isArray(doc) ? doc[r] : undefined);
+          }
+          throw new SqlError("TYPE_MISMATCH", `->> expects a text key or integer index on the right, got ${JSON.stringify(r)}`);
+        }
         if (["+", "-", "*", "/"].includes(e.op)) {
           if (l === null || r === null) return null;
           if (typeof l !== "number" || typeof r !== "number") {
@@ -545,7 +572,11 @@ export class Executor {
       if (typeof v !== "number") throw new SqlError("TYPE_MISMATCH", `${name} expects a number for argument ${i + 1}, got ${JSON.stringify(v)}`);
       return v;
     };
+    // These four make sense with NULL (or no) arguments; everything below NULL-propagates.
     if (name === "COALESCE") return args.find((v) => v !== null) ?? null;
+    if (name === "IFNULL") return args[0] !== null ? args[0] : args[1];
+    if (name === "NULLIF") return args[0] === args[1] ? null : args[0];
+    if (name === "NOW") return new Date().toISOString();
     if (args[0] === null) return null;
     switch (name) {
       case "UPPER":
@@ -571,9 +602,107 @@ export class Executor {
         const len = args.length > 2 ? Math.max(0, num(args[2], 2)) : undefined;
         return s.slice(begin, len === undefined ? undefined : begin + len);
       }
+      case "DATE":
+        // Timestamps are ISO 8601 text, so the calendar date is a prefix.
+        return str(args[0]).slice(0, 10);
+      case "STRFTIME": {
+        const fmt = str(args[0]);
+        if (args[1] === null) return null;
+        const ts = str(args[1], 1);
+        return fmt.replace(/%(.)/g, (_, spec: string) => {
+          switch (spec) {
+            case "Y": return ts.slice(0, 4);
+            case "m": return ts.slice(5, 7);
+            case "d": return ts.slice(8, 10);
+            case "H": return ts.slice(11, 13);
+            case "M": return ts.slice(14, 16);
+            case "S": return ts.slice(17, 19);
+            case "%": return "%";
+            default:
+              throw new SqlError("UNSUPPORTED_FEATURE", `STRFTIME specifier %${spec} is not supported; available: %Y %m %d %H %M %S`);
+          }
+        });
+      }
+      case "REPLACE": {
+        if (args[1] === null || args[2] === null) return null;
+        return str(args[0]).split(str(args[1], 1)).join(str(args[2], 2));
+      }
+      case "CEIL":
+        return Math.ceil(num(args[0]));
+      case "FLOOR":
+        return Math.floor(num(args[0]));
+      case "MOD": {
+        if (args[1] === null) return null;
+        const d = num(args[1], 1);
+        return d === 0 ? null : num(args[0]) % d; // SQL: x MOD 0 is NULL, not an error
+      }
+      case "JSON_EXTRACT": {
+        if (args[1] === null) return null;
+        return this.jsonExtract(str(args[0]), str(args[1], 1));
+      }
       default:
         throw new SqlError("UNKNOWN_FUNCTION", `function "${name}" is not available`); // unreachable — parser gates the set
     }
+  }
+
+  private castValue(v: Scalar, to: CastType): Scalar {
+    if (v === null) return null;
+    switch (to) {
+      case "text":
+        return typeof v === "boolean" ? (v ? "true" : "false") : String(v);
+      case "integer":
+      case "real": {
+        const n = typeof v === "number" ? v : typeof v === "boolean" ? (v ? 1 : 0) : Number(v);
+        if (Number.isNaN(n)) throw new SqlError("TYPE_MISMATCH", `cannot CAST ${JSON.stringify(v)} to ${to}`);
+        return to === "integer" ? Math.trunc(n) : n;
+      }
+      case "boolean": {
+        if (typeof v === "boolean") return v;
+        if (typeof v === "number") return v !== 0;
+        if (v === "true") return true;
+        if (v === "false") return false;
+        throw new SqlError("TYPE_MISMATCH", `cannot CAST ${JSON.stringify(v)} to boolean`);
+      }
+    }
+  }
+
+  private parseJsonDoc(v: Scalar, where: string): unknown {
+    if (typeof v !== "string") {
+      throw new SqlError("TYPE_MISMATCH", `${where} must be JSON text (store JSON with a text column and JSON.stringify), got ${JSON.stringify(v)}`);
+    }
+    try {
+      return JSON.parse(v);
+    } catch {
+      throw new SqlError("TYPE_MISMATCH", `${where} is not valid JSON`);
+    }
+  }
+
+  /** Objects and arrays come back as JSON text (SQLite json1 semantics); missing paths are NULL. */
+  private jsonScalar(v: unknown): Scalar {
+    if (v === undefined || v === null) return null;
+    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return v;
+    return JSON.stringify(v);
+  }
+
+  private jsonExtract(json: string, path: string): Scalar {
+    const doc = this.parseJsonDoc(json, "JSON_EXTRACT's first argument");
+    if (!path.startsWith("$")) {
+      throw new SqlError("INVALID_JSON_PATH", `JSON paths start with "$" (e.g. '$.user.name' or '$.tags[0]'), got ${JSON.stringify(path)}`);
+    }
+    let cur: unknown = doc;
+    const seg = /\.([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\]/y;
+    seg.lastIndex = 1;
+    let at = 1;
+    while (at < path.length) {
+      const m = seg.exec(path);
+      if (!m) {
+        throw new SqlError("INVALID_JSON_PATH", `cannot parse JSON path ${JSON.stringify(path)} at position ${at}; use the '$.key.sub[0]' form`);
+      }
+      at = seg.lastIndex;
+      if (cur === null || typeof cur !== "object") return null;
+      cur = m[1] !== undefined ? (cur as Record<string, unknown>)[m[1]] : Array.isArray(cur) ? cur[Number(m[2])] : undefined;
+    }
+    return this.jsonScalar(cur);
   }
 
   // ---------- writes ----------
