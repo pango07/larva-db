@@ -8,7 +8,7 @@
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Current release: 1.0.0.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Current release: 1.1.1.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
