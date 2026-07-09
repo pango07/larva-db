@@ -1,6 +1,6 @@
 /**
  * Smoke test for the rest of the §13 API: transaction (atomicity,
- * read-your-writes, concurrent re-execution), export (json/csv/sqlite),
+ * read-your-writes, concurrent re-execution), export (json/csv/sqlite/postgres),
  * vacuum (retention + orphan sweep).
  *
  *   bun scripts/api-smoke.ts
@@ -111,6 +111,55 @@ const { Database } = (await import("bun:sqlite")) as unknown as {
 const reopened = Database.deserialize(sqliteBytes);
 const backRow = reopened.prepare("SELECT count FROM inventory WHERE sku = 'gadget'").get() as { count: number };
 ok("sqlite export round-trips through a real engine", backRow.count === gadget, JSON.stringify(backRow));
+
+// --- postgres export: one .sql file, pg_dump-shaped ---
+const pgSchema = defineSchema({
+  authors: { id: t.text().primaryKey(), name: t.text(), email: t.text().unique() },
+  posts: {
+    id: t.text().primaryKey(),
+    authorId: t.text().references("authors.id"),
+    title: t.text(),
+    stars: t.real(),
+    views: t.integer(),
+    published: t.boolean(),
+    createdAt: t.timestamp().partitionBy(),
+  },
+});
+const pgDb = larva({ schema: pgSchema, prefix: `apitest/${ulid()}/` });
+const [author] = await pgDb.sql`INSERT INTO authors (name, email) VALUES (${"Ada"}, ${"ada@example.com"}) RETURNING *`;
+await pgDb.sql`INSERT INTO posts (authorId, title, stars, views, published, createdAt) VALUES
+  (${String(author.id)}, ${"tab\there\nnewline and \\ backslash"}, ${4.5}, ${12}, ${true}, ${"2026-07-01T12:00:00Z"}),
+  (${String(author.id)}, ${"untitled"}, ${null}, ${0}, ${false}, ${"2026-07-02T12:00:00Z"})`;
+const pgSql = await pgDb.export({ format: "postgres" });
+ok(
+  "postgres export: DDL with mapped types + constraints",
+  pgSql.includes('CREATE TABLE "posts"') &&
+    pgSql.includes('"stars" double precision') &&
+    pgSql.includes('"createdAt" timestamptz') &&
+    pgSql.includes('"id" text PRIMARY KEY') &&
+    pgSql.includes('"email" text UNIQUE') &&
+    pgSql.includes('"views" bigint'),
+  pgSql.slice(0, 600),
+);
+ok(
+  "postgres export: COPY blocks, escaping, NULL as \\N, booleans as t/f",
+  pgSql.includes('COPY "posts" ("id", "authorId", "title", "stars", "views", "published", "createdAt") FROM stdin;') &&
+    pgSql.includes("tab\\there\\nnewline and \\\\ backslash") &&
+    pgSql.includes("\\N\t0\tf\t") &&
+    pgSql.includes("\t4.5\t12\tt\t"),
+  pgSql.slice(pgSql.indexOf("COPY"), pgSql.indexOf("COPY") + 500),
+);
+const fkStmt = 'ALTER TABLE "posts" ADD CONSTRAINT "posts_authorId_fkey" FOREIGN KEY ("authorId") REFERENCES "authors" ("id");';
+ok(
+  "postgres export: FK constraints come after all COPY data",
+  pgSql.includes(fkStmt) && pgSql.indexOf(fkStmt) > pgSql.lastIndexOf("\\."),
+  pgSql.slice(-400),
+);
+ok(
+  "postgres export: one atomic load (BEGIN ... COMMIT)",
+  pgSql.startsWith("-- Larva export") && pgSql.includes("BEGIN;") && pgSql.trimEnd().endsWith("COMMIT;"),
+);
+await pgDb.destroy();
 
 // --- vacuum ---
 for (let i = 0; i < 12; i++) await db.sql`UPDATE inventory SET count = count + 0 WHERE sku = ${"widget"}`;

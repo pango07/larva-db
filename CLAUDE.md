@@ -16,7 +16,7 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bun scripts/stress.ts` — commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)
 - `bun scripts/property.ts` — property-based random-workload conflict test (same token requirement)
 - `bun scripts/sql-smoke.ts` — full v1 dialect walkthrough (parser error catalog offline, then live queries, pruning, time travel)
-- `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite), vacuum retention
+- `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite/postgres), vacuum retention
 - `bun scripts/s3-adapter-test.ts` — S3Adapter contract + stress harness over an in-process fake S3 with 409/500 chaos injection (no credentials needed)
 - `bun scripts/group-commit-test.ts` — group-commit coalescing, batch error isolation, nested-commit deadlock guard, and the property conflict harness, all over the chaos fake S3 (no credentials needed)
 - `bun scripts/bench.ts` — write-throughput benchmark over latency-simulated fake S3; compares per-instance coalescing against cross-instance contention (`--latency`, `--writers`, `--ops`)
@@ -43,7 +43,7 @@ Larva is a deliberate miniaturization of the Delta Lake / Iceberg pattern on top
 - `UPDATE`/`DELETE` without `WHERE` requires explicit `{ allowFullTable: true }`.
 - The parser rejects multiple statements per string (injection stacking vector).
 - The v1 public API surface (Design §13) must fit on one screen: `larva()`, `db.sql` tagged template (primary API), `db.query(str, params)`, `db.transaction`, `db.asOf`, `db.rollbackTo`, `db.export`, `db.vacuum`. Resist growing it.
-- Export (SQLite/JSON/CSV) is a v1 feature, not an afterthought — the escape hatch is part of the product promise.
+- Export (SQLite/Postgres/JSON/CSV) is a v1 feature, not an afterthought — the escape hatch is part of the product promise.
 - Only Vercel-specific code should be the storage adapter; the `StorageAdapter` contract is exactly four operations: get, put-with-CAS, delete, list-by-prefix.
 
 ## Design constraints that shape implementation

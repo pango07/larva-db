@@ -85,9 +85,12 @@ History is kept for 7 days (or the last 50 versions, whichever is more).
 Larva is for small apps. You've outgrown it if you need more than a handful of writes per second, or your tables reach millions of rows. When that happens:
 
 ```bash
+npx larva export --format postgres # one .sql file → psql $DATABASE_URL < export.sql
 npx larva export --format sqlite   # a real SQLite file → import into Turso, D1, etc.
-npx larva export --format csv      # spreadsheets, Postgres COPY
+npx larva export --format csv      # spreadsheets
 ```
+
+The Postgres file is `pg_dump`-shaped: `CREATE TABLE` with proper types, data as fast `COPY` blocks, and your `.references()` declarations become real `FOREIGN KEY` constraints. One command out, one command in.
 
 Your data is never trapped. That's a promise, not a feature.
 
