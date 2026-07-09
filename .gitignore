@@ -45,3 +45,6 @@ next-env.d.ts
 
 # built package output
 packages/larvadb/dist/
+
+# local-only agent notes (never commit)
+CLAUDE.local.md

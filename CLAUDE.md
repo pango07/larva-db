@@ -19,7 +19,7 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite), vacuum retention
 - `bun scripts/s3-adapter-test.ts` — S3Adapter contract + stress harness over an in-process fake S3 with 409/500 chaos injection (no credentials needed)
 - `bun run --cwd packages/larvadb build` — build the npm package (bundle + d.ts); `npm pack --dry-run` there to inspect the tarball. Do not `npm publish` without the user's explicit go-ahead.
-- Deploy: `vercel deploy --prod --yes` (project `attentive/larva-db`, direct upload; GitHub repo is `pango07/larva-db` but is not connected to Vercel)
+- Deploy: `vercel deploy --prod --yes` (direct upload)
 
 ## Architecture (Path B — chunked storage, chosen over embedded SQLite)
 
@@ -52,5 +52,3 @@ Larva is a deliberate miniaturization of the Delta Lake / Iceberg pattern on top
 - **Correctness risk concentrates in the conflict/retry matrix**; the plan is property-based testing (concurrent random writers, assert no lost updates).
 
 Keep `LARVA-DESIGN.md` in sync with any design decisions made during implementation — it is the spec of record, and §14 lists the open questions (parser approach, chunk sizing, `RETURNING`, CI strategy for conflict testing).
-
-
