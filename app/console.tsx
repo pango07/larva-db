@@ -33,6 +33,13 @@ const EXAMPLES: { label: string; sql: string }[] = [
     sql: `INSERT INTO customers (name, email, city, createdAt)\nVALUES ('Annie Easley', 'annie@example.com', 'Cleveland', '2026-07-08T12:00:00Z')\nRETURNING *`,
   },
   {
+    label: "revenue by day",
+    sql: `SELECT DATE(createdAt) AS day, SUM(total) AS revenue
+FROM orders
+GROUP BY DATE(createdAt)
+ORDER BY day`,
+  },
+  {
     label: "HAVING + CASE",
     sql: `SELECT customerId, SUM(total) AS revenue,\n  CASE WHEN SUM(total) > 500 THEN 'vip' ELSE 'standard' END AS tier\nFROM orders\nGROUP BY customerId\nHAVING revenue > 100\nORDER BY revenue DESC`,
   },

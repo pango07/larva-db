@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-129_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-151_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -110,7 +110,7 @@ When you get there, congratulations: run the export and graduate.
 
 ## SQL dialect
 
-Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, and scalar functions `UPPER`/`LOWER`/`LENGTH`/`TRIM`/`ROUND`/`ABS`/`COALESCE`/`SUBSTR`; `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` (incl. `COUNT(DISTINCT …)`) and `HAVING`, two-table `INNER`/`LEFT JOIN`; `INSERT` (multi-row, `RETURNING`) with upsert:
+Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, `CAST`, scalar functions (`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ROUND`, `ABS`, `COALESCE`, `NULLIF`, `IFNULL`, `REPLACE`, `CEIL`, `FLOOR`, `MOD`, `SUBSTR`), date helpers (`NOW()`/`CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` — timestamps are ISO text, so this is cheap and range filters stay prunable), and JSON over text columns (`JSON_EXTRACT(col, '$.a[0]')`, `->>`); `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` over expressions or aliases (`GROUP BY DATE(createdAt)`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`GROUP_CONCAT` (incl. `COUNT(DISTINCT …)`) and `HAVING`, two-table `INNER`/`LEFT JOIN`; `INSERT` (multi-row, `RETURNING`) with upsert:
 
 ```ts
 await db.sql`INSERT INTO counters (slug, count) VALUES (${"visits"}, ${1})
@@ -140,7 +140,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **129 checks across six suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **151 checks across six suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|

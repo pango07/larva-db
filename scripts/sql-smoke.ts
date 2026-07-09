@@ -45,7 +45,13 @@ await expectSqlError("CREATE VIEW", () => parse("CREATE VIEW v AS SELECT 1"), "U
 await expectSqlError("CREATE TRIGGER", () => parse("CREATE TRIGGER trg"), "UNSUPPORTED_FEATURE", "triggers");
 await expectSqlError("CREATE INDEX", () => parse("CREATE INDEX idx ON a (x)"), "UNSUPPORTED_FEATURE", "indexes");
 await expectSqlError("stacked statements", () => parse("SELECT * FROM a; DROP TABLE a"), "MULTIPLE_STATEMENTS", "injection");
-await expectSqlError("unknown function lists the whole catalog", () => parse("SELECT NOW() FROM a"), "UNKNOWN_FUNCTION", "COALESCE");
+await expectSqlError("unknown function lists the whole catalog", () => parse("SELECT MEDIAN(x) FROM a"), "UNKNOWN_FUNCTION", "COALESCE");
+await expectSqlError("CONCAT hints at ||", () => parse("SELECT CONCAT(a, b) FROM t"), "UNKNOWN_FUNCTION", "||");
+await expectSqlError("SUBSTRING hints at SUBSTR", () => parse("SELECT SUBSTRING(a, 1, 2) FROM t"), "UNKNOWN_FUNCTION", "SUBSTR");
+await expectSqlError("DATE_TRUNC hints at DATE/STRFTIME", () => parse("SELECT DATE_TRUNC('month', x) FROM t"), "UNKNOWN_FUNCTION", "STRFTIME");
+await expectSqlError("unknown CAST target", () => parse("SELECT CAST(x AS blob) FROM t"), "UNKNOWN_TYPE", "blob");
+await expectSqlError("aggregate in GROUP BY", () => parse("SELECT COUNT(*) FROM t GROUP BY SUM(x)"), "AGGREGATE_MISPLACED", "GROUP BY");
+await expectSqlError("separator on non-GROUP_CONCAT aggregate", () => parse("SELECT SUM(x, ',') FROM t"), "PARSE_ERROR", "GROUP_CONCAT");
 await expectSqlError("nested aggregates", () => parse("SELECT SUM(COUNT(x)) FROM a"), "UNSUPPORTED_FEATURE", "nested");
 await expectSqlError("aggregate in WHERE points to HAVING", () => parse("SELECT * FROM a WHERE COUNT(*) > 1"), "AGGREGATE_IN_WHERE", "HAVING");
 await expectSqlError("wrong function arity", () => parse("SELECT ROUND(x, 1, 2) FROM a"), "WRONG_ARGUMENT_COUNT", "ROUND");
@@ -62,6 +68,11 @@ ok("nested scalar functions parse", parse("SELECT COALESCE(UPPER(name), '?') FRO
 ok("|| concatenation parses", parse("SELECT a || b FROM t").kind === "select");
 ok("upsert parses", parse("INSERT INTO t (id, n) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET n = excluded.n").kind === "insert");
 ok("DO NOTHING parses without a target", parse("INSERT INTO t (id) VALUES (?) ON CONFLICT DO NOTHING").kind === "insert");
+ok("GROUP BY expression parses", parse("SELECT DATE(createdAt), SUM(total) FROM orders GROUP BY DATE(createdAt)").kind === "select");
+ok("CAST parses", parse("SELECT CAST(x AS integer) FROM t").kind === "select");
+ok("CURRENT_TIMESTAMP parses", parse("SELECT CURRENT_TIMESTAMP FROM t").kind === "select");
+ok("GROUP_CONCAT with separator parses", parse("SELECT GROUP_CONCAT(name, ', ') FROM t").kind === "select");
+ok("->> parses", parse("SELECT payload ->> 'user' FROM events").kind === "select");
 
 // ---------- Part B: live walkthrough ----------
 if (!process.env.BLOB_READ_WRITE_TOKEN) {
@@ -209,6 +220,39 @@ ok("increment upsert (count = count + 1)", (await db.sql`SELECT count FROM count
 await db.sql`DROP TABLE counters`;
 await expectSqlError("conflict target must be pk or unique", () => db.sql`INSERT INTO customers (name, email, createdAt) VALUES (${"X"}, ${"x@example.com"}, ${"2026-06-08T00:00:00Z"}) ON CONFLICT (name) DO NOTHING`, "INVALID_CONFLICT_TARGET", "name");
 await expectSqlError("a conflict outside the target still fails loudly", () => db.sql`INSERT INTO customers (id, name, email, createdAt) VALUES (${String(ada.id)}, ${"X"}, ${"fresh@example.com"}, ${"2026-06-08T00:00:00Z"}) ON CONFLICT (email) DO NOTHING`, "PRIMARY_KEY_CONFLICT", "does not cover");
+
+// time-series shapes: dates, GROUP BY expressions and aliases
+// (orders: Ada 200/220/240 on June 5/10/15, Grace 130/140 on July 1/3)
+const daily = await db.sql`SELECT DATE(createdAt) AS day, SUM(total) AS revenue FROM orders GROUP BY DATE(createdAt) ORDER BY day`;
+ok("revenue by day (GROUP BY expression)", daily.length === 5 && daily[0].day === "2026-06-05" && daily[0].revenue === 200, fmt(daily));
+const monthly = await db.sql`SELECT STRFTIME(${"%Y-%m"}, createdAt) AS month, COUNT(*) AS n FROM orders GROUP BY month ORDER BY month`;
+ok("monthly buckets (STRFTIME + GROUP BY alias)", fmt(monthly) === '[{"month":"2026-06","n":3},{"month":"2026-07","n":2}]', fmt(monthly));
+const tiers = await db.sql`SELECT CASE WHEN total >= 200 THEN ${"big"} ELSE ${"small"} END AS tier, COUNT(*) AS n FROM orders GROUP BY tier ORDER BY n DESC`;
+ok("GROUP BY a CASE alias", fmt(tiers) === '[{"tier":"big","n":3},{"tier":"small","n":2}]', fmt(tiers));
+const nowRow = await db.sql`SELECT NOW() AS ts, CURRENT_TIMESTAMP AS ts2, DATE(NOW()) AS today FROM customers LIMIT 1`;
+ok("NOW / CURRENT_TIMESTAMP / DATE", typeof nowRow[0].ts === "string" && String(nowRow[0].ts).includes("T") && String(nowRow[0].ts2).includes("T") && String(nowRow[0].today).length === 10, fmt(nowRow));
+
+// scalar stragglers + CAST
+const cast = await db.sql`SELECT CAST(total AS integer) AS i, CAST(total AS text) AS s FROM orders ORDER BY total LIMIT 1`;
+ok("CAST to integer and text", cast[0].i === 130 && cast[0].s === "130", fmt(cast));
+const nulls = await db.sql`SELECT NULLIF(status, ${"archived"}) AS gone, IFNULL(NULL, ${"fallback"}) AS fb FROM orders LIMIT 1`;
+ok("NULLIF / IFNULL", nulls[0].gone === null && nulls[0].fb === "fallback", fmt(nulls));
+const misc = await db.sql`SELECT REPLACE(${"a-b-c"}, ${"-"}, ${"."}) AS r, CEIL(1.2) AS c, FLOOR(1.8) AS f, MOD(7, 3) AS m FROM customers LIMIT 1`;
+ok("REPLACE / CEIL / FLOOR / MOD", misc[0].r === "a.b.c" && misc[0].c === 2 && misc[0].f === 1 && misc[0].m === 1, fmt(misc));
+
+// GROUP_CONCAT
+const gc = await db.sql`SELECT customerId, GROUP_CONCAT(total, ${", "}) AS totals FROM orders GROUP BY customerId ORDER BY totals`;
+ok("GROUP_CONCAT with separator", gc.some((r) => r.totals === "200, 220, 240") && gc.some((r) => r.totals === "130, 140"), fmt(gc));
+
+// JSON over text columns (SQLite json1 semantics; t.json() is still reserved)
+await db.sql`CREATE TABLE events (id text PRIMARY KEY, payload text)`;
+await db.sql`INSERT INTO events (payload) VALUES (${JSON.stringify({ user: { name: "Ada" }, tags: ["alpha", "beta"] })})`;
+const je = await db.sql`SELECT JSON_EXTRACT(payload, ${"$.user.name"}) AS who, payload ->> ${"user"} AS userJson FROM events`;
+ok("JSON_EXTRACT + ->>", je[0].who === "Ada" && typeof je[0].userJson === "string" && String(je[0].userJson).includes("Ada"), fmt(je));
+const jf = await db.sql`SELECT COUNT(*) AS n FROM events WHERE JSON_EXTRACT(payload, ${"$.tags[1]"}) = ${"beta"}`;
+ok("filter on a JSON path", jf[0].n === 1, fmt(jf));
+await expectSqlError("bad JSON path is caught", () => db.sql`SELECT JSON_EXTRACT(payload, ${"user.name"}) AS x FROM events`, "INVALID_JSON_PATH", "$");
+await db.sql`DROP TABLE events`;
 
 // zone-map pruning: each insert above made one chunk; a narrow date filter must skip most
 const chunks = await db.sql`SELECT COUNT(*) AS n FROM orders WHERE createdAt BETWEEN ${"2026-07-01"} AND ${"2026-07-31"}`;

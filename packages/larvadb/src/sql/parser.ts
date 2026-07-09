@@ -1,5 +1,6 @@
 import {
   AggFunc,
+  CastType,
   ColumnRef,
   CompareOp,
   Expr,
@@ -14,7 +15,7 @@ import {
 import { SqlError, unsupported } from "./errors";
 import { Token, tokenize } from "./lexer";
 
-const AGG_FUNCS = new Set(["COUNT", "SUM", "AVG", "MIN", "MAX"]);
+const AGG_FUNCS = new Set(["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT"]);
 /** name → [min arity, max arity] */
 const SCALAR_FUNCS: Record<string, [number, number]> = {
   UPPER: [1, 1],
@@ -25,9 +26,29 @@ const SCALAR_FUNCS: Record<string, [number, number]> = {
   ROUND: [1, 2],
   SUBSTR: [2, 3],
   COALESCE: [2, Infinity],
+  DATE: [1, 1],
+  STRFTIME: [2, 2],
+  NOW: [0, 0],
+  NULLIF: [2, 2],
+  IFNULL: [2, 2],
+  REPLACE: [3, 3],
+  CEIL: [1, 1],
+  FLOOR: [1, 1],
+  MOD: [2, 2],
+  JSON_EXTRACT: [2, 2],
 };
 const FUNC_LIST =
-  "aggregates COUNT, SUM, AVG, MIN, MAX and scalar functions UPPER, LOWER, LENGTH, TRIM, ROUND, ABS, COALESCE, SUBSTR";
+  "aggregates COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT and scalar functions UPPER, LOWER, LENGTH, TRIM, ROUND, ABS, COALESCE, SUBSTR, DATE, STRFTIME, NOW, NULLIF, IFNULL, REPLACE, CEIL, FLOOR, MOD, JSON_EXTRACT, CAST";
+/** Near-miss names agents emit, mapped to the supported spelling. */
+const FUNC_HINTS: Record<string, string> = {
+  CONCAT: "use the || operator instead",
+  SUBSTRING: "use SUBSTR(text, start, length)",
+  CEILING: "use CEIL",
+  TO_CHAR: "use STRFTIME(format, timestamp)",
+  DATE_TRUNC: "use DATE(x) for days or STRFTIME('%Y-%m', x) for months",
+  DATETIME: "timestamps are ISO 8601 text; compare them directly or slice with DATE(x)",
+  JSON_EXTRACT_PATH_TEXT: "use JSON_EXTRACT(column, '$.path') or the ->> operator",
+};
 
 /**
  * Hand-written recursive-descent / Pratt parser for the Larva dialect
@@ -176,8 +197,11 @@ class Parser {
 
     if (this.eat("keyword", "GROUP")) {
       this.expect("keyword", "BY");
-      stmt.groupBy = [this.columnRef()];
-      while (this.eat("punct", ",")) stmt.groupBy.push(this.columnRef());
+      stmt.groupBy = [this.expr()];
+      while (this.eat("punct", ",")) stmt.groupBy.push(this.expr());
+      if (stmt.groupBy.some(hasAggregate)) {
+        throw new SqlError("AGGREGATE_MISPLACED", "aggregate functions are not allowed in GROUP BY; group by the raw expression and aggregate in the SELECT list");
+      }
     }
     if (this.eat("keyword", "HAVING")) stmt.having = this.expr();
 
@@ -429,8 +453,8 @@ class Parser {
 
   private additive(): Expr {
     let left = this.multiplicative();
-    while (this.at("op") && ["+", "-", "||"].includes(this.peek().text)) {
-      const op = this.next().text as "+" | "-" | "||";
+    while (this.at("op") && ["+", "-", "||", "->>"].includes(this.peek().text)) {
+      const op = this.next().text as "+" | "-" | "||" | "->>";
       left = { kind: "binary", op, left, right: this.multiplicative() };
     }
     return left;
@@ -460,6 +484,7 @@ class Parser {
     if (this.at("number")) return { kind: "literal", value: Number(this.next().text) };
     if (this.at("string")) return { kind: "literal", value: this.next().text };
     if (this.eat("keyword", "NULL")) return { kind: "literal", value: null };
+    if (this.eat("keyword", "CURRENT_TIMESTAMP")) return { kind: "func", name: "NOW", args: [] };
     if (this.eat("keyword", "TRUE")) return { kind: "literal", value: true };
     if (this.eat("keyword", "FALSE")) return { kind: "literal", value: false };
     if (this.at("punct", "-") || (this.at("op") && this.peek().text === "-")) {
@@ -479,6 +504,8 @@ class Parser {
     const func = this.next().text.toUpperCase();
     this.expect("punct", "(");
 
+    if (func === "CAST") return this.castExpr();
+
     if (AGG_FUNCS.has(func)) {
       if (this.aggDepth > 0) {
         throw new SqlError(
@@ -496,9 +523,14 @@ class Parser {
         arg = this.expr();
         this.aggDepth--;
       }
+      let sep: Expr | undefined;
+      if (this.eat("punct", ",")) {
+        if (func !== "GROUP_CONCAT") throw this.err(`${func} takes a single argument (only GROUP_CONCAT accepts a separator)`);
+        sep = this.additive();
+      }
       this.expect("punct", ")");
       if (this.at("keyword", "OVER")) throw unsupported("OVER");
-      return { kind: "aggregate", func: func as AggFunc, arg, distinct };
+      return { kind: "aggregate", func: func as AggFunc, arg, distinct, sep };
     }
 
     const arity = SCALAR_FUNCS[func];
@@ -518,7 +550,25 @@ class Parser {
       return { kind: "func", name: func as ScalarFunc, args };
     }
 
-    throw new SqlError("UNKNOWN_FUNCTION", `function "${func}" is not available; Larva supports ${FUNC_LIST}`);
+    const hint = FUNC_HINTS[func];
+    throw new SqlError("UNKNOWN_FUNCTION", `function "${func}" is not available; ${hint ?? `Larva supports ${FUNC_LIST}`}`);
+  }
+
+  /** CAST(expr AS type) — the opening paren is already consumed. */
+  private castExpr(): Expr {
+    const expr = this.expr();
+    this.expect("keyword", "AS");
+    const raw = this.ident("type name").toLowerCase();
+    const TYPES: Record<string, CastType> = {
+      text: "text", varchar: "text", timestamp: "text", datetime: "text",
+      integer: "integer", int: "integer",
+      real: "real", float: "real", double: "real",
+      boolean: "boolean", bool: "boolean",
+    };
+    const to = TYPES[raw];
+    if (!to) throw new SqlError("UNKNOWN_TYPE", `CAST target "${raw}" is not available; use text, integer, real, or boolean`);
+    this.expect("punct", ")");
+    return { kind: "cast", expr, to };
   }
 
   private caseExpr(): Expr {
