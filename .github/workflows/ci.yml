@@ -59,17 +59,42 @@ jobs:
       id-token: write # npm provenance
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0 # the package-change gate diffs against the pre-push commit
+
+      # Docs and app changes must not mint npm releases: publish only when the
+      # pushed range actually touched the package. A version bump edits
+      # packages/larvadb/package.json, so real releases always pass this gate.
+      - name: Gate on package changes
+        id: gate
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+            echo "unknown pre-push commit — erring on the side of publishing"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BEFORE" HEAD -- packages/larvadb; then
+            echo "packages/larvadb untouched by this push — skipping publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "packages/larvadb changed — publishing"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: steps.gate.outputs.changed == 'true'
         with:
           bun-version: latest
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.gate.outputs.changed == 'true'
         with:
           node-version: 22
 
       - name: Upgrade npm (OIDC trusted publishing needs >= 11.5; pinned to 11.x)
+        if: steps.gate.outputs.changed == 'true'
         run: npm install -g npm@11 && npm --version
 
       - name: Install
+        if: steps.gate.outputs.changed == 'true'
         run: bun install --frozen-lockfile
 
       # Auth is npm Trusted Publishing (OIDC): the registry trusts this repo's
@@ -79,6 +104,7 @@ jobs:
       # which would invoke arborist to reconcile workspaces and crash on the
       # root's `workspace:*` dependency (a bun protocol npm can't resolve).
       - name: Publish to npm
+        if: steps.gate.outputs.changed == 'true'
         working-directory: packages/larvadb
         run: |
           NAME=$(jq -r .name package.json)
