@@ -162,6 +162,21 @@ await db.upgrade();                      // flip an existing database
 const db2 = larva({ schema, commitLog: true }); // or start new ones there
 ```
 
+### The CLI
+
+The whole API is also a shell command — `npx larva` works wherever `@larva-db/core` is installed:
+
+```bash
+npx larva sql "SELECT name, email FROM customers LIMIT 5"
+npx larva export --format postgres --out export.sql  # then: psql $DATABASE_URL < export.sql
+npx larva upgrade                                    # flip to format 3, the commit log
+npx larva rollback 41                                # the undo button, from your shell
+npx larva vacuum
+npx larva version
+```
+
+Credentials auto-load from `.env.local` (`vercel env pull .env.local`); `--prefix` targets a specific database. Full reference — every command, flag, and troubleshooting — in [docs/cli.md](https://github.com/pango07/larva-db/blob/main/docs/cli.md).
+
 ### Any S3-compatible store
 
 Vercel Blob is the default, but the storage contract is four operations, so the same database runs on AWS S3 or Cloudflare R2 — zero extra dependencies:
@@ -245,7 +260,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## Tested where it matters
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **194 checks across six suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **213 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
 
 The stress and property harnesses ship in the package for testing your own setup:
 

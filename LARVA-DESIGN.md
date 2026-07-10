@@ -73,7 +73,7 @@ This is not a novel architecture. It is a deliberate miniaturization of the patt
 
 ## 5. Storage layout
 
-A Larva database occupies a prefix inside a **private** Vercel Blob store (public stores are refused at connection time; see Section 11). The layout under that prefix:
+A Larva database occupies a prefix inside a Vercel Blob store, and every blob is **private by construction** — the adapter writes `access: "private"` on every put, so data can never be publicly readable regardless of the store's default (see Section 11). The layout under that prefix:
 
 ```
 larva/
@@ -221,7 +221,7 @@ The resulting front-page sentence: *Larva grows to gigabytes of storage; you hav
 
 ## 11. Security posture
 
-**Private storage only.** Larva refuses to initialize against a public Blob store, because public blobs are readable by anyone holding the URL and blob URLs can leak and be indexed. All data blobs live in a private store; every read and write is authenticated with the store's token via the standard `@vercel/blob` SDK (OIDC or read-write token from the Vercel environment). Larva never generates public URLs for data blobs.
+**Private storage only.** Every blob Larva writes carries `access: "private"` — enforced in the storage adapter on every put, not checked once at connect time — because public blobs are readable by anyone holding the URL, and blob URLs leak and get indexed. Every read and write is authenticated with the store's token via the standard `@vercel/blob` SDK (OIDC or read-write token from the Vercel environment). Larva never generates public URLs for data blobs.
 
 **The token is the perimeter.** Anyone with the Blob read-write token has full read-write on the database — Larva adds no user-level access control, and says so plainly. Row-level security, multi-tenant isolation within one database, and per-user permissions are application concerns (or reasons to graduate to Postgres). The threat model v1 defends: network attackers (everything is authenticated HTTPS), blob-URL leakage (private store), concurrent-writer corruption (commit protocol), and accidental destruction (time travel).
 
@@ -264,6 +264,8 @@ await db.export({ format: "sqlite" });           // the escape hatch
 await db.vacuum();                               // reclaim storage outside retention
 await db.upgrade();                              // one-way flip to format 3 (the commit log)
 ```
+
+The same surface ships as a shell command — the package's `larva` bin (`npx larva sql | export | upgrade | rollback | vacuum | version`, credentials auto-loaded from `.env.local`). One surface, two doors; the CLI is validated end to end by `scripts/cli-smoke.ts`.
 
 ## 14. Roadmap and open questions
 

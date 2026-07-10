@@ -6,11 +6,11 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-194_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-213_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Current release: 2.0.1.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Current release: 2.1.0.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -163,6 +163,21 @@ await db.upgrade();                      // flip an existing database
 const db2 = larva({ schema, commitLog: true }); // or start new ones there
 ```
 
+### The CLI
+
+The whole API is also a shell command — `npx larva` works wherever `@larva-db/core` is installed:
+
+```bash
+npx larva sql "SELECT name, email FROM customers LIMIT 5"
+npx larva export --format postgres --out export.sql  # then: psql $DATABASE_URL < export.sql
+npx larva upgrade                                    # flip to format 3, the commit log
+npx larva rollback 41                                # the undo button, from your shell
+npx larva vacuum
+npx larva version
+```
+
+Credentials auto-load from `.env.local` (`vercel env pull .env.local`); `--prefix` targets a specific database. Full reference — every command, flag, and troubleshooting (starting with the missing-token case) — in **[docs/cli.md](docs/cli.md)**.
+
 ### Any S3-compatible store
 
 Vercel Blob is the default, but the storage contract is four operations, so the same database runs on AWS S3 or Cloudflare R2 — zero extra dependencies:
@@ -248,13 +263,14 @@ The editable source for these lives at [docs/larva-architecture.excalidraw](docs
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **194 checks across six suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **213 checks across seven suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|
 | `scripts/stress.ts` | 10 concurrent writers, 200 commits against a real store: zero lost updates, zero duplicates, exact version arithmetic |
 | `scripts/property.ts` | randomized insert/update/delete workloads verified against a per-writer sequential model, tolerant of ambiguous commit outcomes |
 | `scripts/sql-smoke.ts` | the full dialect + the machine-readable error catalog + pruning + time travel, live |
+| `scripts/cli-smoke.ts` | the `larva` CLI as a subprocess: arguments, exit codes, stdout tables, export files on disk, upgrade/rollback/vacuum |
 | `scripts/api-smoke.ts` | transaction atomicity, concurrent read-modify-write transactions, export round-trips (a real SQLite engine; Postgres DDL/COPY/FK structure), vacuum retention |
 | `scripts/s3-adapter-test.ts` | the S3 adapter under an in-process fake S3 with injected 409s and 500s — chaos the engine must absorb |
 | `scripts/group-commit-test.ts` | same-instance commit coalescing, batch error isolation, and the conflict matrix over the chaos-injected fake S3 |

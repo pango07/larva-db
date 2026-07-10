@@ -16,6 +16,7 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bun scripts/stress.ts` — commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)
 - `bun scripts/property.ts` — property-based random-workload conflict test (same token requirement)
 - `bun scripts/sql-smoke.ts` — full v1 dialect walkthrough (parser error catalog offline, then live queries, pruning, time travel)
+- `bun scripts/cli-smoke.ts` — drives the `larva` CLI (`packages/larvadb/src/cli.ts`, shipped as the package `bin`) as a subprocess against the real store: args, exit codes, export files (requires the Blob token)
 - `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite/postgres), vacuum retention
 - `bun scripts/s3-adapter-test.ts` — S3Adapter contract + stress harness over an in-process fake S3 with 409/500 chaos injection (no credentials needed)
 - `bun scripts/group-commit-test.ts` — group-commit coalescing, batch error isolation, nested-commit deadlock guard, and the property conflict harness, all over the chaos fake S3 (no credentials needed)
@@ -38,7 +39,7 @@ Larva is a deliberate miniaturization of the Delta Lake / Iceberg pattern on top
 
 - A chunk blob, once written, is never modified. All mutation is copy-on-write plus one manifest CAS.
 - No silently lost writes, ever. Conflicts fail loudly after retries.
-- Private Blob stores only; refuse public stores at connect time. Larva never generates public URLs for data blobs.
+- Data blobs are private by construction: the storage adapter writes `access: "private"` on every put. Larva never generates public URLs for data blobs.
 - The SQL dialect is a closed, documented subset (Design §7). Precise, machine-readable error messages for unsupported SQL are a design feature — agents self-correct from specific errors. Do not quietly accept SQL outside the subset.
 - `UPDATE`/`DELETE` without `WHERE` requires explicit `{ allowFullTable: true }`.
 - The parser rejects multiple statements per string (injection stacking vector).
