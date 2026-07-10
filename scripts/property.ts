@@ -21,6 +21,7 @@ const config = {
   opsPerWriter: Number(arg("ops") ?? PROPERTY_DEFAULTS.opsPerWriter),
   maxAttempts: Number(arg("max-attempts") ?? PROPERTY_DEFAULTS.maxAttempts),
   cleanup: !process.argv.includes("--keep"),
+  commitLog: process.argv.includes("--log"),
 };
 
 console.log("larva property-based conflict test");

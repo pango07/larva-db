@@ -274,6 +274,88 @@ const schema = defineSchema({
   ok("composite unique enforced across instances", err?.code === "UNIQUE_CONFLICT", err?.message);
 }
 
+// ---------- 9. format 3: upgrade + the ordered commit log ----------
+{
+  // Born format 1, upgraded mid-life — the migration every existing store takes.
+  const db = larva({ schema, prefix: "log-upgrade/", store });
+  await db.sql`INSERT INTO notes (id, body, score) VALUES (${"pre"}, ${"before upgrade"}, ${1})`;
+  const preVersion = await db.currentVersion();
+
+  const up = await db.upgrade();
+  ok("upgrade() flips to format 3", up.formatVersion === 3);
+  ok("upgrade() is idempotent", (await db.upgrade()).version === up.version);
+
+  await db.sql`INSERT INTO notes (id, body, score) VALUES (${"post"}, ${"after upgrade"}, ${2})`;
+  const all = await db.sql`SELECT id FROM notes ORDER BY id`;
+  ok("reads span the upgrade boundary", all.length === 2);
+  ok(
+    "post-upgrade commits are log entries, not manifest swaps",
+    [...objects.keys()].some((k) => k.startsWith("log-upgrade/log/")),
+  );
+
+  // Time travel across the boundary, at log-entry granularity.
+  const past = await db.asOf(preVersion);
+  ok("asOf() reaches a pre-upgrade version", (await past.sql`SELECT COUNT(*) AS n FROM notes`)[0].n === 1);
+  await db.rollbackTo(preVersion);
+  const rolled = await db.sql`SELECT id FROM notes`;
+  const raw = JSON.parse(objects.get("log-upgrade/manifest.json")!.body) as { formatVersion: number };
+  ok("rollback across the boundary restores data", rolled.length === 1 && rolled[0].id === "pre");
+  ok("rollback preserves the format version (never re-admits old writers)", raw.formatVersion === 3);
+  const postRollback = await db.asOf((await db.currentVersion()) - 1);
+  ok("the rollback itself is rollbackable", (await postRollback.sql`SELECT COUNT(*) AS n FROM notes`)[0].n === 2);
+}
+
+// ---------- 10. format 3 under load: cross-instance writers + chaos ----------
+{
+  chaos = true;
+  const dbA = larva({ schema, prefix: "log-load/", store, commitLog: true });
+  await dbA.sql`INSERT INTO notes (id, body, score) VALUES (${"ctr"}, ${"counter"}, ${0})`;
+  const dbB = larva({ schema, prefix: "log-load/", store });
+
+  const WRITERS_PER_DB = 4;
+  const OPS = 5;
+  let inserts = 0;
+  let increments = 0;
+  const writer = async (db: typeof dbA, name: string) => {
+    for (let i = 0; i < OPS; i++) {
+      if (i % 2 === 0) {
+        await db.sql`INSERT INTO notes (id, body, score) VALUES (${`${name}-${i}`}, ${"w"}, ${i})`;
+        inserts++;
+      } else {
+        await db.sql`UPDATE notes SET score = score + 1 WHERE id = ${"ctr"}`;
+        increments++;
+      }
+    }
+  };
+  await Promise.all([
+    ...Array.from({ length: WRITERS_PER_DB }, (_, w) => writer(dbA, `a${w}`)),
+    ...Array.from({ length: WRITERS_PER_DB }, (_, w) => writer(dbB, `b${w}`)),
+  ]);
+  const rows = await dbA.sql`SELECT id, score FROM notes`;
+  const ctr = rows.find((r) => r.id === "ctr");
+  ok("log mode: cross-instance appends all present under chaos", rows.length === inserts + 1, `${rows.length - 1}/${inserts} rows`);
+  ok("log mode: cross-instance counter exact under chaos", ctr?.score === increments, `score=${ctr?.score}, expected ${increments}`);
+
+  const cp = JSON.parse(objects.get("log-load/manifest.json")!.body) as { version: number };
+  const tip = await dbA.currentVersion();
+  ok(
+    "checkpoint advances behind the log tip",
+    cp.version > 0 && cp.version % 8 === 0 && cp.version <= tip,
+    `checkpoint v${cp.version}, tip v${tip}`,
+  );
+  chaos = false;
+}
+
+// ---------- 11. property-based conflict matrix over the log, chaos on ----------
+{
+  chaos = true;
+  console.log("\nrunning property harness over the commit log + chaos store (6 writers × 15 ops)...");
+  const report = await runProperty({ writers: 6, opsPerWriter: 15, commitLog: true }, () => {}, store);
+  for (const c of report.checks) ok(`log property: ${c.name}`, c.pass, c.detail);
+  ok("log property harness passed overall", report.pass);
+  chaos = false;
+}
+
 server.stop();
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

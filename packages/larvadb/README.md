@@ -151,6 +151,15 @@ type Customer = InferRow<typeof schema, "customers">;
 const rows = await db.sql<Customer>`SELECT * FROM customers`;
 ```
 
+### More write headroom — the commit log
+
+Format 3 changes how commits land: instead of re-uploading the whole manifest per commit, each commit is a tiny immutable delta in an ordered log, and the manifest becomes a periodic checkpoint. Conflicts get cheap (losing a race costs one small read, not a manifest round-trip), write cost stops scaling with database size, and contention tails shrink — same guarantees, verified by the same stress/property gauntlet. One-way, explicit, and old clients refuse loudly instead of corrupting:
+
+```ts
+await db.upgrade();                      // flip an existing database
+const db2 = larva({ schema, commitLog: true }); // or start new ones there
+```
+
 ### Any S3-compatible store
 
 Vercel Blob is the default, but the storage contract is four operations, so the same database runs on AWS S3 or Cloudflare R2 — zero extra dependencies:
@@ -234,7 +243,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## Tested where it matters
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **168 checks across six suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **194 checks across six suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
 
 The stress and property harnesses ship in the package for testing your own setup:
 

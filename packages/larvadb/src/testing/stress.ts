@@ -11,6 +11,8 @@ export interface StressConfig {
   maxAttempts: number;
   /** Delete the run's blobs afterwards. Failed runs are always kept for inspection. */
   cleanup: boolean;
+  /** Run the database in format 3 (ordered commit log) instead of manifest CAS. */
+  commitLog?: boolean;
 }
 
 export const DEFAULTS: StressConfig = {
@@ -74,7 +76,7 @@ export async function runStress(
   const db = new LarvaProto(store, prefix);
 
   log(`run ${runId}: init db at ${prefix}`);
-  await db.init(["events", "counters"]);
+  await db.init(["events", "counters"], undefined, { commitLog: config.commitLog });
   await db.insert("counters", [{ id: "main", value: 0 }]);
   const baseVersion = 1; // v0 init + v1 counter seed
 

@@ -29,8 +29,12 @@ export interface ChunkRef {
  *   2 — v2 schema features: sequence columns (CAS-claimed ranges in a
  *       sequences blob) and composite unique constraints. A store only
  *       declares 2 when its schema actually uses one of them, so plain
- *       stores stay readable by format-1 clients. */
-export const SUPPORTED_FORMAT_VERSION = 2;
+ *       stores stay readable by format-1 clients.
+ *   3 — the ordered commit log: commits are create-only numbered entries
+ *       under log/ (slot number = version); manifest.json is demoted to a
+ *       periodic checkpoint that snapshots replay the log tail onto. Entered
+ *       only by explicit db.upgrade() or larva({ commitLog: true }). */
+export const SUPPORTED_FORMAT_VERSION = 3;
 
 /** The lowest format a store with this schema can declare. Kept minimal so
  * stores that don't use v2 features remain openable by older clients. */
@@ -56,6 +60,63 @@ export interface Manifest {
    * prototype databases created via init(). */
   schema?: unknown;
   tables: Record<string, { chunks: ChunkRef[] }>;
+}
+
+/**
+ * One commit in a format-3 store: the delta between consecutive manifest
+ * versions, written create-only to log/<version>.json. The slot number IS the
+ * version — two writers racing the same slot resolve by create-only PUT, and
+ * the loser rebases by replaying the winner's entry (no manifest rewrite).
+ */
+export interface LogEntry {
+  version: number;
+  commitId: string;
+  committedAt: string;
+  /** Present only when the commit changed the schema. */
+  schema?: unknown;
+  /** Present only when the commit raised the store's format. */
+  formatVersion?: number;
+  /** Per-table chunk delta; null drops the table; an entry with empty
+   * add/remove creates it. Untouched tables are absent. */
+  tables: Record<string, { add: ChunkRef[]; remove: string[] } | null>;
+}
+
+/** Delta between two manifests (base → next) in LogEntry form. */
+function diffManifests(base: Manifest, next: Manifest): LogEntry["tables"] {
+  const out: LogEntry["tables"] = {};
+  for (const [t, tbl] of Object.entries(next.tables)) {
+    const baseTbl = base.tables[t];
+    const baseIds = new Set((baseTbl?.chunks ?? []).map((c) => c.id));
+    const nextIds = new Set(tbl.chunks.map((c) => c.id));
+    const add = tbl.chunks.filter((c) => !baseIds.has(c.id));
+    const remove = (baseTbl?.chunks ?? []).filter((c) => !nextIds.has(c.id)).map((c) => c.id);
+    if (add.length || remove.length || !baseTbl) out[t] = { add, remove };
+  }
+  for (const t of Object.keys(base.tables)) if (!next.tables[t]) out[t] = null;
+  return out;
+}
+
+/** Replay one log entry onto a manifest, in place. Replacement chunks land at
+ * the end of the table's list — chunk order is not semantic (rows are sorted
+ * within chunks; queries sort explicitly). */
+function applyLogEntry(m: Manifest, e: LogEntry): void {
+  for (const [t, d] of Object.entries(e.tables)) {
+    if (d === null) {
+      delete m.tables[t];
+      continue;
+    }
+    const tbl = (m.tables[t] ??= { chunks: [] });
+    if (d.remove.length > 0) {
+      const gone = new Set(d.remove);
+      tbl.chunks = tbl.chunks.filter((c) => !gone.has(c.id));
+    }
+    tbl.chunks.push(...d.add);
+  }
+  if (e.schema !== undefined) m.schema = e.schema;
+  if (e.formatVersion !== undefined) m.formatVersion = e.formatVersion;
+  m.version = e.version;
+  m.commitId = e.commitId;
+  m.committedAt = e.committedAt;
 }
 
 export interface Snapshot {
@@ -173,6 +234,14 @@ const DEFAULT_MAX_ATTEMPTS = 15;
  * claims under load; smaller = smaller gaps on crash. */
 const SEQ_RANGE_SIZE = 32;
 
+/** In log mode, fold the log into a fresh manifest.json checkpoint (and a
+ * retained history snapshot) every this-many versions. Smaller = shorter log
+ * tails to replay on snapshot; larger = less checkpoint write amplification. */
+const CHECKPOINT_EVERY = 8;
+
+/** Fixed-width so log entries list in version order. */
+const padVersion = (v: number): string => String(v).padStart(12, "0");
+
 /** One queued commit awaiting the group-commit drain loop. */
 interface QueuedCommit {
   plan: Planner;
@@ -217,10 +286,14 @@ export class LarvaProto {
     return `${this.prefix}manifest.json`;
   }
 
+  private logPath(version: number): string {
+    return `${this.prefix}log/${padVersion(version)}.json`;
+  }
+
   /** Create the empty database. Fails if one already exists at this prefix. */
-  async init(tables: string[], schema?: unknown): Promise<void> {
+  async init(tables: string[], schema?: unknown, opts?: { commitLog?: boolean }): Promise<void> {
     const manifest: Manifest = {
-      formatVersion: requiredFormatVersion(schema),
+      formatVersion: opts?.commitLog ? 3 : requiredFormatVersion(schema),
       version: 0,
       commitId: ulid(),
       committedAt: new Date().toISOString(),
@@ -228,13 +301,49 @@ export class LarvaProto {
       tables: Object.fromEntries(tables.map((t) => [t, { chunks: [] }])),
     };
     await this.putCreateOnly(this.manifestPath(), JSON.stringify(manifest));
+    if (opts?.commitLog) {
+      // Retain v0 as the base-of-time checkpoint: once maybeCheckpoint
+      // advances manifest.json, this is what lets manifestAt reconstruct
+      // versions older than the first periodic checkpoint.
+      await this.store
+        .put(`${this.prefix}history/manifest.v0.json`, JSON.stringify(manifest), { createOnly: true })
+        .catch(() => {});
+    }
   }
 
-  /** Fetch the manifest fresh from origin. Pins a consistent snapshot. */
+  /** Log entries are immutable once created, so this cache can never be stale. */
+  private logCache = new Map<number, LogEntry>();
+
+  /** Read log entry `version`, or null if it does not exist (yet). The
+   * existence probe is fetched fresh — a stale 404 would hide committed data. */
+  async readLogEntry(version: number): Promise<LogEntry | null> {
+    const cached = this.logCache.get(version);
+    if (cached) return cached;
+    const res = await this.store.get(this.logPath(version), { fresh: true });
+    if (!res) return null;
+    const entry = JSON.parse(res.body) as LogEntry;
+    this.logCache.set(version, entry);
+    return entry;
+  }
+
+  /**
+   * Fetch the manifest fresh from origin. Pins a consistent snapshot.
+   * Format 3: the manifest is a checkpoint — replay the log tail onto it.
+   * The log has no gaps by construction (slot n+1 is only ever written by a
+   * writer that observed slot n), so the first missing entry is the tip.
+   */
   async snapshot(): Promise<Snapshot> {
     const res = await this.store.get(this.manifestPath(), { fresh: true });
     if (!res) throw new Error(`No manifest at ${this.manifestPath()} — call init() first`);
-    return { manifest: parseManifest(res.body), etag: res.etag };
+    const manifest = parseManifest(res.body);
+    if ((manifest.formatVersion ?? 1) >= 3) {
+      for (let v = manifest.version + 1; ; v++) {
+        const entry = await this.readLogEntry(v);
+        if (!entry) break;
+        applyLogEntry(manifest, entry);
+      }
+    }
+    return { manifest, etag: res.etag };
   }
 
   /** Stage one immutable chunk. When statsCols is given, rows are sorted by
@@ -478,8 +587,15 @@ export class LarvaProto {
       return { version, stats };
     };
 
+    // Slot attempts are ~3× cheaper and faster than manifest-CAS attempts (a
+    // tiny entry PUT + incremental refetch vs. a full manifest round-trip), so
+    // the loud-failure budget calibrates per protocol: same wall-clock
+    // patience, more of the cheap attempts. Measured at 40ms-latency storage:
+    // 10 synchronized slot writers exhaust 15 but stay comfortably inside 45.
+    const budget = (snap.manifest.formatVersion ?? 1) >= 3 ? maxAttempts * 3 : maxAttempts;
+
     let lastCommitId = "";
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= budget; attempt++) {
       stats.attempts = attempt;
 
       let next = current.apply(structuredClone(snap.manifest));
@@ -499,7 +615,30 @@ export class LarvaProto {
       // format so pre-v2 clients refuse it instead of ignoring the features.
       next.formatVersion = Math.max(next.formatVersion ?? 1, requiredFormatVersion(next.schema));
 
+      // The base snapshot's format picks the protocol. The commit that flips a
+      // store to format 3 (upgrade) is itself the last manifest CAS; everything
+      // after it goes through the log.
+      const logMode = (snap.manifest.formatVersion ?? 1) >= 3;
+
       try {
+        if (logMode) {
+          // Slot protocol: the version number is the slot; create-only PUT is
+          // the arbiter. Losing costs one tiny entry read + a retry at the
+          // next slot — no manifest rewrite, staged chunks reused on rebase.
+          const entry: LogEntry = {
+            version: next.version,
+            commitId: next.commitId,
+            committedAt: next.committedAt,
+            ...(JSON.stringify(snap.manifest.schema) !== JSON.stringify(next.schema) ? { schema: next.schema } : {}),
+            ...(next.formatVersion !== snap.manifest.formatVersion ? { formatVersion: next.formatVersion } : {}),
+            tables: diffManifests(snap.manifest, next),
+          };
+          await this.store.put(this.logPath(next.version), JSON.stringify(entry), { createOnly: true });
+          this.logCache.set(next.version, entry);
+          this.trace?.(`attempt ${attempt}: OK slot v${next.version}`);
+          void this.maybeCheckpoint(next, snap.etag); // best-effort, off the commit's latency
+          return finish(next.version);
+        }
         await this.store.put(this.manifestPath(), JSON.stringify(next), {
           ifMatch: snap.etag,
         });
@@ -521,7 +660,25 @@ export class LarvaProto {
         this.trace?.(
           `attempt ${attempt}: ${conflict ? "412" : "transient error"} (based v${snap.manifest.version} etag ${snap.etag.slice(0, 12)})`,
         );
-        if (attempt < maxAttempts) await sleep(backoffMs(attempt));
+        if (logMode) {
+          // Slot entries are immutable, so ambiguity resolves by reading our
+          // slot directly: our commitId there means we won it.
+          const landed = await this.readLogEntry(next.version);
+          if (landed?.commitId === next.commitId) {
+            this.trace?.(`attempt ${attempt}: ambiguous outcome resolved — our slot landed`);
+            void this.maybeCheckpoint(next, snap.etag);
+            return finish(next.version);
+          }
+          // Same jittered backoff as the CAS path — the exponential spread is
+          // the fairness mechanism (near-immediate retries starve slow
+          // writers; measured: 10 synchronized writers exhaust 15 attempts).
+          // The refetch, though, is incremental: replay the winners we just
+          // read instead of re-pulling the checkpoint.
+          if (attempt < budget) await sleep(backoffMs(attempt));
+          snap = await this.advanceSnapshot(snap);
+          continue;
+        }
+        if (attempt < budget) await sleep(backoffMs(attempt));
         snap = await this.snapshot();
         if (snap.manifest.commitId === lastCommitId) {
           this.trace?.(`attempt ${attempt}: ambiguous outcome resolved — our commit landed`);
@@ -531,7 +688,7 @@ export class LarvaProto {
     }
 
     stats.ms = Date.now() - started;
-    throw new ConflictError(maxAttempts);
+    throw new ConflictError(budget);
   }
 
   /**
@@ -603,11 +760,73 @@ export class LarvaProto {
     return this.mutateRow(table, "main", (row) => ({ ...row, value: Number(row.value) + by }), opts);
   }
 
+  /**
+   * Advance a snapshot by replaying log entries past its version — the cheap
+   * refetch after losing a slot race. The winner's entry is already in the
+   * cache (the landed-check read it), so this usually costs one 404 probe.
+   */
+  private async advanceSnapshot(snap: Snapshot): Promise<Snapshot> {
+    const manifest = structuredClone(snap.manifest);
+    for (let v = manifest.version + 1; ; v++) {
+      const entry = await this.readLogEntry(v);
+      if (!entry) break;
+      applyLogEntry(manifest, entry);
+    }
+    return { manifest, etag: snap.etag };
+  }
+
+  /**
+   * Fold the log into a fresh checkpoint every CHECKPOINT_EVERY versions:
+   * a retained history snapshot (sparse, for time travel) and an advanced
+   * manifest.json (so snapshots replay a short tail). Both best-effort — a
+   * missed checkpoint only lengthens replay; the ifMatch chain keeps
+   * checkpoint advancement linear, so it can never regress.
+   */
+  private async maybeCheckpoint(next: Manifest, checkpointEtag: string): Promise<void> {
+    if (next.version % CHECKPOINT_EVERY !== 0) return;
+    await this.store
+      .put(`${this.prefix}history/manifest.v${next.version}.json`, JSON.stringify(next), { createOnly: true })
+      .catch(() => {});
+    await this.store
+      .put(this.manifestPath(), JSON.stringify(next), { ifMatch: checkpointEtag })
+      .catch(() => {});
+  }
+
   /** Fetch a retained past manifest (time travel). Null when outside retention
    * or when the history write for that commit was lost (they are best-effort). */
   async historyManifest(version: number): Promise<Manifest | null> {
     const res = await this.store.get(`${this.prefix}history/manifest.v${version}.json`);
     return res ? parseManifest(res.body) : null;
+  }
+
+  /**
+   * Reconstruct the manifest at `version` (time travel). Format ≤2 stores
+   * retain one history file per commit, so the exact lookup hits. Format 3
+   * retains sparse checkpoints plus the log: walk down to the nearest
+   * retained base at or below `version`, then replay entries up to it.
+   * Null when outside retention or a needed entry has been vacuumed.
+   */
+  async manifestAt(version: number): Promise<Manifest | null> {
+    const exact = await this.historyManifest(version);
+    if (exact) return exact;
+
+    const cur = await this.store.get(this.manifestPath(), { fresh: true });
+    if (!cur) return null;
+    const checkpoint = parseManifest(cur.body);
+    if ((checkpoint.formatVersion ?? 1) < 3) return null;
+
+    let base: Manifest | null = checkpoint.version <= version ? checkpoint : null;
+    for (let m = version - 1, probes = 0; base === null && m >= 0 && probes < 4 * CHECKPOINT_EVERY; m--, probes++) {
+      base = await this.historyManifest(m);
+    }
+    if (base === null) return null;
+
+    for (let v = base.version + 1; v <= version; v++) {
+      const entry = await this.readLogEntry(v);
+      if (!entry) return null;
+      applyLogEntry(base, entry);
+    }
+    return base.version === version ? base : null;
   }
 
   /** Delete every blob under this database's prefix. */

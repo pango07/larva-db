@@ -4,11 +4,11 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-168_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-194_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Current release: 1.2.0.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Current release: 2.0.0.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -152,6 +152,15 @@ type Customer = InferRow<typeof schema, "customers">;
 const rows = await db.sql<Customer>`SELECT * FROM customers`;
 ```
 
+### More write headroom — the commit log
+
+Format 3 changes how commits land: instead of re-uploading the whole manifest per commit, each commit is a tiny immutable delta in an ordered log, and the manifest becomes a periodic checkpoint. Conflicts get cheap (losing a race costs one small read, not a manifest round-trip), write cost stops scaling with database size, and contention tails shrink — same guarantees, verified by the same stress/property gauntlet. One-way, explicit, and old clients refuse loudly instead of corrupting:
+
+```ts
+await db.upgrade();                      // flip an existing database
+const db2 = larva({ schema, commitLog: true }); // or start new ones there
+```
+
 ### Any S3-compatible store
 
 Vercel Blob is the default, but the storage contract is four operations, so the same database runs on AWS S3 or Cloudflare R2 — zero extra dependencies:
@@ -237,7 +246,7 @@ The editable source for these lives at [docs/larva-architecture.excalidraw](docs
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **168 checks across six suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **194 checks across six suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|

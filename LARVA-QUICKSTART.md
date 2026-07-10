@@ -76,6 +76,7 @@ const tenMinutesAgo = await db.asOf(new Date(Date.now() - 10 * 60 * 1000));
 await tenMinutesAgo.sql`SELECT COUNT(*) FROM customers`;  // peek at the past
 
 await db.rollbackTo(tenMinutesAgo.version);               // restore it
+await db.upgrade();  // optional: format 3, the ordered commit log — cheaper conflicts at scale
 ```
 
 History is kept for 7 days (or the last 50 versions, whichever is more).
