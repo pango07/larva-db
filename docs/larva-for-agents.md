@@ -41,10 +41,15 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
 
 ## Schema features to know
 
+- A `t.uuid()` column is an auto-assigned ID: OMIT it on INSERT and read the
+  generated UUID back with `RETURNING`. Prefer it for row identity — the
+  writer invents the value, so nothing ever contends. Supplying your own
+  value is allowed and respected.
 - A `t.sequence()` column is an auto-assigned integer: OMIT it on INSERT and
   read the assigned value back with `RETURNING`. Never generate the number
   yourself. Numbers are unique across concurrent writers but gappy (like a
-  Postgres sequence).
+  Postgres sequence). Use it when humans need small numbers (invoice #42);
+  otherwise prefer `t.uuid()`.
 - Composite unique constraints come from `defineSchema`'s second argument:
   `defineSchema(spec, { uniques: { orders: [["customerId", "sku"]] } })`.
 

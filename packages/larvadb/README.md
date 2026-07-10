@@ -74,21 +74,24 @@ await db.sql`INSERT INTO counters (slug, count) VALUES (${"visits"}, ${1})
              ON CONFLICT (slug) DO UPDATE SET count = count + ${1}`;
 ```
 
-### Sequences & composite uniques
+### Auto IDs, sequences & composite uniques
 
-Invoice numbers without running a server: `t.sequence()` auto-assigns integers that are unique across concurrent processes (drawn from CAS-claimed ranges, gappy on crash — exactly a Postgres sequence). Composite uniques guard pairs, and work as upsert targets:
+`t.uuid()` fills a time-ordered UUID on insert — nothing to coordinate, so ID generation never contends. `t.sequence()` auto-assigns small integers that are unique across concurrent processes (drawn from CAS-claimed ranges, gappy on crash — exactly a Postgres sequence). Composite uniques guard pairs, and work as upsert targets:
 
 ```ts
 const schema = defineSchema(
   {
+    orders: { id: t.uuid().primaryKey(), memo: t.text() },
     invoices: { number: t.sequence().primaryKey(), customer: t.text() },
     grants: { id: t.text().primaryKey(), userId: t.text(), feature: t.text(), level: t.integer() },
   },
   { uniques: { grants: [["userId", "feature"]] } },
 );
 
+await db.sql`INSERT INTO orders (memo) VALUES (${"first"}) RETURNING id`;
+// → [{ id: "0197f8c2-…" }] — omit the column, read it back
 await db.sql`INSERT INTO invoices (customer) VALUES (${"ada"}) RETURNING number`;
-// → [{ number: 42 }]   — omit the column, read it back
+// → [{ number: 42 }]      — same ergonomics, human-facing numbers
 
 await db.sql`INSERT INTO grants (userId, feature, level) VALUES (${"u1"}, ${"exports"}, ${2})
              ON CONFLICT (userId, feature) DO UPDATE SET level = excluded.level`;
@@ -260,7 +263,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## Tested where it matters
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **213 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **219 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
 
 The stress and property harnesses ship in the package for testing your own setup:
 

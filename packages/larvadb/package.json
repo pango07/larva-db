@@ -1,6 +1,6 @@
 {
   "name": "@larva-db/core",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "A tiny SQL database that lives inside your Vercel Blob store. Real SQL, atomic transactions, time travel, and a guaranteed exit path when you outgrow it.",
   "license": "MIT",
   "type": "module",

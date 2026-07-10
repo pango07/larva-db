@@ -274,6 +274,43 @@ const schema = defineSchema({
   ok("composite unique enforced across instances", err?.code === "UNIQUE_CONFLICT", err?.message);
 }
 
+// ---------- 8b. v2 schema features: t.uuid() auto IDs ----------
+{
+  const uuidSchema = defineSchema({
+    orders: { id: t.uuid().primaryKey(), memo: t.text(), ref: t.uuid() },
+  });
+  const dbA = larva({ schema: uuidSchema, prefix: "v2-uuid/", store });
+  await dbA.sql`SELECT COUNT(*) AS n FROM orders`; // force init
+  const dbB = larva({ schema: uuidSchema, prefix: "v2-uuid/", store });
+
+  // Contention-free identity: each writer invents its own IDs, so unlike
+  // sequences there is no shared state to race on — only the format to check.
+  const N = 20;
+  await Promise.all(
+    Array.from({ length: N }, (_, i) => (i % 2 === 0 ? dbA : dbB).sql`INSERT INTO orders (memo) VALUES (${`m${i}`})`),
+  );
+  const V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const rows = await dbA.sql`SELECT id, ref FROM orders`;
+  ok(
+    "uuid pk auto-filled with RFC-format UUIDv7 on every insert",
+    rows.length === N && rows.every((r) => typeof r.id === "string" && V7.test(r.id as string)),
+  );
+  ok("uuid values distinct across two instances", new Set(rows.map((r) => r.id)).size === N);
+  ok(
+    "non-pk uuid columns auto-fill too",
+    rows.every((r) => typeof r.ref === "string" && V7.test(r.ref as string)) &&
+      new Set(rows.map((r) => r.ref)).size === N,
+  );
+
+  const explicit = await dbA.sql`INSERT INTO orders (id, memo) VALUES (${"custom-id"}, ${"explicit"}) RETURNING id`;
+  ok("an explicitly supplied id is respected, not overwritten", explicit[0].id === "custom-id");
+  const returned = await dbB.sql`INSERT INTO orders (memo) VALUES (${"returned"}) RETURNING id`;
+  ok("RETURNING hands back the generated uuid", V7.test(returned[0].id as string));
+
+  const stored = JSON.parse(objects.get("v2-uuid/manifest.json")!.body) as { formatVersion: number };
+  ok("store using t.uuid() declares formatVersion 2", stored.formatVersion === 2);
+}
+
 // ---------- 9. format 3: upgrade + the ordered commit log ----------
 {
   // Born format 1, upgraded mid-life — the migration every existing store takes.

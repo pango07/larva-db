@@ -1,4 +1,4 @@
-import { Row, Scalar, ulid } from "./core";
+import { Row, Scalar, ulid, uuidv7 } from "./core";
 
 /**
  * Code-first schema (Design §8). The canonical schema lives in the app repo so
@@ -21,6 +21,10 @@ export interface ColumnDef {
    * Gappy on crash, like a Postgres sequence; values are unique across
    * processes because claimed ranges are disjoint. */
   sequence?: boolean;
+  /** Auto-filled with a time-ordered UUIDv7 when omitted on INSERT (format 2
+   * stores). The writer invents the value, so unlike sequence there is
+   * nothing to coordinate — contention-free identity. */
+  uuid?: boolean;
 }
 
 export interface TableSchema {
@@ -82,6 +86,12 @@ export class ColumnBuilder<T> {
     return this;
   }
 
+  /** @internal — use t.uuid(). */
+  markUuid(): this {
+    this.def.uuid = true;
+    return this;
+  }
+
   build(): ColumnDef {
     return { ...this.def };
   }
@@ -97,6 +107,10 @@ export const t = {
    * Numbers are unique across concurrent processes (disjoint CAS-claimed
    * ranges) but gappy on crash — same contract as a Postgres sequence. */
   sequence: () => new ColumnBuilder<number | null>("integer").markSequence(),
+  /** Auto-ID: omit it on INSERT and Larva fills a time-ordered UUID (v7).
+   * Nothing to coordinate across processes — each writer invents the value —
+   * and time-ordering keeps new rows clustered for zone-map pruning. */
+  uuid: () => new ColumnBuilder<string | null>("text").markUuid(),
   json: (): never => {
     throw new SchemaError(
       "UNSUPPORTED_COLUMN_TYPE",
@@ -224,6 +238,7 @@ export function validateInsert(table: string, schema: TableSchema, row: Row): Ro
     if (v === null && def.sequence) {
       throw new SchemaError("SEQUENCE_UNASSIGNED", `sequence column "${table}.${name}" was not assigned; insert through db.sql\`INSERT …\``);
     }
+    if (v === null && def.uuid) v = uuidv7();
     if (v === null && name === schema.primaryKey) v = ulid();
     if (!typeOk(def.type, v)) {
       throw new SchemaError(
@@ -264,6 +279,9 @@ export function schemaDrift(code: DatabaseSchema, manifest: DatabaseSchema): str
       const liveCol = live.columns[col];
       if (liveCol && (liveCol.sequence ?? false) !== (def.sequence ?? false)) {
         drift.push(`table "${table}.${col}": sequence flag differs between code and store`);
+      }
+      if (liveCol && (liveCol.uuid ?? false) !== (def.uuid ?? false)) {
+        drift.push(`table "${table}.${col}": uuid flag differs between code and store`);
       }
     }
   }

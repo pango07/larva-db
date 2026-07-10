@@ -70,4 +70,14 @@ const counter: number | null = ticket.counter;
 // @ts-expect-error uniques keys must be table names in the schema
 defineSchema({ a: { id: t.text().primaryKey() } }, { uniques: { b: [["id", "id"]] } });
 
-void [v2, invoiceNumber, invoiceNumberStr, v2nullable, counter];
+// uuid is a text column; primaryKey() strips null
+const withUuid = defineSchema({ orders: { id: t.uuid().primaryKey(), memo: t.text(), ref: t.uuid() } });
+type Order = InferRow<typeof withUuid, "orders">;
+declare const order: Order;
+const orderId: string = order.id;
+const orderRef: string | null = order.ref;
+
+// @ts-expect-error uuid pk is a string, not a number
+const orderIdNum: number = order.id;
+
+void [v2, invoiceNumber, invoiceNumberStr, v2nullable, counter, withUuid, orderId, orderRef, orderIdNum];
