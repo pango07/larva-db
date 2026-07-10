@@ -48,3 +48,6 @@ packages/larvadb/dist/
 
 # local-only agent notes (never commit)
 CLAUDE.local.md
+
+# generated search index (pagefind, at build)
+public/_pagefind/

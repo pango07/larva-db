@@ -1,0 +1,120 @@
+---
+title: The CLI
+---
+
+import { Callout } from "nextra/components";
+
+# The `larva` CLI
+
+Everything in the [API](/docs/api), runnable from a shell. It ships inside `@larva-db/core` — nothing extra to install:
+
+```bash
+npx larva --help        # any project with @larva-db/core installed
+bunx larva --help       # same, under bun
+npm i -g @larva-db/core # or install globally and just type `larva`
+```
+
+The CLI talks to the same database your app does: point it at the same store and prefix, and `larva sql` sees exactly what `db.sql` sees.
+
+## Setup — the one thing that must be right
+
+The CLI needs **`BLOB_READ_WRITE_TOKEN`**. It auto-loads `.env.local` and `.env` **from the directory you run it in**:
+
+```bash
+vercel env pull .env.local   # writes the token into .env.local
+npx larva version            # prints a number? you're connected
+```
+
+## Global options
+
+| Flag | Default | |
+|---|---|---|
+| `--prefix PATH` | `larva/` | which database inside the store |
+| `--allow-full-table` | off | permit `UPDATE`/`DELETE` without a `WHERE` clause |
+| `-h`, `--help` | | usage text |
+
+<Callout type="warning">
+  **Mind the prefix.** Connecting is zero-config by design: pointing at a prefix with no database
+  **creates a fresh, empty one**. If a query unexpectedly returns nothing, the likeliest cause is a
+  typo'd `--prefix` showing you a brand-new empty database — not lost data.
+</Callout>
+
+## Commands
+
+### `larva sql "STATEMENT"`
+
+Rows print as a table, with timing and how many chunks the zone maps let the query skip:
+
+```
+$ npx larva sql "SELECT name, email FROM customers ORDER BY name"
+┌───┬──────────────┬───────────────────┐
+│   │ name         │ email             │
+├───┼──────────────┼───────────────────┤
+│ 0 │ Ada Lovelace │ ada@example.com   │
+│ 1 │ Grace Hopper │ grace@example.com │
+└───┴──────────────┴───────────────────┘
+2 rows in 595ms — read 1/1 chunks
+```
+
+Writes work too — `INSERT … RETURNING`, upserts, `CREATE TABLE`, all of it. Guardrails carry over:
+
+```
+$ npx larva sql "DELETE FROM customers"
+larva: DELETE without a WHERE clause affects every row in "customers"; add --allow-full-table if that is intended
+```
+
+### `larva export --format postgres|sqlite|json|csv [--out FILE]`
+
+```bash
+npx larva export --format postgres --out export.sql
+psql $DATABASE_URL < export.sql        # the entire migration to Postgres
+```
+
+Defaults: `larva-export.sql` / `.db` / `.json`; `csv` writes one `larva-export-<table>.csv` per table. **`sqlite` needs the bun runtime** (`bunx larva export --format sqlite`); every other format runs anywhere.
+
+### `larva upgrade`
+
+Flip to [format 3, the ordered commit log](/docs/how-it-works/format-versioning). One atomic commit, one-way, idempotent:
+
+```
+$ npx larva upgrade
+format 3 (the ordered commit log), version 3
+```
+
+### `larva rollback VERSION`
+
+The undo button — restores a past version as a *new* commit, so the rollback itself is rollbackable:
+
+```
+$ npx larva rollback 41
+restored v41 as new version 43 (undo with: larva rollback 42)
+```
+
+### `larva vacuum [--retain-days N] [--retain-versions N]`
+
+```
+$ npx larva vacuum
+dropped 12 history objects and 4 chunks; 50 versions retained
+```
+
+### `larva version`
+
+Prints the current database version — one integer, script-friendly, and the cheapest "am I connected?" check.
+
+## Exit codes
+
+`0` on success, `1` on any failure, errors on **stderr** with the same machine-readable codes as the API — safe to wire into scripts and agents.
+
+## Troubleshooting
+
+**`larva: BLOB_READ_WRITE_TOKEN is not set`** — the #1 issue. Run `vercel env pull .env.local` in a linked project, or `export BLOB_READ_WRITE_TOKEN=…`. Already pulled it? Make sure you're running the CLI **from the directory that contains `.env.local`**.
+
+**Queries return nothing, but the app has data** — wrong `--prefix` (see the callout above). Find the prefix your app passes to `larva({ prefix })`; `vercel blob list` shows what actually lives in the store.
+
+**`FORMAT_UNSUPPORTED: this database uses format version N…`** — the store was upgraded by a newer client than your CLI. Do what the message says: update `@larva-db/core`.
+
+**`EXPORT_UNAVAILABLE` on `--format sqlite`** — use `bunx larva export --format sqlite`; SQLite export needs bun.
+
+**`Commit failed after N attempts due to concurrent writers`** — the loud `ConflictError`, never silent loss. Rerun; if it persists, something is hammering the database.
+
+**Slow first command (~a second)** — cold connect fetches the manifest and pins a snapshot; timing prints with every `sql` result so you can see it.

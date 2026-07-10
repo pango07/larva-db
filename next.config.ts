@@ -1,7 +1,12 @@
 import type { NextConfig } from "next";
+import nextra from "nextra";
 
-const nextConfig: NextConfig = {
-  /* config options here */
-};
+// Nextra renders the documentation (content/*.mdx) under /docs; the test lab
+// (SQL console + stress lab) stays at /.
+const withNextra = nextra({
+  contentDirBasePath: "/docs",
+});
 
-export default nextConfig;
+const nextConfig: NextConfig = {};
+
+export default withNextra(nextConfig);

@@ -8,7 +8,7 @@ Not for: apps with heavy traffic or millions of rows. (When you get there, congr
 ## 1. Install
 
 ```bash
-npm install larvadb
+npm install @larva-db/core
 ```
 
 Make sure your Vercel project has a **private Blob store** connected (Vercel dashboard → Storage → Create → Blob → Private). That's the whole setup — Larva finds the credentials Vercel already put in your environment.
@@ -18,7 +18,7 @@ Make sure your Vercel project has a **private Blob store** connected (Vercel das
 Create a file called `schema.ts`. This tells Larva (and your AI agent) what your data looks like:
 
 ```ts
-import { defineSchema, t } from "larvadb";
+import { defineSchema, t } from "@larva-db/core";
 
 export const schema = defineSchema({
   customers: {
@@ -42,7 +42,7 @@ Tip: put `.partitionBy()` on the column you'll filter by most (usually a date). 
 ## 3. Use it
 
 ```ts
-import { larva } from "larvadb";
+import { larva } from "@larva-db/core";
 import { schema } from "./schema";
 
 const db = larva({ schema });

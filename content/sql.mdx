@@ -1,0 +1,98 @@
+---
+title: The SQL dialect
+---
+
+import { Callout } from "nextra/components";
+
+# The SQL dialect
+
+Larva accepts real SQL strings. The dialect is a **deliberately small, fully documented subset** — small enough that an agent's system prompt can enumerate it, and small enough that the parser produces precise, correcting error messages instead of generic syntax errors. It covers roughly 90% of the queries small applications actually write.
+
+## Supported
+
+### SELECT
+
+```sql
+SELECT DISTINCT customers.name, orders.total * 1.1 AS withTax
+FROM orders
+INNER JOIN customers ON orders.customerId = customers.id
+WHERE orders.status = 'paid' AND orders.total BETWEEN 50 AND 500
+ORDER BY withTax DESC
+LIMIT 10 OFFSET 20
+```
+
+- Full scalar expressions in the select list: arithmetic, `||` concatenation, `CASE WHEN` (searched and simple), `CAST(x AS text/integer/real/boolean)`.
+- `WHERE` with `=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`.
+- `ORDER BY` source columns *or* select-item aliases; `LIMIT` / `OFFSET`.
+- **Two-table** `INNER JOIN` and `LEFT JOIN` on equality predicates.
+
+### Scalar functions
+
+`UPPER` `LOWER` `LENGTH` `TRIM` `ROUND` `ABS` `COALESCE` `NULLIF` `IFNULL` `REPLACE` `CEIL` `FLOOR` `MOD` `SUBSTR`
+
+### Dates — cheap by construction
+
+Timestamps are ISO 8601 **text**, so date functions are string operations and range filters compare lexicographically:
+
+```sql
+SELECT DATE(createdAt) AS day, SUM(total) AS revenue
+FROM orders GROUP BY day ORDER BY day
+```
+
+`NOW()` / `CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` (`%Y %m %d %H %M %S`).
+
+<Callout type="warning">
+  For pruning, filter on the **raw** column: `WHERE createdAt >= '2026-07-01'` skips chunks via
+  zone maps; `WHERE DATE(createdAt) >= '2026-07-01'` scans everything (still correct, just slower).
+</Callout>
+
+### Grouping
+
+`GROUP BY` over full expressions or select aliases, with `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `GROUP_CONCAT(x, sep)` — over arbitrary expressions, including `COUNT(DISTINCT col)` — and `HAVING`:
+
+```sql
+SELECT customerId, SUM(total) AS revenue,
+  CASE WHEN SUM(total) > 500 THEN 'vip' ELSE 'standard' END AS tier
+FROM orders GROUP BY customerId HAVING revenue > 100
+```
+
+### JSON — over text columns
+
+Store JSON with `t.text()` + `JSON.stringify`, then query inside it (SQLite json1 semantics):
+
+```sql
+SELECT JSON_EXTRACT(payload, '$.user.name') AS who FROM events
+SELECT payload ->> 'status' AS status FROM events
+```
+
+### Writes
+
+```sql
+INSERT INTO customers (name, email) VALUES ('Ada', 'ada@example.com') RETURNING *
+```
+
+- Multi-row `INSERT`, `RETURNING` on every write statement.
+- **Upsert**: `ON CONFLICT (col) DO NOTHING` / `DO UPDATE SET col = excluded.col`. The conflict target must be the primary key, a `UNIQUE` column, or the exact columns of a [composite unique](/docs/api#composite-unique-constraints) — `ON CONFLICT (userId, feature) DO UPDATE …`.
+- `UPDATE … WHERE`, `DELETE … WHERE` — without a `WHERE` clause they are **rejected** unless you pass `{ allowFullTable: true }` (the most common catastrophic agent mistake becomes a specific error instead).
+- `CREATE TABLE` / `DROP TABLE` (agents doing interactive setup use this; a code-first schema stays authoritative).
+
+## Not supported — on purpose
+
+Subqueries, window functions, `UNION`, self-joins, joins of three or more tables, `ALTER TABLE`, views, triggers, nested aggregates. Each exclusion is either rarely emitted by agents writing conservative SQL, or expressible in application code at Larva's scale.
+
+Every rejection **names the feature and says what to do instead**, and near-miss spellings are redirected (`CONCAT` → `||`, `SUBSTRING` → `SUBSTR`, `DATE_TRUNC` → `DATE`/`STRFTIME`):
+
+```
+UNSUPPORTED_FEATURE: subqueries are not supported in Larva v1 (found one in IN);
+run the inner query first and interpolate its result
+```
+
+This is a design feature, not a limitation dressed up — agents self-correct well when errors are specific.
+
+## The bar for growing the dialect
+
+Recorded in [design decisions](/docs/design-decisions): a construct joins the dialect when **agents writing conservative SQL emit it routinely, and it executes within the existing engine shape** — in-memory relational algebra after pruning, one atomic commit per write. `HAVING`, `DISTINCT`, scalar functions, `CASE`, and upsert cleared that bar. Subqueries never will; the answer to needing them is `larva export`.
+
+## Injection safety
+
+The `db.sql` tagged template parameterizes every `${...}` interpolation — values are never string-concatenated into SQL. The parser also rejects multiple statements per string, closing the classic injection-stacking vector.

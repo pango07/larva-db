@@ -163,7 +163,7 @@ Execution is straightforward relational algebra: the planner extracts predicates
 Larva is code-first with a SQL door. The canonical schema is a TypeScript object checked into the repository:
 
 ```ts
-import { defineSchema, t } from "larvadb";
+import { defineSchema, t } from "@larva-db/core";
 
 export const schema = defineSchema({
   users: {
@@ -246,7 +246,7 @@ The documented graduation path is symmetric across the two directions people act
 The entire v1 public API, which is also the ease-of-use contract — if this list grows past a screen, something has gone wrong:
 
 ```ts
-import { larva, defineSchema, t } from "larvadb";
+import { larva, defineSchema, t } from "@larva-db/core";
 
 const db = larva({ schema });                    // token auto-discovered from Vercel env
 

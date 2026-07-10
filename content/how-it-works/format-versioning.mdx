@@ -1,0 +1,44 @@
+---
+title: Format versioning
+---
+
+import { Callout } from "nextra/components";
+
+# Format versioning
+
+A Larva store is **shared mutable state between independently deployed clients** — a web app, a cron job, a CLI on someone's laptop — and they will never update in lockstep. Format versioning is what makes evolving the on-store layout safe anyway.
+
+## The formats
+
+| Format | What it added |
+|---|---|
+| **1** | the original layout: manifest + chunks + history |
+| **2** | sequence columns (`t.sequence()`) and composite unique constraints — a store only declares 2 when its schema actually uses one, so plain stores stay readable by format-1 clients |
+| **3** | [the ordered commit log](/docs/how-it-works/commit-protocol#format-3-the-ordered-commit-log) — entered only by explicit `db.upgrade()` or `larva({ commitLog: true })` |
+
+## The guard
+
+Every manifest read — current and history — validates `formatVersion`. A client that encounters a newer format than it supports refuses with a machine-readable error and **touches nothing**:
+
+```
+FORMAT_UNSUPPORTED: this database uses format version 3; this client supports
+up to 2 — upgrade with `npm install @larva-db/core@latest`
+```
+
+Why loud refusal matters: the failure mode of an *unguarded old writer* against a newer store isn't an error — it's silent. It would commit through the old protocol, bypassing the new format's commit point, and destroy the no-lost-writes invariant without a sound. The guard turns a silent corruption into a one-line fix.
+
+## Upgrading
+
+```ts
+await db.upgrade(); // or: npx larva upgrade
+```
+
+- **One atomic commit** — every client sees either the old world or the new one.
+- **One-way and explicit** — installing a newer package never changes any store's format; only `upgrade()` does.
+- **Idempotent** — calling it on an already-upgraded store is a no-op.
+- **Rollback-safe** — `rollbackTo` across the upgrade boundary restores *data* while preserving the *format*, so rollback can never silently re-admit old writers.
+
+<Callout type="info">
+  Rolling out across several deployments: update the `@larva-db/core` dependency everywhere first
+  (safe — changes nothing), then flip the store once.
+</Callout>
