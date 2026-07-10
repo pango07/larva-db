@@ -21,8 +21,12 @@ export interface ChunkRef {
   stats?: ChunkStats;
 }
 
+/** Highest on-store format this client can read and write. A manifest
+ * declaring a newer version is refused loudly (FormatError) — never opened. */
+export const SUPPORTED_FORMAT_VERSION = 1;
+
 export interface Manifest {
-  formatVersion: 1;
+  formatVersion: number;
   version: number;
   /** Unique id of the commit that produced this manifest. Lets a writer whose
    * CAS outcome was ambiguous (transient error, SDK-internal retry answered
@@ -55,6 +59,26 @@ export interface CommitStats {
 export interface CommitResult {
   version: number;
   stats: CommitStats;
+}
+
+/** The store's format is newer than this client understands. Refusing loudly
+ * is what protects no-lost-writes during mixed-version rollouts: a writer that
+ * ignored this would commit through the old protocol and silently drop other
+ * writers' commits made through the new one. */
+export class FormatError extends Error {
+  constructor(found: number) {
+    super(
+      `FORMAT_UNSUPPORTED: this database uses format version ${found}; this client ` +
+        `supports up to ${SUPPORTED_FORMAT_VERSION} — upgrade with \`npm install @larva-db/core@latest\``,
+    );
+    this.name = "FormatError";
+  }
+}
+
+function parseManifest(body: string): Manifest {
+  const m = JSON.parse(body) as Manifest;
+  if ((m.formatVersion ?? 1) > SUPPORTED_FORMAT_VERSION) throw new FormatError(m.formatVersion);
+  return m;
 }
 
 /** A commit that could not land after exhausting retries. Never silent. */
@@ -174,7 +198,7 @@ export class LarvaProto {
   /** Create the empty database. Fails if one already exists at this prefix. */
   async init(tables: string[], schema?: unknown): Promise<void> {
     const manifest: Manifest = {
-      formatVersion: 1,
+      formatVersion: SUPPORTED_FORMAT_VERSION,
       version: 0,
       commitId: ulid(),
       committedAt: new Date().toISOString(),
@@ -188,7 +212,7 @@ export class LarvaProto {
   async snapshot(): Promise<Snapshot> {
     const res = await this.store.get(this.manifestPath(), { fresh: true });
     if (!res) throw new Error(`No manifest at ${this.manifestPath()} — call init() first`);
-    return { manifest: JSON.parse(res.body) as Manifest, etag: res.etag };
+    return { manifest: parseManifest(res.body), etag: res.etag };
   }
 
   /** Stage one immutable chunk. When statsCols is given, rows are sorted by
@@ -507,7 +531,7 @@ export class LarvaProto {
    * or when the history write for that commit was lost (they are best-effort). */
   async historyManifest(version: number): Promise<Manifest | null> {
     const res = await this.store.get(`${this.prefix}history/manifest.v${version}.json`);
-    return res ? (JSON.parse(res.body) as Manifest) : null;
+    return res ? parseManifest(res.body) : null;
   }
 
   /** Delete every blob under this database's prefix. */

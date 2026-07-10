@@ -12,7 +12,7 @@ export {
 } from "./schema";
 export { SqlError } from "./sql/errors";
 export { parse } from "./sql/parser";
-export { ConflictError, ulid, type Row, type Scalar } from "./core";
+export { ConflictError, FormatError, ulid, type Row, type Scalar } from "./core";
 export {
   CasConflictError,
   VercelBlobAdapter,
