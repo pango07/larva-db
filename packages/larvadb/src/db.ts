@@ -1,4 +1,4 @@
-import { AppendIntent, cmpScalar, ConflictError, LarvaProto, Manifest, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
+import { AppendIntent, cmpScalar, ConflictError, IntentVerdict, LarvaProto, Manifest, OrderedIntent, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
 import { DatabaseSchema, SchemaError, schemaDrift, TableSchema } from "./schema";
 import { InsertStmt } from "./sql/ast";
 import { SqlError } from "./sql/errors";
@@ -93,8 +93,15 @@ export class LarvaDb {
   private format = 1;
   /** This instance's durable-but-not-yet-folded appends (format 4, tier A). */
   private pending = new Map<string, { intent: AppendIntent; path: string }>();
-  private foldChain: Promise<void> = Promise.resolve();
+  /** Serializes ALL lease-holding work on this instance (folds and leader
+   * passes). Concurrent request handlers share one proto writerId, so
+   * tryLease alone cannot distinguish them — without this chain, N waiters
+   * would all "renew their own lease" and elect N simultaneous leaders. */
+  private leaseChain: Promise<void> = Promise.resolve();
   private foldScheduled = false;
+  /** Tier B escalation: while set in the future, ordered single-statement
+   * writes queue for a leader instead of racing slots directly. */
+  private queueUntil = 0;
 
   constructor(private opts: LarvaOptions = {}) {
     // Group commit on: concurrent writes through one LarvaDb instance coalesce
@@ -184,7 +191,152 @@ export class LarvaDb {
     // Ordered writes see prior appends: fold them into the log first, so an
     // UPDATE can never silently miss a row the caller just inserted.
     if (this.pending.size > 0) await this.foldNow();
+    // Tier B (format 4): under cross-instance contention, stop racing slots —
+    // ship the statement as an ordered intent and await a leader's verdict.
+    // The fast path is untouched: with no contention observed, writes go
+    // straight to their slot exactly as in format 3.
+    if (this.format >= 4 && (stmt.kind === "insert" || stmt.kind === "update" || stmt.kind === "delete")) {
+      if (Date.now() < this.queueUntil) return (await this.orderedViaQueue(text, params, opts)) as T[];
+      try {
+        const rows = (await this.executor.execute(stmt, params, opts)) as T[];
+        const stats = this.executor.lastCommitStats;
+        if (stats && stats.casConflicts >= 2) this.queueUntil = Date.now() + 10_000;
+        return rows;
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          // Rescue: the direct path exhausted its budget — arbitrate via the queue.
+          this.queueUntil = Date.now() + 10_000;
+          return (await this.orderedViaQueue(text, params, opts)) as T[];
+        }
+        throw err;
+      }
+    }
     return (await this.executor.execute(stmt, params, opts)) as T[];
+  }
+
+  // ---------- format 4, tier B: ordered intents + leader batching ----------
+
+  /** Ship one constraint-bearing statement to the queue and wait for the slot
+   * verdict a leaseholder embeds in a log entry. Any waiting writer that finds
+   * the lease free elects itself, so no dedicated leader ever needs to exist. */
+  private async orderedViaQueue(sqlText: string, params: Scalar[], opts: ExecOptions): Promise<Row[]> {
+    const snap = await this.proto.snapshot();
+    const intent: OrderedIntent = {
+      kind: "ordered",
+      id: ulid(),
+      writerId: this.proto.writerId,
+      createdAt: new Date().toISOString(),
+      baseVersion: snap.manifest.version,
+      sql: sqlText,
+      params,
+      ...(opts.allowFullTable ? { allowFullTable: true } : {}),
+    };
+    const path = await this.proto.putIntent(intent);
+
+    const deadline = Date.now() + 30_000;
+    let scan = intent.baseVersion;
+    for (;;) {
+      for (;;) {
+        const entry = await this.proto.readLogEntry(scan + 1);
+        if (!entry) break;
+        scan++;
+        if (entry.folds?.length) entry.folds.forEach((id) => this.pending.delete(id));
+        const v = entry.verdicts?.[intent.id];
+        if (v) {
+          if (v.ok) return v.rows ?? [];
+          throw new SqlError(v.code, v.message);
+        }
+      }
+      if (Date.now() > deadline) {
+        // Withdraw best-effort; a leader that already read the blob may still
+        // commit it, and the message says so instead of pretending otherwise.
+        await this.proto.store.del([path]).catch(() => {});
+        throw new SqlError(
+          "VERDICT_TIMEOUT",
+          "ordered write queued but no verdict arrived in 30s; the write MAY still commit — verify before retrying",
+        );
+      }
+      await this.leadNow(); // elects only when the lease is genuinely free
+
+    }
+  }
+
+  /** Leader duty (lease held): batch every pending ordered intent into one log
+   * slot, verdicts embedded. Statements are planned sequentially against a
+   * virtual manifest — the in-process group-commit machinery promoted across
+   * process boundaries. One member's error becomes its verdict alone. */
+  private async processOrderedQueue(): Promise<void> {
+    const ordered = (await this.proto.listIntents()).filter(
+      (i): i is { path: string; intent: OrderedIntent } => i.intent.kind === "ordered",
+    );
+    if (ordered.length === 0) return;
+
+    // A leader that crashed after its slot landed but before cleanup leaves
+    // arbitrated blobs behind: re-executing one would double-apply it, so
+    // anything with a verdict on record is cleanup, not work.
+    const pending: typeof ordered = [];
+    for (const it of ordered) {
+      if (await this.findVerdict(it.intent.id, it.intent.baseVersion)) {
+        await this.proto.store.del([it.path]).catch(() => {});
+      } else {
+        pending.push(it);
+      }
+    }
+    if (pending.length === 0) return;
+    pending.sort((a, b) => (a.intent.createdAt < b.intent.createdAt ? -1 : a.intent.createdAt > b.intent.createdAt ? 1 : 0));
+
+    await this.proto.commit(async (snap) => {
+      const verdicts: Record<string, IntentVerdict> = {};
+      let virtual = structuredClone(snap.manifest);
+      const applies: PlanOutcome["apply"][] = [];
+      for (const { intent } of pending) {
+        try {
+          const stmt = parse(intent.sql);
+          if (stmt.kind === "select") throw new SqlError("INTERNAL", "an ordered intent cannot be a SELECT");
+          const rows = await this.executor.executeInTx(
+            stmt,
+            intent.params,
+            { allowFullTable: intent.allowFullTable },
+            { manifest: virtual, etag: "" },
+            (apply) => {
+              const next = apply(structuredClone(virtual));
+              if (next === null) throw new SqlError("INTERNAL", "ordered intent failed to apply to its own snapshot");
+              virtual = next;
+              applies.push(apply);
+            },
+          );
+          verdicts[intent.id] = { ok: true, ...(rows.length ? { rows } : {}) };
+        } catch (err) {
+          verdicts[intent.id] =
+            err instanceof SqlError || err instanceof SchemaError
+              ? { ok: false, code: err.code, message: err.message }
+              : { ok: false, code: "ORDERED_INTENT_FAILED", message: err instanceof Error ? err.message : String(err) };
+        }
+      }
+      return {
+        apply: (m) => {
+          let cur: Manifest | null = m;
+          for (const a of applies) {
+            cur = a(cur);
+            if (cur === null) return null;
+          }
+          return cur;
+        },
+        verdicts,
+      };
+    });
+    await this.proto.store.del(pending.map((p) => p.path)).catch(() => {});
+  }
+
+  /** Scan entries after the intent's version horizon for its verdict. Entries
+   * are immutable and cached, so repeat scans are cheap. */
+  private async findVerdict(id: string, baseVersion: number): Promise<IntentVerdict | null> {
+    for (let v = baseVersion + 1; ; v++) {
+      const entry = await this.proto.readLogEntry(v);
+      if (!entry) return null;
+      const verdict = entry.verdicts?.[id];
+      if (verdict) return verdict;
+    }
   }
 
   // ---------- format 4, tier A: durable-at-PUT appends ----------
@@ -249,8 +401,27 @@ export class LarvaDb {
   /** Fold every pending intent in the store (ours and anyone's) into one log
    * commit. Serialized per instance; lease-coordinated across instances. */
   private foldNow(): Promise<void> {
-    const run = this.foldChain.then(() => this.foldOnce());
-    this.foldChain = run.catch(() => {});
+    const run = this.leaseChain.then(() => this.foldOnce());
+    this.leaseChain = run.catch(() => {});
+    return run;
+  }
+
+  /** One serialized leader pass: acquire the lease, arbitrate the ordered
+   * queue, release. Queued behind any in-flight fold/leader work, so a burst
+   * of waiters produces one working pass plus cheap no-op passes. */
+  private leadNow(): Promise<void> {
+    const run = this.leaseChain.then(async () => {
+      if (!(await this.proto.tryLease())) {
+        await sleep(80); // another instance is arbitrating — let it finish
+        return;
+      }
+      try {
+        await this.processOrderedQueue();
+      } finally {
+        await this.proto.releaseLease();
+      }
+    });
+    this.leaseChain = run.catch(() => {});
     return run;
   }
 
@@ -268,7 +439,9 @@ export class LarvaDb {
     }
 
     try {
-      const intents = await this.proto.listIntents();
+      const intents = (await this.proto.listIntents()).filter(
+        (i): i is { path: string; intent: AppendIntent } => i.intent.kind === "append",
+      );
       if (intents.length === 0) return;
 
       await this.proto.commit(async (snap) => {
@@ -313,6 +486,9 @@ export class LarvaDb {
 
       for (const { intent } of intents) this.pending.delete(intent.id);
       await this.proto.store.del(intents.map((i) => i.path)).catch(() => {});
+      // While we hold the lease we are the leader — service any ordered
+      // intents waiting in the same queue before letting it go.
+      await this.processOrderedQueue();
     } finally {
       await this.proto.releaseLease();
     }

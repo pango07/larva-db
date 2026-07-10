@@ -42,6 +42,25 @@ This matters on Vercel specifically: Fluid Compute serves many concurrent reques
   at one storage round-trip, because durability cannot be faked.
 </Callout>
 
+## Format 4: two-tier writes
+
+Format 4 splits writes by one honest question: **is the outcome fully known before the write leaves the process?**
+
+**Tier A — fast appends.** A pure INSERT with an auto-generated id (`t.uuid()`, `t.sequence()`, or the implicit ULID) and no unique constraints cannot fail ordering — nothing about its result depends on other writers. So it's acknowledged the moment **one create-only PUT** lands in this writer's own `queue/` prefix: durable at ack, contention with nobody, `RETURNING` served locally. A lease-elected compactor folds pending intents into ordinary log commits in the background.
+
+- **Read-your-writes**: your instance's un-folded rows are scanned alongside chunk rows — filters, joins, and aggregates see them immediately.
+- **The barrier**: any UPDATE, DELETE, or transaction folds pending appends first, so ordered writes never miss a row you just inserted.
+- **Idempotent folds**: appended rows always carry client-generated ids, so a fold skips anything already present — a folder that crashes mid-cleanup re-folds harmlessly.
+
+**Tier B — contention batching.** Constraint-bearing statements normally race slots exactly as in format 3 (the uncontended fast path is untouched). When the heuristic detects cross-instance contention (repeated slot losses), writers stop racing: each ships its statement as an **ordered intent** and any waiting writer that finds the lease free elects itself leader, plans every pending intent sequentially against a virtual manifest, and lands the whole batch as **one log slot** with per-intent verdicts (result rows or a precise error) embedded in the entry. Waiting writers learn their fate from the log-tail reads they already do.
+
+<Callout type="info">
+  The lease is a **performance mechanism, never a correctness one**: the create-only log slot stays
+  the sole arbiter, so a split lease wastes work but cannot corrupt. A verdict on record makes a
+  leftover intent cleanup, never work — the crashed-leader window closes by construction. Harness
+  datapoint: 24 concurrent updates from three instances landed as a single slot.
+</Callout>
+
 ## Transactions and the consistency model
 
 `db.transaction` runs its callback against one pinned snapshot with read-your-writes; everything lands in one commit. The overlap check rejects write-write conflicts at commit time. This is **snapshot isolation, not serializability** — write skew between two transactions reading overlapping data and writing disjoint rows is theoretically possible, exactly as in Postgres's default mode. Documented, accepted.

@@ -1,4 +1,4 @@
-import { ChunkRef, cmpScalar, LarvaProto, Manifest, Row, Scalar, Snapshot } from "../core";
+import { ChunkRef, cmpScalar, CommitStats, LarvaProto, Manifest, Row, Scalar, Snapshot } from "../core";
 import { DatabaseSchema, TableSchema, validateInsert } from "../schema";
 import {
   Aggregate,
@@ -63,15 +63,20 @@ export class Executor {
     return ts;
   }
 
+  /** Stats of the most recent direct write commit — LarvaDb's contention
+   * heuristic reads this to decide when to escalate to the ordered queue. */
+  lastCommitStats?: CommitStats;
+
   async execute(stmt: Statement, params: Scalar[], opts: ExecOptions, snap?: Snapshot): Promise<Row[]> {
     if (stmt.kind === "select") return this.select(stmt, params, snap ?? (await this.proto.snapshot()), opts.overlay);
     // Single-statement write: plan against each (re)fetched snapshot, one CAS.
     let rows: Row[] = [];
-    await this.proto.commit(async (s) => {
+    const result = await this.proto.commit(async (s) => {
       const plan = await this.plan(stmt, params, opts, s);
       rows = plan.rows;
       return { apply: plan.apply };
     }, opts);
+    this.lastCommitStats = result.stats;
     return rows;
   }
 

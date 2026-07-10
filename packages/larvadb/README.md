@@ -160,7 +160,7 @@ const rows = await db.sql<Customer>`SELECT * FROM customers`;
 
 Format 3 changes how commits land: instead of re-uploading the whole manifest per commit, each commit is a tiny immutable delta in an ordered log, and the manifest becomes a periodic checkpoint. Conflicts get cheap (losing a race costs one small read, not a manifest round-trip), write cost stops scaling with database size, and contention tails shrink — same guarantees, verified by the same stress/property gauntlet. One-way, explicit, and old clients refuse loudly instead of corrupting:
 
-Format 4 adds **fast appends** on top: an INSERT whose outcome is fully client-determined — auto-generated id (`t.uuid()`, `t.sequence()`, or the implicit ULID), no unique constraints — is acknowledged the moment one durable PUT lands in a per-writer queue, then folded into the log in the background. Zero contention with anyone, your own reads see the rows immediately, and ordered writes (UPDATE/DELETE/transactions) fold first so they never miss them. Event logs, activity feeds, and telemetry stop touching the ordered path entirely.
+Format 4 adds **fast appends** on top: an INSERT whose outcome is fully client-determined — auto-generated id (`t.uuid()`, `t.sequence()`, or the implicit ULID), no unique constraints — is acknowledged the moment one durable PUT lands in a per-writer queue, then folded into the log in the background. Zero contention with anyone, your own reads see the rows immediately, and ordered writes (UPDATE/DELETE/transactions) fold first so they never miss them. Event logs, activity feeds, and telemetry stop touching the ordered path entirely. And when many instances hammer the same rows, the contention heuristic stops the retry storms: writers queue their statements and a lease-elected leader lands every waiting writer's work as **one** commit, each statement's result (or precise error) delivered back individually.
 
 ```ts
 await db.upgrade();                      // flip an existing database
@@ -265,7 +265,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## Tested where it matters
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **230 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **240 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
 
 The stress and property harnesses ship in the package for testing your own setup:
 

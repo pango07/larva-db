@@ -486,6 +486,93 @@ const schema = defineSchema({
   ok("the replanted intent was cleaned up by the healing fold", ![...objects.keys()].some((k) => k.startsWith("f4-refold/queue/")));
 }
 
+// ---------- 14. format 4 tier B: ordered intents, verdicts, leader batching ----------
+{
+  const f4schema = defineSchema({ counters: { id: t.text().primaryKey(), n: t.integer() } });
+  const mk = () => larva({ schema: f4schema, prefix: "f4-ordered/", store, commitLog: true });
+  const dbs = [mk(), mk(), mk()];
+  const [dbA, dbB, dbC] = dbs;
+  await dbA.sql`INSERT INTO counters (id, n) VALUES (${"hot"}, ${0})`;
+
+  // Force queue mode (normally entered by the contention heuristic) so the
+  // whole tier-B machinery runs deterministically.
+  for (const db of dbs) (db as unknown as { queueUntil: number }).queueUntil = Date.now() + 120_000;
+
+  const PER = 8;
+  await Promise.all(
+    dbs.flatMap((db) => Array.from({ length: PER }, () => db.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`)),
+  );
+  const [hot] = await dbA.sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok("queued hot counter exact across 3 instances", hot.n === 3 * PER, `n=${hot.n}, expected ${3 * PER}`);
+
+  const verdictEntries = [...objects.entries()]
+    .filter(([k]) => k.startsWith("f4-ordered/log/"))
+    .map(([, o]) => JSON.parse(o.body) as { verdicts?: Record<string, unknown> })
+    .filter((e) => e.verdicts);
+  ok("verdicts are embedded in log entries", verdictEntries.length > 0, `${verdictEntries.length} verdict entries`);
+  ok(
+    "a leader batched several writers' intents into one slot",
+    verdictEntries.some((e) => Object.keys(e.verdicts!).length > 1),
+    `batch sizes: ${verdictEntries.map((e) => Object.keys(e.verdicts!).length).join(",")}`,
+  );
+  ok("the ordered queue drained after arbitration", ![...objects.keys()].some((k) => k.startsWith("f4-ordered/queue/")));
+
+  // A failing statement becomes its verdict alone — the precise error travels
+  // back to the writer that queued it, and batchmates are unaffected.
+  const dup = await dbB.sql`INSERT INTO counters (id, n) VALUES (${"hot"}, ${9})`.then(
+    () => null,
+    (e: unknown) => e as SqlError,
+  );
+  ok("an error verdict propagates to the queued writer", dup?.code === "PRIMARY_KEY_CONFLICT", dup?.message);
+
+  // Crashed-leader window: a verdict on record with the blob left behind.
+  // Re-processing must treat it as cleanup, never as work (no double-apply).
+  const planted = {
+    kind: "ordered",
+    id: "01CRASHEDORDEREDINTENT000A",
+    writerId: "01ZOMBIEWRITER00000000000A",
+    createdAt: new Date().toISOString(),
+    baseVersion: 0,
+    sql: "UPDATE counters SET n = n + 1 WHERE id = 'hot'",
+    params: [],
+  };
+  const plantPath = "f4-ordered/queue/01ZOMBIEWRITER00000000000A/intent-000000000000.json";
+  const plant = () =>
+    objects.set(plantPath, { body: JSON.stringify(planted), etag: `"plant-${++etagCounter}"`, uploadedAt: new Date().toISOString() });
+
+  plant();
+  await dbC.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`; // leader run executes the planted intent once
+  const [afterFirst] = await dbC.sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok("a planted ordered intent executes exactly once", afterFirst.n === 3 * PER + 2, `n=${afterFirst.n}`);
+
+  plant(); // the same intent id again — its verdict is already in the log
+  await dbC.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`;
+  const [afterSecond] = await dbC.sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok(
+    "a re-planted arbitrated intent is cleanup, not work (no double-apply)",
+    afterSecond.n === 3 * PER + 3,
+    `n=${afterSecond.n}, expected ${3 * PER + 3}`,
+  );
+  ok("the re-planted blob was swept", !objects.has(plantPath));
+}
+
+// ---------- 15. format 4 tier B: the contention heuristic escalates on its own ----------
+{
+  chaos = false;
+  const f4schema = defineSchema({ counters: { id: t.text().primaryKey(), n: t.integer() } });
+  const mk = () => larva({ schema: f4schema, prefix: "f4-escalate/", store, commitLog: true });
+  const dbs = [mk(), mk(), mk(), mk()];
+  await dbs[0].sql`INSERT INTO counters (id, n) VALUES (${"hot"}, ${0})`;
+  const PER = 6;
+  await Promise.all(
+    dbs.flatMap((db) => Array.from({ length: PER }, () => db.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`)),
+  );
+  const [hot] = await dbs[0].sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok("hot counter exact with the heuristic free to escalate", hot.n === dbs.length * PER, `n=${hot.n}, expected ${dbs.length * PER}`);
+  const escalated = dbs.some((db) => (db as unknown as { queueUntil: number }).queueUntil > 0);
+  ok("cross-instance contention tripped the escalation heuristic", escalated);
+}
+
 server.stop();
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
