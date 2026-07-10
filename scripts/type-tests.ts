@@ -41,3 +41,33 @@ const typedRows: Promise<Customer[]> = db.sql<Customer>`SELECT * FROM customers`
 
 void [id, name, age, active, createdAt, nameStrict, missing, typedRows];
 export type { Nope };
+
+// v2 schema features: sequence inference and typed composite uniques
+const v2 = defineSchema(
+  {
+    invoices: {
+      number: t.sequence().primaryKey(),
+      customer: t.text(),
+    },
+  },
+  { uniques: { invoices: [["number", "customer"]] } },
+);
+
+type Invoice = InferRow<typeof v2, "invoices">;
+declare const invoice: Invoice;
+
+// sequence is an integer column; primaryKey() strips null
+const invoiceNumber: number = invoice.number;
+
+// @ts-expect-error sequence pk is a number, not a string
+const invoiceNumberStr: string = invoice.number;
+
+const v2nullable = defineSchema({ tickets: { id: t.text().primaryKey(), counter: t.sequence() } });
+type Ticket = InferRow<typeof v2nullable, "tickets">;
+declare const ticket: Ticket;
+const counter: number | null = ticket.counter;
+
+// @ts-expect-error uniques keys must be table names in the schema
+defineSchema({ a: { id: t.text().primaryKey() } }, { uniques: { b: [["id", "id"]] } });
+
+void [v2, invoiceNumber, invoiceNumberStr, v2nullable, counter];
