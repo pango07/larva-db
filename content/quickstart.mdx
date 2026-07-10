@@ -1,0 +1,96 @@
+---
+title: Quickstart
+---
+
+import { Steps, Callout } from "nextra/components";
+
+# Quickstart — sixty seconds to a database
+
+<Steps>
+### Install
+
+```bash
+npm install @larva-db/core
+```
+
+Make sure your Vercel project has a **Blob store** connected (dashboard → Storage → Create → Blob), or create one from the shell:
+
+```bash
+vercel blob store add my-larva-store --access private --yes
+vercel env pull .env.local   # BLOB_READ_WRITE_TOKEN lands in your env
+```
+
+That's the whole setup — Larva finds the credentials Vercel already put in your environment, and every blob it writes is private by construction.
+
+### Describe your data
+
+Create `schema.ts`. This tells Larva — and your AI agent — what your data looks like:
+
+```ts
+import { defineSchema, t } from "@larva-db/core";
+
+export const schema = defineSchema({
+  customers: {
+    id: t.text().primaryKey(),              // ULIDs generated for you
+    name: t.text(),
+    email: t.text().unique(),
+    createdAt: t.timestamp().partitionBy(), // ← put this on your most-filtered column
+  },
+  orders: {
+    id: t.text().primaryKey(),
+    customerId: t.text().references("customers.id"),
+    total: t.real(),
+    status: t.text(),
+    createdAt: t.timestamp().partitionBy(),
+  },
+});
+```
+
+No migrations to run — tables declared in code are created on first connect, and drift between code and store is a loud startup error, never a silent guess.
+
+### Use it
+
+```ts
+import { larva } from "@larva-db/core";
+import { schema } from "./schema";
+
+const db = larva({ schema });
+
+// ${...} values are parameterized automatically — never string-concatenated
+await db.sql`INSERT INTO customers (name, email) VALUES (${"Ada"}, ${"ada@example.com"})`;
+
+const top = await db.sql`
+  SELECT customers.name, orders.total FROM orders
+  INNER JOIN customers ON orders.customerId = customers.id
+  WHERE orders.createdAt > ${"2026-06-01"}
+  ORDER BY orders.total DESC LIMIT 10`;
+```
+
+### When something goes wrong
+
+Every commit is a new immutable version, so destructive mistakes are reversible:
+
+```ts
+const past = await db.asOf(new Date(Date.now() - 10 * 60 * 1000)); // 10 minutes ago
+await past.sql`SELECT COUNT(*) FROM customers`;  // peek, read-only
+await db.rollbackTo(past.version);               // restore it (itself undoable)
+```
+
+History is kept for 7 days or the last 50 versions, whichever is more.
+
+### Growing up
+
+You've outgrown Larva when you need more than a handful of writes per second or your tables reach millions of rows. When that happens:
+
+```bash
+npx larva export --format postgres   # one .sql file
+psql $DATABASE_URL < larva-export.sql
+```
+
+The file is pg_dump-shaped — real types, fast `COPY` blocks, and your `.references()` declarations become genuine `FOREIGN KEY` constraints. One command out, one command in.
+</Steps>
+
+<Callout type="info">
+  Building with an AI agent? Paste [the agent prompt](/docs/agents) into its instructions — it
+  teaches the dialect, the guardrails, and the performance rules in one page.
+</Callout>

@@ -1,0 +1,40 @@
+---
+title: Time travel & vacuum
+---
+
+# Time travel, rollback, and vacuum
+
+Because chunks are immutable and every commit produces a new manifest, **old versions are complete snapshots that already exist**. Time travel isn't a feature bolted on — it's the storage model refusing to forget.
+
+## Reading the past
+
+```ts
+const past = await db.asOf(new Date(Date.now() - 10 * 60 * 1000)); // or a version number
+await past.sql`SELECT COUNT(*) FROM customers`;                    // read-only
+```
+
+`asOf` snapshots are read-only; writes against them are rejected with a pointer to `rollbackTo`.
+
+## The undo button
+
+```ts
+await db.rollbackTo(past.version);
+```
+
+Rollback is **itself a new commit** — non-destructive, atomic, and rollbackable. This is the answer to the scariest failure mode of agent-built software: an agent ran a wrong `UPDATE` or convinced itself a table needed deleting. Recovery is one line, and it exists because of the architecture rather than in spite of it — a stronger safety story than most managed databases offer at this price.
+
+Guardrail note: the *prevention* side is `UPDATE`/`DELETE` without `WHERE` requiring an explicit `{ allowFullTable: true }`. Rollback is the cure when prevention wasn't enough.
+
+## Retention
+
+History is kept for **7 days or the last 50 versions, whichever keeps more**. In format 1 every commit leaves a history snapshot; in [format 3](/docs/how-it-works/format-versioning) history is sparse checkpoints plus the log — any retained version is reconstructed by replaying deltas from the nearest base, so `asOf` and `rollbackTo` keep per-version granularity in both formats.
+
+## Vacuum
+
+```ts
+await db.vacuum(); // { retainDays: 7, retainVersions: 50 } — whichever keeps more
+```
+
+Vacuum drops history outside retention and deletes chunks referenced by **no retained version** — including orphans from crashed commits, after a grace period. It's safe alongside live readers and writers: current data is never touched, because the current manifest's chunks are always retained by definition.
+
+In format 3, log entries are history too: an entry is dropped only when it's outside the retention window *and* no longer needed to replay from the oldest retained checkpoint.

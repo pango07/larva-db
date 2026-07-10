@@ -1,0 +1,59 @@
+---
+title: The architecture
+---
+
+# How it works — the architecture
+
+Larva is a deliberate **miniaturization of the Delta Lake / Iceberg pattern**, sized for the object storage you already have. Rows live in immutable files; one small mutable object describes the current state of everything; concurrency control is the object store's own conditional-write primitive.
+
+## The layer cake
+
+```
+Your app — or the AI agent building it
+        │  real SQL, every ${…} parameterized
+        ▼
+LarvaDB (@larva-db/core) — the orchestrator
+  · SQL engine: hand-written parser → zone-map pruning → in-memory execution
+  · commit protocol: stage immutable chunks → one atomic commit
+  · transactions · group commit · sequences · time travel · export · CLI
+        │  StorageAdapter — exactly 4 operations:
+        │  get · put-with-CAS · delete · list
+        ▼
+Object store — Vercel Blob (default) · AWS S3 · Cloudflare R2
+```
+
+The only platform-specific code is the storage adapter, and its contract is four operations. That's why the same database runs unmodified on S3 or R2, and why `S3Adapter` is ~200 lines.
+
+## The storage layout
+
+A database occupies a prefix inside the store:
+
+```
+larva/
+  manifest.json          ← the mutable object (format 3: a rolling checkpoint)
+  tables/
+    users/
+      chunk_01H9….json   ← immutable chunk blobs — rows, never edited
+  log/
+    000000000043.json    ← format 3: one immutable delta per commit
+  history/
+    manifest.v41.json    ← retained snapshots (time travel)
+  sequences.json         ← CAS-claimed number ranges (off the hot path)
+```
+
+**Chunks** hold ~1,000–5,000 rows each, sorted by primary key, ULID-named so writes never collide. A chunk, once written, is *never modified* — updates and deletes produce a replacement chunk and retire the old one from the manifest. This one invariant is where most of Larva's properties come from.
+
+**The manifest** names the current chunk set per table, embeds the schema, and carries per-chunk **zone maps** — min/max of the primary key and the declared `partitionBy()` column. A query's planner prunes chunks by intersecting its predicates with those ranges, which is why date-range filters on a partition column read a fraction of the table.
+
+## What falls out of immutability
+
+- **Snapshot isolation, free.** One manifest fetch pins a consistent view of the whole database; concurrent commits are invisible to running queries.
+- **Caching that can't go stale.** Chunks are immutable, so a chunk cache never needs invalidation; only the manifest needs freshness.
+- **Time travel as a byproduct.** Old manifests *are* complete snapshots — see [time travel](/docs/how-it-works/time-travel).
+- **Consistent exports with zero locking.** An export reads one snapshot; writers keep writing.
+
+## Reads: what a query costs
+
+A query = one manifest fetch + the chunks that survive pruning, filtered/joined/aggregated/sorted in memory. At the target scale (a 30,000-row table is ten to thirty chunks, a couple of MB) that's sub-second even for a full scan. Filters on the primary key or partition column prune aggressively; anything else scans the table — acceptable at this scale by design, and the docs say so plainly.
+
+The write side is the interesting part: [the commit protocol](/docs/how-it-works/commit-protocol).

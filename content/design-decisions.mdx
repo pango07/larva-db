@@ -1,0 +1,47 @@
+---
+title: Design decisions
+---
+
+# Design decisions — and the roads not taken
+
+The [design document](https://github.com/pango07/larva-db/blob/main/LARVA-DESIGN.md) is the spec of record; this page is its greatest hits. Larva documents *why*, not just *what* — including the alternatives that lost.
+
+## Why Larva exists at all
+
+Vercel has no first-party Postgres. Postgres on Vercel means the marketplace — a second vendor, second dashboard, second bill, and connection-pooling concepts alien to the target user. Larva's wedge is narrow but real: **zero additional vendor** (Blob is already in the account), a radically simpler mental model (files in a bucket you can see), versioned time travel as a first-class primitive, and full portability of the storage layer.
+
+## The road not taken: embedded SQLite
+
+The obvious design was Path A: embed a real SQLite engine and snapshot the database file to Blob. Real SQL for free! It lost to Path B (purpose-built chunked storage) because the write path is fatal at this substrate: every commit means re-uploading the *entire database file* (write amplification that grows with data size), concurrent writers can't merge conflicting file snapshots (whole-file CAS makes every conflict a total loss), and partial reads are impossible (every cold query downloads everything). Path B's chunked layout makes writes proportional to what changed, lets disjoint commits rebase cheaply, and lets zone maps prune reads.
+
+## Audience first: agents write the SQL
+
+The primary user is a non-engineer building with an AI agent. Three consequences:
+
+1. **Real SQL strings**, not a query-builder API — SQL is the language every agent already speaks.
+2. **Error-message quality is a product feature.** The parser is hand-written specifically so rejections can name the feature and the alternative. Agents self-correct from specific errors; this is the whole bet.
+3. **Destruction must be cheaply reversible**, because there is no code reviewer. Hence time travel as a core primitive, and `allowFullTable` as an explicit speed bump.
+
+## The dialect's admission bar
+
+A construct joins the dialect when **agents writing conservative SQL emit it routinely AND it executes within the existing engine shape** — in-memory algebra after pruning, one atomic commit per write. `HAVING`, `DISTINCT`, scalar functions, `CASE`, upsert, sequences, and composite uniques cleared it. Subqueries never will, regardless of demand — they'd change the engine's shape, and the honest answer to needing them is `larva export`.
+
+## Honesty as strategy
+
+The performance envelope is stated bluntly on purpose: single-digit commits per second, per-query cost proportional to chunks touched, pruning only on the primary key and one partition column. No complexity is added to push past those ceilings, because the ceilings are the product boundary — **the answer to outgrowing Larva is the export**, and making that exit first-class (real Postgres DDL, `COPY` blocks, enforced foreign keys) is part of the promise. A database for the long tail earns trust by telling you when to leave it.
+
+## Rejected: Edge Config as a substrate
+
+Evaluated and rejected: it's a read-optimized config store with a deliberately write-hostile path (slow, globally propagated, rate-limited, small size cap). A database's write path can't live on it.
+
+## Rejected: per-feature format flags
+
+When the on-store format needed to evolve, Delta-Lake-style per-feature flags (`requires: {read, write}`) were considered and rejected in favor of one strictly-checked integer plus an explicit atomic `upgrade()`. Finer granularity wasn't worth a permanent dual-format read/write matrix for a young package — revisitable if adoption makes coordinated upgrades genuinely painful.
+
+## Accepted: write skew
+
+Transactions get snapshot isolation, not serializability. Write skew between transactions reading overlapping data and writing disjoint rows is possible — exactly as in Postgres's default mode — and accepted for v1, documented rather than hidden.
+
+## The roadmap's ladder
+
+The v1 write ceiling is a protocol choice, not an object-storage limit. The design doc records a ladder of known techniques, each independently shippable: sequence range leasing (**shipped**), composite uniques (**shipped**), the ordered commit log (**shipped** — format 3), lease-elected cross-process group commit, contention-free intent queues with Calvin-style slot verdicts, and sharded contention domains. The remaining rungs wait for a workload that needs them — the shipped ones already cover multi-process operational apps at modest scale.

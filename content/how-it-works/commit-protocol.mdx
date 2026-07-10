@@ -1,0 +1,51 @@
+---
+title: The commit protocol
+---
+
+import { Callout } from "nextra/components";
+
+# The commit protocol
+
+The heart of the system. Object storage offers no locks and no transactions — the only coordination primitive is a **conditional write** (`ifMatch` an ETag, or create-only). Everything here is built on that single fact.
+
+## The promise
+
+**No silently lost writes, ever.** Atomic, durable commits. Snapshot-isolated reads. What it deliberately does *not* promise: high write throughput — commits serialize through one commit point, and sustained throughput is roughly one commit per second. That trade was accepted at design time for the target workload, and [the exit is guaranteed](/docs/cli#larva-export---format-postgressqlitejsoncsv---out-file) for workloads that outgrow it.
+
+## Format 1: compare-and-swap on the manifest
+
+1. **Stage.** The writer uploads its new chunks — immutable, ULID-named, touching nothing live. A failed commit leaves only orphans for vacuum.
+2. **Commit.** One `PUT manifest.json ifMatch:<etag>`. The store lets exactly one concurrent writer win.
+3. **Conflict.** The loser gets a 412, refetches, and asks: *did the winning commit change anything mine touched?*
+   - **No** (different tables/chunks — the common case): **rebase** — re-point the same staged chunks at the new state and retry. Cheap.
+   - **Yes** (row-level overlap): **re-execute** the statements against the fresh snapshot, then retry.
+   - Retries use jittered exponential backoff; after the attempt budget (default 15), the commit fails loudly with `ConflictError`. Never silently.
+
+## Group commit: same-instance writers never contend
+
+Commits that arrive while another commit from the same `LarvaDb` instance is in flight are queued, and the whole batch lands as **one** commit. Each member plans against a virtual manifest including the members before it, so a batch has transaction-like internal consistency — and one member's error rejects that member alone.
+
+This matters on Vercel specifically: Fluid Compute serves many concurrent requests from one warm instance, so concurrent end-users genuinely share a `LarvaDb` — and stop fighting over the manifest entirely. Measured at 40ms-latency storage with ten writers: ~1.6× throughput, 5× fewer storage writes, hot-counter p95 falling from ~12s to ~1.3s.
+
+## Format 3: the ordered commit log
+
+`db.upgrade()` changes the commit *point* while keeping the commit *protocol*. A commit becomes a small immutable delta written **create-only** to `log/<version>.json` — the slot number *is* the version, and first-writer-wins on the slot is the arbiter. `manifest.json` is demoted to a periodic checkpoint (every 8 versions, written off the commit's latency path, advanced under its own CAS chain so it can never regress).
+
+- A snapshot = read the checkpoint + replay the log tail. Entries are immutable, so everything but the tip probe comes from cache. The log has no gaps by construction: slot n+1 is only ever attempted by a writer that observed slot n.
+- **Losing a race gets cheap**: one tiny entry read + a retry at the next slot, instead of a full manifest round-trip. Measured: mixed-workload p95 under 10-writer contention drops ~25%.
+- **Commit payloads are deltas**, so write cost stops scaling with database size — a 10,000-chunk manifest re-uploaded per commit versus a ~300-byte entry.
+- Same jittered backoff (measured: near-immediate slot retries starve slow writers), same re-execute-on-overlap, same loud `ConflictError` (with a 3× attempt budget, because slot attempts are ~3× cheaper and faster).
+
+<Callout type="info">
+  Throughput at small scale is **parity** with format 1 — the log's advantages are structural, not a
+  small-scale speedup, and we say so. The physics neither format changes: sync-commit latency floors
+  at one storage round-trip, because durability cannot be faked.
+</Callout>
+
+## Transactions and the consistency model
+
+`db.transaction` runs its callback against one pinned snapshot with read-your-writes; everything lands in one commit. The overlap check rejects write-write conflicts at commit time. This is **snapshot isolation, not serializability** — write skew between two transactions reading overlapping data and writing disjoint rows is theoretically possible, exactly as in Postgres's default mode. Documented, accepted.
+
+## How we know it holds
+
+Correctness risk concentrates in the conflict/retry matrix, so that's where the tests concentrate: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), property-based random workloads verified against a model, and offline chaos suites injecting 409s and 500s under the storage adapter — run on every push, in both formats. See [the test lab](/docs/test-lab).

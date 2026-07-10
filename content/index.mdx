@@ -1,0 +1,54 @@
+---
+title: What is Larva?
+---
+
+import { Cards } from "nextra/components";
+
+# What is Larva?
+
+**A tiny SQL database that lives inside your Vercel Blob store.** No signup, no new vendor, no server, no connection string. When your app grows up, export to a bigger database with one command — that's why it's called Larva.
+
+```ts
+import { defineSchema, larva, t } from "@larva-db/core";
+
+const schema = defineSchema({
+  customers: {
+    id: t.text().primaryKey(),              // ULIDs generated for you
+    email: t.text().unique(),
+    createdAt: t.timestamp().partitionBy(), // ← makes date filters fast
+  },
+});
+
+const db = larva({ schema }); // credentials auto-discovered from the Vercel env
+
+await db.sql`INSERT INTO customers (email, createdAt)
+             VALUES (${"ada@example.com"}, ${"2026-06-01T00:00:00Z"}) RETURNING *`;
+```
+
+That's the whole setup. No migrations to run, no dashboard to visit, no second bill.
+
+## What you get
+
+- **Real SQL** — a deliberately scoped dialect that covers ~90% of what small apps write: joins, `GROUP BY` over expressions, `HAVING`, upserts, JSON functions, date bucketing. Everything outside it is rejected *by name, with an alternative*.
+- **No silently lost writes, ever.** Every commit goes through an atomic protocol; conflicts rebase, re-execute, or fail loudly. Verified by 213 checks including randomized concurrent-writer gauntlets.
+- **Atomic transactions** — several statements, one commit, all or nothing.
+- **Time travel** — every commit is a new immutable version; `db.asOf()` reads the past and `db.rollbackTo()` is a one-line undo button.
+- **Sequences** — `t.sequence()` auto-numbers rows, unique across concurrent writers, without a server.
+- **A guaranteed exit** — `db.export({ format: "postgres" })` produces one pg_dump-shaped file; `psql $DATABASE_URL < export.sql` is the entire migration.
+
+## Who it's for — and honest limits
+
+Larva is for the enormous long tail of **small applications**: dashboards, internal tools, hobby apps, prototypes, and anything an AI agent is building for you. The limits are physics, not configuration:
+
+- **Storage** grows to gigabytes — that axis never runs out.
+- **Writes** serialize through one commit point: roughly one commit per second sustained. Five people editing a dashboard never notice; fifty writes per second hits a wall.
+- **Reads** pull data to the compute. Filters on the primary key or the `partitionBy()` column prune aggressively; anything else scans — fine at tens of thousands of rows, untenable at millions.
+
+When you get there, congratulations: [export and graduate](/docs/cli#larva-export---format-postgressqlitejsoncsv---out-file).
+
+<Cards>
+  <Cards.Card title="Quickstart — sixty seconds to a database" href="/docs/quickstart" />
+  <Cards.Card title="The SQL dialect" href="/docs/sql" />
+  <Cards.Card title="How it works" href="/docs/how-it-works" />
+  <Cards.Card title="Give this to your AI agent" href="/docs/agents" />
+</Cards>

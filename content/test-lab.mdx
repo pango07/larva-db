@@ -1,0 +1,88 @@
+---
+title: The test lab
+---
+
+import { Callout } from "nextra/components";
+
+# The test lab
+
+This site doubles as a working demo and the project's test bench. [The home page](/) runs a **real Larva database** — seeded `customers`, `orders`, and auto-numbered `invoices`, living in a private Vercel Blob store on format 3, the ordered commit log. Nothing is mocked.
+
+## The SQL console
+
+Type any statement in [the dialect](/docs/sql) and run it live. The example chips walk the breadth: joins + `GROUP BY`, zone-map-pruned date ranges, `INSERT … RETURNING`, revenue-by-day, `HAVING` + `CASE`, upserts, a sequence-numbered invoice, and one deliberately unsupported query so you can see an agent-grade error. Every result reports timing, **chunks read vs. total** (pruning, visibly), and the database version it saw.
+
+**Export buttons** produce real files — the Postgres one loads with `psql $DATABASE_URL < larva-demo.sql`. **Reset demo data** re-seeds everything; mangle freely, that's the point.
+
+## The stress lab
+
+The bottom of the home page hammers one database with concurrent writers, then audits the final state for lost updates, duplicates, and version drift — the commit protocol's core promise, tested against the real store on every click.
+
+- **append** — disjoint writes; exercises the cheap *rebase* recovery path
+- **counter** — every write overlaps; forces full *re-execute* recovery
+- **mixed** — both at once
+
+## Guardrails (a public toy, not a public liability)
+
+- Statements cap at 5,000 characters.
+- Writes draw from a **budget of 400 commits between resets** — every commit bumps the version, so budget × statement cap bounds total storage no matter what the console is fed. Exhausting it returns `WRITE_BUDGET_EXHAUSTED` (HTTP 429); reset restarts it.
+- Stress runs always clean up after themselves, and reset also sweeps blobs left by failed harness runs.
+
+## API routes (what the buttons call)
+
+| Route | Method | Does |
+|---|---|---|
+| `/api/sql` | POST `{ sql, allowFullTable? }` | run one statement, return rows + stats |
+| `/api/export?format=postgres\|json` | GET | download the live database |
+| `/api/export?format=csv&table=NAME` | GET | download one table as CSV |
+| `/api/demo-reset` | POST | drop and re-seed; restarts the write budget |
+| `/api/stress` | POST `{ writers, commitsPerWriter, mode }` | run the concurrent-writer audit |
+
+## Run your own
+
+```bash
+git clone https://github.com/pango07/larva-db && cd larva-db
+bun install
+vercel link
+vercel blob store add my-larva-store --access private --yes
+vercel env pull .env.local        # BLOB_READ_WRITE_TOKEN
+bun run dev                       # http://localhost:3000
+vercel deploy --prod --yes        # or ship it
+```
+
+## The test suites — 213 checks across seven suites
+
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate. All of it runs in CI on every push; merges to `main` publish to npm.
+
+```bash
+bunx tsc --noEmit                  # typecheck (includes compile-only type tests)
+bun run lint
+
+# offline — no credentials needed
+bun scripts/s3-adapter-test.ts     # storage contract + injected 409/500 chaos
+bun scripts/group-commit-test.ts   # coalescing, conflict matrix, format 3, upgrade flow
+
+# live — need BLOB_READ_WRITE_TOKEN in .env.local
+bun scripts/sql-smoke.ts           # the whole dialect, end to end
+bun scripts/api-smoke.ts           # transactions, exports, vacuum
+bun scripts/cli-smoke.ts           # the larva CLI as a subprocess
+bun scripts/stress.ts --writers 4 --commits 6    # add --log for format 3
+bun scripts/property.ts --writers 4 --ops 10     # add --log for format 3
+bun scripts/bench.ts               # write throughput, both formats
+```
+
+| Suite | What it proves |
+|---|---|
+| `stress.ts` | concurrent writers on a real store: zero lost updates, exact version arithmetic |
+| `property.ts` | randomized workloads verified against a per-writer sequential model |
+| `sql-smoke.ts` | the full dialect + the machine-readable error catalog + pruning + time travel |
+| `api-smoke.ts` | transaction atomicity, export round-trips, vacuum retention, format 3 live |
+| `cli-smoke.ts` | the CLI: arguments, exit codes, files on disk, upgrade/rollback |
+| `s3-adapter-test.ts` | the storage contract under injected chaos |
+| `group-commit-test.ts` | coalescing, the conflict matrix, the ordered commit log under chaos |
+
+<Callout>
+  The stress and property harnesses ship in the package —
+  `import { runStress, runProperty } from "@larva-db/core/testing"` — so you can gauntlet your own
+  setup.
+</Callout>

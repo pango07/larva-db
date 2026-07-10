@@ -1,0 +1,38 @@
+---
+title: For AI agents
+---
+
+import { Callout } from "nextra/components";
+import { AgentPromptBlock } from "../app/_components/agent-prompt-block";
+
+# Give this to your AI agent
+
+Larva is built for apps where an agent writes the SQL. This page holds the prompt that teaches an agent the dialect, the guardrails, and the performance rules — paste it into your agent's instructions (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, a system prompt).
+
+<Callout type="info">
+  Agents can also fetch it directly: it's served raw at [`/llms.txt`](/llms.txt) on every deployed
+  test lab — one URL instead of a paste.
+</Callout>
+
+## The prompt
+
+<AgentPromptBlock />
+
+## What it teaches, in five bullets
+
+- Always interpolate with `${…}` (parameterized automatically) — never concatenate SQL.
+- The supported dialect, and what to do instead for everything outside it.
+- `UPDATE`/`DELETE` without `WHERE` needs `{ allowFullTable: true }`; multi-statement changes go in `db.transaction`.
+- Filter on raw pk/partition columns for pruning (`createdAt >= '…'`, not `DATE(createdAt) >= '…'`).
+- Surface `ConflictError`, never swallow it — and `db.rollbackTo()` undoes mistakes.
+
+## Why errors look the way they do
+
+Every rejection is machine-readable and names its alternative, because agents self-correct from specific messages:
+
+```
+UNSUPPORTED_FEATURE: subqueries are not supported in Larva v1 (found one in IN);
+run the inner query first and interpolate its result
+```
+
+The canonical source is [`docs/larva-for-agents.md`](https://github.com/pango07/larva-db/blob/main/docs/larva-for-agents.md) in the repo — this page and `/llms.txt` render the same file, so none of the three can drift.
