@@ -47,120 +47,50 @@ await db.sql`SELECT name FROM customers WHERE email = ${"ada@example.com"}`;
 
 ## What you can do with it
 
-### Dashboard queries — time series included
+Real SQL — the dialect covers ~90% of the queries small apps actually write, and every line below is the whole program (each one verified against a live store):
 
 ```ts
-// revenue by day
-await db.sql`SELECT DATE(createdAt) AS day, SUM(total) AS revenue
-             FROM orders
-             GROUP BY DATE(createdAt)
-             ORDER BY day`;
-// → [{ day: "2026-07-01", revenue: 340 }, { day: "2026-07-02", revenue: 125 }, ...]
+// the everyday stuff
+await db.sql`INSERT INTO customers (name, email) VALUES (${"Ada"}, ${"ada@example.com"}) RETURNING *`;
+await db.sql`SELECT name, email FROM customers WHERE createdAt >= ${"2026-06-01"} ORDER BY name LIMIT 10`;
 
-// monthly buckets, joins, HAVING — the usual dashboard shapes all work
-await db.sql`SELECT customers.name, SUM(orders.total) AS revenue
-             FROM orders
-             INNER JOIN customers ON orders.customerId = customers.id
-             GROUP BY customers.name
-             HAVING revenue > ${100}
-             ORDER BY revenue DESC
-             LIMIT 10`;
-```
+// dashboards: dates, grouping, joins
+await db.sql`SELECT DATE(createdAt) AS day, SUM(total) AS revenue FROM orders GROUP BY day ORDER BY day`;
+await db.sql`SELECT customers.name, SUM(orders.total) AS spent FROM orders
+  INNER JOIN customers ON orders.customerId = customers.id
+  GROUP BY customers.name HAVING spent > ${100}`;
 
-### Upserts — the counter pattern
-
-```ts
+// upserts and JSON
 await db.sql`INSERT INTO counters (slug, count) VALUES (${"visits"}, ${1})
-             ON CONFLICT (slug) DO UPDATE SET count = count + ${1}`;
+  ON CONFLICT (slug) DO UPDATE SET count = count + ${1}`;
+await db.sql`SELECT JSON_EXTRACT(payload, ${"$.user.name"}) AS who FROM events`;
 ```
 
-### Sequences & composite uniques
+`CASE WHEN`, `CAST`, `DISTINCT`, `BETWEEN`, `LIKE`, scalar functions, `STRFTIME` buckets — [the full dialect](#sql-dialect) is below, and everything outside it is rejected by name with what to do instead.
 
-Invoice numbers without running a server: `t.sequence()` auto-assigns integers that are unique across concurrent processes (drawn from CAS-claimed ranges, gappy on crash — exactly a Postgres sequence). Composite uniques guard pairs, and work as upsert targets:
+### Transactions, time travel, auto-numbering
 
 ```ts
-const schema = defineSchema(
-  {
-    invoices: { number: t.sequence().primaryKey(), customer: t.text() },
-    grants: { id: t.text().primaryKey(), userId: t.text(), feature: t.text(), level: t.integer() },
-  },
-  { uniques: { grants: [["userId", "feature"]] } },
-);
+await db.transaction(async (tx) => {          // several statements, one atomic commit
+  await tx.sql`INSERT INTO orders (customerId, total) VALUES (${id}, ${99.5})`;
+  await tx.sql`UPDATE inventory SET count = count - 1 WHERE sku = ${"widget"}`;
+});
+
+const past = await db.asOf(new Date(Date.now() - 600_000));
+await db.rollbackTo(past.version);            // the undo button: 10 minutes ago, restored
 
 await db.sql`INSERT INTO invoices (customer) VALUES (${"ada"}) RETURNING number`;
-// → [{ number: 42 }]   — omit the column, read it back
-
-await db.sql`INSERT INTO grants (userId, feature, level) VALUES (${"u1"}, ${"exports"}, ${2})
-             ON CONFLICT (userId, feature) DO UPDATE SET level = excluded.level`;
+// → [{ number: 42 }] — t.sequence() columns auto-number, unique across concurrent writers
 ```
 
-### Transactions — several statements, one atomic commit
+### The escape hatch
 
 ```ts
-await db.transaction(async (tx) => {
-  const [order] = await tx.sql`INSERT INTO orders (customerId, total)
-                               VALUES (${customerId}, ${99.5}) RETURNING *`;
-  await tx.sql`UPDATE inventory SET count = count - 1 WHERE sku = ${sku}`;
-});
-// either both happened, or neither did
+await db.export({ format: "postgres" });      // pg_dump-shaped .sql → psql $DATABASE_URL < export.sql
+await db.export({ format: "sqlite" });        // a genuine .db file → Turso, D1, anywhere
 ```
 
-### JSON columns (the practical way)
-
-Store JSON with `t.text()` + `JSON.stringify`, then query inside it:
-
-```ts
-await db.sql`SELECT JSON_EXTRACT(payload, ${"$.user.name"}) AS who FROM events`;
-await db.sql`SELECT payload ->> ${"status"} AS status FROM events`;
-```
-
-### The undo button
-
-Every commit is a new immutable version. When something goes wrong — say an AI agent deleted the wrong rows — recovery is one line:
-
-```ts
-const past = await db.asOf(new Date(Date.now() - 10 * 60 * 1000)); // 10 min ago
-await past.sql`SELECT COUNT(*) FROM customers`;  // peek at the past, read-only
-await db.rollbackTo(past.version);               // restore it (itself undoable)
-```
-
-### The escape hatch — graduate in one command
-
-Your data is never trapped. That's a promise, not a feature:
-
-```ts
-// → Postgres (Neon, Supabase, RDS…): one .sql file, pg_dump-shaped —
-//   CREATE TABLEs with real types, data as fast COPY blocks, and your
-//   .references() declarations become genuine FOREIGN KEY constraints
-const sql = await db.export({ format: "postgres" });
-await Bun.write("export.sql", sql);
-// then:  psql $DATABASE_URL < export.sql     ← the entire migration
-
-await db.export({ format: "sqlite" }); // a genuine .db file → Turso, D1, anywhere
-await db.export({ format: "csv" });    // spreadsheets
-await db.export({ format: "json" });   // everything else
-await db.vacuum();                     // reclaim storage outside retention
-```
-
-### Typed rows
-
-```ts
-import type { InferRow } from "@larva-db/core";
-
-type Customer = InferRow<typeof schema, "customers">;
-// { id: string; name: string | null; email: string | null; createdAt: string | null }
-
-const rows = await db.sql<Customer>`SELECT * FROM customers`;
-```
-
-### More write headroom — the commit log
-
-Format 3 changes how commits land: instead of re-uploading the whole manifest per commit, each commit is a tiny immutable delta in an ordered log, and the manifest becomes a periodic checkpoint. Conflicts get cheap (losing a race costs one small read, not a manifest round-trip), write cost stops scaling with database size, and contention tails shrink — same guarantees, verified by the same stress/property gauntlet. One-way, explicit, and old clients refuse loudly instead of corrupting:
-
-```ts
-await db.upgrade();                      // flip an existing database
-const db2 = larva({ schema, commitLog: true }); // or start new ones there
-```
+Your data is never trapped — that's a promise, not a feature. CSV and JSON too, and `db.vacuum()` reclaims storage outside retention.
 
 ### The CLI
 
@@ -168,31 +98,19 @@ The whole API is also a shell command — `npx larva` works wherever `@larva-db/
 
 ```bash
 npx larva sql "SELECT name, email FROM customers LIMIT 5"
-npx larva export --format postgres --out export.sql  # then: psql $DATABASE_URL < export.sql
-npx larva upgrade                                    # flip to format 3, the commit log
-npx larva rollback 41                                # the undo button, from your shell
-npx larva vacuum
-npx larva version
+npx larva export --format postgres --out export.sql
+npx larva rollback 41
 ```
 
-Credentials auto-load from `.env.local` (`vercel env pull .env.local`); `--prefix` targets a specific database. Full reference — every command, flag, and troubleshooting — in [docs/cli.md](https://github.com/pango07/larva-db/blob/main/docs/cli.md).
+Credentials auto-load from `.env.local`. Full reference — every command, flag, and troubleshooting — in [docs/cli.md](https://github.com/pango07/larva-db/blob/main/docs/cli.md).
 
-### Any S3-compatible store
-
-Vercel Blob is the default, but the storage contract is four operations, so the same database runs on AWS S3 or Cloudflare R2 — zero extra dependencies:
+### And the rest, in one breath
 
 ```ts
-import { larva, S3Adapter } from "@larva-db/core";
-
-const db = larva({
-  schema,
-  store: new S3Adapter({
-    bucket: "my-bucket",
-    endpoint: "https://<account>.r2.cloudflarestorage.com", // omit for AWS S3
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-  }),
-});
+const rows = await db.sql<InferRow<typeof schema, "customers">>`SELECT * FROM customers`; // typed rows
+defineSchema(spec, { uniques: { grants: [["userId", "feature"]] } }); // composite uniques (upsert-targetable)
+larva({ schema, store: new S3Adapter({ bucket, accessKeyId, secretAccessKey }) }); // AWS S3 / R2, same database
+await db.upgrade(); // format 3, the ordered commit log — cheaper conflicts as you grow
 ```
 
 ## Give this to your AI agent
