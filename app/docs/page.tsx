@@ -18,15 +18,16 @@ const COMMANDS: [string, string][] = [
   ["bun scripts/group-commit-test.ts", "commit coalescing + conflict matrix — offline"],
   ["bun scripts/sql-smoke.ts", "the whole dialect, live against the real store"],
   ["bun scripts/api-smoke.ts", "transactions, exports, vacuum — live"],
-  ["bun scripts/stress.ts --writers 4 --commits 6", "concurrent-writer audit — live"],
-  ["bun scripts/property.ts --writers 4 --ops 10", "randomized workloads vs. a model — live"],
+  ["bun scripts/stress.ts --writers 4 --commits 6", "concurrent-writer audit — live; add --log for format 3"],
+  ["bun scripts/property.ts --writers 4 --ops 10", "randomized workloads vs. a model — live; add --log for format 3"],
+  ["bun scripts/bench.ts", "write-throughput benchmark, both formats — offline"],
 ];
 
 const ROUTES: [string, string, string][] = [
   ["/api/sql", "POST { sql, params? }", "run one statement, get rows + chunk-read stats"],
   ["/api/export?format=postgres | json", "GET", "download the live database"],
   ["/api/export?format=csv&table=NAME", "GET", "download one table as CSV"],
-  ["/api/demo-reset", "POST", "drop and re-seed the demo tables"],
+  ["/api/demo-reset", "POST", "drop and re-seed the demo tables; restarts the write budget"],
   ["/api/stress", "POST { writers, commitsPerWriter, mode }", "run the concurrent-writer audit"],
 ];
 
@@ -80,14 +81,17 @@ export default function DocsPage() {
           What this lab is
         </h2>
         <p className="text-ink-secondary mb-3 max-w-2xl text-sm leading-relaxed">
-          A real Larva database (seeded <code className="font-mono">customers</code> and{" "}
-          <code className="font-mono">orders</code>) living in a private Vercel Blob store — nothing
-          mocked. The <Link href="/" className="underline underline-offset-4">console</Link> runs any
+          A real Larva database (seeded <code className="font-mono">customers</code>,{" "}
+          <code className="font-mono">orders</code>, and auto-numbered{" "}
+          <code className="font-mono">invoices</code>) living in a private Vercel Blob store on
+          format 3, the ordered commit log — nothing mocked. The <Link href="/" className="underline underline-offset-4">console</Link> runs any
           statement in the dialect and reports timing, chunks read (zone-map pruning in action), and
           the database version. The export buttons produce real files — the Postgres one loads with{" "}
           <code className="font-mono">psql $DATABASE_URL &lt; larva-demo.sql</code>. The stress lab
           hammers the commit protocol with concurrent writers and audits for lost updates. Mangle
-          the demo data freely; <em>Reset demo data</em> re-seeds it.
+          the demo data freely; <em>Reset demo data</em> re-seeds it. Writes draw from a budget of
+          400 commits between resets (statements cap at 5,000 chars), so the store stays a toy no
+          matter what the console is fed.
         </p>
         <div className="border-hairline bg-surface overflow-x-auto rounded-xl border">
           <table className="w-full text-left text-sm">

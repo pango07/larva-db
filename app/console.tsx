@@ -48,6 +48,10 @@ ORDER BY day`,
     sql: `INSERT INTO customers (name, email, city, createdAt)\nVALUES ('Annie Easley', 'annie@example.com', 'Cleveland', '2026-07-08T12:00:00Z')\nON CONFLICT (email) DO UPDATE SET city = excluded.city\nRETURNING *`,
   },
   {
+    label: "sequence invoice",
+    sql: `INSERT INTO invoices (customer, total)\nVALUES ('Annie Easley', 250.00)\nRETURNING number, customer`,
+  },
+  {
     label: "an agent-grade error",
     sql: `SELECT name FROM customers\nWHERE id IN (SELECT customerId FROM orders)`,
   },

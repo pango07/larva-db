@@ -15,10 +15,13 @@ Live pages:
 ## The SQL console
 
 Type any statement in the supported dialect and run it against the live demo
-database. The example chips walk the dialect: joins + `GROUP BY`,
-zone-map-pruned date ranges, `INSERT ... RETURNING`, revenue-by-day
-(`GROUP BY DATE(...)`), `HAVING` + `CASE`, upsert via `ON CONFLICT`, and one
-deliberately unsupported query so you can see an agent-grade error message.
+database — which runs on **format 3, the ordered commit log**, so you are
+exercising the newest write path. The example chips walk the dialect: joins +
+`GROUP BY`, zone-map-pruned date ranges, `INSERT ... RETURNING`, revenue-by-day
+(`GROUP BY DATE(...)`), `HAVING` + `CASE`, upsert via `ON CONFLICT`, an
+auto-numbered insert into the `invoices` table (`t.sequence()` — omit the
+column, read it back with `RETURNING`), and one deliberately unsupported query
+so you can see an agent-grade error message.
 
 Every result row comes back with timing, how many chunks the query actually
 read (pruning in action), and the database version it saw.
@@ -27,6 +30,17 @@ read (pruning in action), and the database version it saw.
 (`.sql`, load with `psql $DATABASE_URL < larva-demo.sql`), JSON, and per-table
 CSV. **Reset demo data** rebuilds the seed rows if you've mangled them —
 mangle freely, that's the point.
+
+### Guardrails (it's a public toy, not a public liability)
+
+- Statements are capped at 5,000 characters.
+- Writes draw from a **budget of 400 commits between resets** — every commit
+  bumps the database version, so budget × statement cap bounds total storage
+  no matter what gets thrown at the console. Exhausting it returns
+  `WRITE_BUDGET_EXHAUSTED` (HTTP 429); the reset button restarts it.
+- Stress runs always clean up after themselves (the `cleanup` flag is not
+  caller-controlled), and **Reset demo data** also sweeps blobs left behind
+  by failed harness runs.
 
 ## The stress lab
 
@@ -74,9 +88,9 @@ bun scripts/group-commit-test.ts   # commit coalescing + conflict matrix
 # live — need BLOB_READ_WRITE_TOKEN in .env.local
 bun scripts/sql-smoke.ts           # the whole dialect, end to end
 bun scripts/api-smoke.ts           # transactions, exports, vacuum
-bun scripts/stress.ts --writers 4 --commits 6
-bun scripts/property.ts --writers 4 --ops 10
-bun scripts/bench.ts               # throughput benchmark (simulated latency)
+bun scripts/stress.ts --writers 4 --commits 6    # add --log for format 3
+bun scripts/property.ts --writers 4 --ops 10     # add --log for format 3
+bun scripts/bench.ts               # throughput benchmark, both formats (simulated latency)
 ```
 
 CI runs all of it on every push and PR; merges to `main` publish to npm

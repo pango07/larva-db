@@ -14,7 +14,10 @@ export async function POST(req: NextRequest) {
     rowsPerCommit: Math.min(Math.max(1, body.rowsPerCommit ?? 5), CAPS.rowsPerCommit),
     mode: body.mode ?? "mixed",
     maxAttempts: Math.min(Math.max(1, body.maxAttempts ?? 50), 100),
-    cleanup: body.cleanup ?? true,
+    // Never caller-controlled: a public endpoint that can leave 60k rows of
+    // blobs per call is a storage-bill grief vector. Failed runs still keep
+    // their blobs for inspection; /api/demo-reset sweeps those.
+    cleanup: true,
   };
   try {
     const report = await runStress(config);

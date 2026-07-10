@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { SchemaError, SqlError } from "@larva-db/core";
-import { demoDb } from "@/app/lib/demo";
+import { parse, SchemaError, SqlError } from "@larva-db/core";
+import { demoDb, WRITE_BUDGET } from "@/app/lib/demo";
 
 export const maxDuration = 60;
 
@@ -13,6 +13,23 @@ export async function POST(req: NextRequest) {
   }
   try {
     const db = await demoDb();
+    // Write budget: every commit bumps the version, and a statement is capped
+    // at 5,000 chars, so version × statement size bounds what this public demo
+    // can ever put in the blob store. Reads stay free; reset restarts the budget.
+    if (parse(sql).kind !== "select") {
+      const version = await db.currentVersion();
+      if (version >= WRITE_BUDGET) {
+        return NextResponse.json(
+          {
+            error: {
+              code: "WRITE_BUDGET_EXHAUSTED",
+              message: `the demo database has taken ${version} write commits since its last reset (budget: ${WRITE_BUDGET}) — hit "Reset demo data" to keep writing`,
+            },
+          },
+          { status: 429 },
+        );
+      }
+    }
     const started = Date.now();
     const rows = await db.query(sql, [], { allowFullTable: body.allowFullTable });
     const ms = Date.now() - started;
