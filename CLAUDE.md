@@ -42,7 +42,8 @@ Larva is a deliberate miniaturization of the Delta Lake / Iceberg pattern on top
 - The SQL dialect is a closed, documented subset (Design §7). Precise, machine-readable error messages for unsupported SQL are a design feature — agents self-correct from specific errors. Do not quietly accept SQL outside the subset.
 - `UPDATE`/`DELETE` without `WHERE` requires explicit `{ allowFullTable: true }`.
 - The parser rejects multiple statements per string (injection stacking vector).
-- The v1 public API surface (Design §13) must fit on one screen: `larva()`, `db.sql` tagged template (primary API), `db.query(str, params)`, `db.transaction`, `db.asOf`, `db.rollbackTo`, `db.export`, `db.vacuum`. Resist growing it.
+- The public API surface (Design §13) must fit on one screen: `larva()`, `db.sql` tagged template (primary API), `db.query(str, params)`, `db.transaction`, `db.asOf`, `db.rollbackTo`, `db.export`, `db.vacuum`, `db.upgrade`. Resist growing it.
+- On-store format versioning (Design §5): formats 1 (original), 2 (sequences + composite uniques), 3 (ordered commit log). Manifests declare the minimum format their content requires; clients refuse newer formats loudly (`FormatError`). Any future format bump ships with an explicit atomic `upgrade()`; `rollbackTo` preserves the format version.
 - Export (SQLite/Postgres/JSON/CSV) is a v1 feature, not an afterthought — the escape hatch is part of the product promise.
 - Only Vercel-specific code should be the storage adapter; the `StorageAdapter` contract is exactly four operations: get, put-with-CAS, delete, list-by-prefix.
 
