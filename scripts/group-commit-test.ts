@@ -208,6 +208,31 @@ const schema = defineSchema({
   chaos = false;
 }
 
+// ---------- 7. format-version guard refuses newer stores ----------
+{
+  const db = larva({ schema, prefix: "gc-format/", store });
+  await db.sql`INSERT INTO notes (id, body, score) VALUES (${"pre"}, ${"v1"}, ${0})`;
+  const rows = await db.sql`SELECT id FROM notes`;
+  ok("format guard: v1 store opens normally", rows.length === 1);
+
+  // simulate a store already upgraded by a future client
+  const stored = objects.get("gc-format/manifest.json")!;
+  const future = { ...JSON.parse(stored.body), formatVersion: 2 };
+  objects.set("gc-format/manifest.json", { ...stored, body: JSON.stringify(future) });
+
+  const err = await larva({ schema, prefix: "gc-format/", store })
+    .sql`SELECT id FROM notes`.then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+  ok("format guard: newer store refused, nothing written", err?.name === "FormatError");
+  ok(
+    "format guard: error is machine-readable and says how to fix",
+    (err?.message ?? "").startsWith("FORMAT_UNSUPPORTED:") && (err?.message ?? "").includes("npm install"),
+    err?.message,
+  );
+}
+
 server.stop();
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
