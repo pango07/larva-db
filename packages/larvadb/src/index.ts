@@ -6,13 +6,14 @@ export {
   SchemaError,
   type ColumnBuilder,
   type DatabaseSchema,
+  type SchemaOptions,
   type InferRow,
   type InferTables,
   type TypedSchema,
 } from "./schema";
 export { SqlError } from "./sql/errors";
 export { parse } from "./sql/parser";
-export { ConflictError, FormatError, ulid, type Row, type Scalar } from "./core";
+export { ConflictError, FormatError, SUPPORTED_FORMAT_VERSION, ulid, type Row, type Scalar } from "./core";
 export {
   CasConflictError,
   VercelBlobAdapter,

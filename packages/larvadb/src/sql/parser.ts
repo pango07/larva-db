@@ -252,22 +252,17 @@ class Parser {
   private onConflict(): OnConflict | undefined {
     if (!this.eat("keyword", "ON")) return undefined;
     this.expect("keyword", "CONFLICT");
-    let column: string | undefined;
+    let columns: string[] | undefined;
     if (this.eat("punct", "(")) {
-      column = this.ident("conflict target column");
-      if (this.at("punct", ",")) {
-        throw new SqlError(
-          "UNSUPPORTED_FEATURE",
-          "multi-column conflict targets are not supported; target the primary key or a single UNIQUE column",
-        );
-      }
+      columns = [this.ident("conflict target column")];
+      while (this.eat("punct", ",")) columns.push(this.ident("conflict target column"));
       this.expect("punct", ")");
     }
     this.expect("keyword", "DO");
-    if (this.eat("keyword", "NOTHING")) return { column, action: "nothing" };
+    if (this.eat("keyword", "NOTHING")) return { columns, action: "nothing" };
 
     this.expect("keyword", "UPDATE");
-    if (column === undefined) {
+    if (columns === undefined) {
       throw new SqlError(
         "PARSE_ERROR",
         "ON CONFLICT DO UPDATE requires a conflict target, e.g. ON CONFLICT (id) DO UPDATE SET …",
@@ -286,7 +281,7 @@ class Parser {
         "a WHERE clause on ON CONFLICT DO UPDATE is not supported; the update applies to every conflicting row",
       );
     }
-    return { column, action: { set } };
+    return { columns, action: { set } };
   }
 
   private update(): Statement {

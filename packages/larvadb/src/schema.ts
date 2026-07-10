@@ -17,12 +17,19 @@ export interface ColumnDef {
   unique: boolean;
   references?: string;
   partitionBy: boolean;
+  /** Auto-assigned integer drawn from a CAS-claimed range (format 2 stores).
+   * Gappy on crash, like a Postgres sequence; values are unique across
+   * processes because claimed ranges are disjoint. */
+  sequence?: boolean;
 }
 
 export interface TableSchema {
   columns: Record<string, ColumnDef>;
   primaryKey: string;
   partitionColumn?: string;
+  /** Composite UNIQUE constraints (two or more columns each; format 2 stores).
+   * Enforced on INSERT and upsert, like single-column .unique(). */
+  uniques?: string[][];
 }
 
 export type DatabaseSchema = Record<string, TableSchema>;
@@ -69,6 +76,12 @@ export class ColumnBuilder<T> {
     return this;
   }
 
+  /** @internal — use t.sequence(). */
+  markSequence(): this {
+    this.def.sequence = true;
+    return this;
+  }
+
   build(): ColumnDef {
     return { ...this.def };
   }
@@ -80,6 +93,10 @@ export const t = {
   real: () => new ColumnBuilder<number | null>("real"),
   boolean: () => new ColumnBuilder<boolean | null>("boolean"),
   timestamp: () => new ColumnBuilder<string | null>("timestamp"),
+  /** Auto-assigned integer: omit it on INSERT and Larva fills the next number.
+   * Numbers are unique across concurrent processes (disjoint CAS-claimed
+   * ranges) but gappy on crash — same contract as a Postgres sequence. */
+  sequence: () => new ColumnBuilder<number | null>("integer").markSequence(),
   json: (): never => {
     throw new SchemaError(
       "UNSUPPORTED_COLUMN_TYPE",
@@ -110,7 +127,18 @@ export type InferRow<
   T extends keyof TSchema["~spec"],
 > = InferTables<TSchema>[T];
 
-export function defineSchema<S extends SchemaSpec>(spec: S): TypedSchema<S> {
+export interface SchemaOptions<S extends SchemaSpec = SchemaSpec> {
+  /** Composite UNIQUE constraints per table, e.g. { orders: [["customerId", "sku"]] }.
+   * Single-column uniqueness belongs on the column: t.text().unique(). */
+  uniques?: Partial<Record<keyof S & string, string[][]>>;
+}
+
+export function defineSchema<S extends SchemaSpec>(spec: S, opts?: SchemaOptions<S>): TypedSchema<S> {
+  for (const table of Object.keys(opts?.uniques ?? {})) {
+    if (!spec[table]) {
+      throw new SchemaError("UNKNOWN_TABLE", `uniques declares constraints for table "${table}", which is not in the schema`);
+    }
+  }
   const schema: DatabaseSchema = {};
   for (const [table, cols] of Object.entries(spec)) {
     const columns: Record<string, ColumnDef> = {};
@@ -138,7 +166,27 @@ export function defineSchema<S extends SchemaSpec>(spec: S): TypedSchema<S> {
       throw new SchemaError("MULTIPLE_PARTITION_COLUMNS", `table "${table}" declares ${parts.length} partitionBy columns; declare at most one`);
     }
 
-    schema[table] = { columns, primaryKey, partitionColumn: parts[0]?.[0] };
+    const uniques = opts?.uniques?.[table];
+    if (uniques) {
+      for (const cols of uniques) {
+        if (cols.length < 2) {
+          throw new SchemaError(
+            "INVALID_COMPOSITE_UNIQUE",
+            `composite unique on "${table}" lists ${cols.length} column(s); use .unique() on the column for single-column uniqueness`,
+          );
+        }
+        for (const c of cols) {
+          if (!columns[c]) {
+            throw new SchemaError("UNKNOWN_COLUMN", `composite unique on "${table}" references column "${c}", which does not exist`);
+          }
+        }
+        if (new Set(cols).size !== cols.length) {
+          throw new SchemaError("INVALID_COMPOSITE_UNIQUE", `composite unique on "${table}" repeats a column: (${cols.join(", ")})`);
+        }
+      }
+    }
+
+    schema[table] = { columns, primaryKey, partitionColumn: parts[0]?.[0], ...(uniques?.length ? { uniques } : {}) };
   }
   return schema as TypedSchema<S>;
 }
@@ -171,6 +219,11 @@ export function validateInsert(table: string, schema: TableSchema, row: Row): Ro
   }
   for (const [name, def] of Object.entries(schema.columns)) {
     let v = row[name] ?? null;
+    // Sequence values are claimed (async) by the insert planner before
+    // validation; a null here means the planner was bypassed.
+    if (v === null && def.sequence) {
+      throw new SchemaError("SEQUENCE_UNASSIGNED", `sequence column "${table}.${name}" was not assigned; insert through db.sql\`INSERT …\``);
+    }
     if (v === null && name === schema.primaryKey) v = ulid();
     if (!typeOk(def.type, v)) {
       throw new SchemaError(
@@ -202,6 +255,16 @@ export function schemaDrift(code: DatabaseSchema, manifest: DatabaseSchema): str
     }
     if ((live.partitionColumn ?? null) !== (codeTable.partitionColumn ?? null)) {
       drift.push(`table "${table}": partition column differs (code "${codeTable.partitionColumn}", store "${live.partitionColumn}")`);
+    }
+    const uniqKey = (u?: string[][]) => JSON.stringify((u ?? []).map((cols) => [...cols].sort()).sort());
+    if (uniqKey(live.uniques) !== uniqKey(codeTable.uniques)) {
+      drift.push(`table "${table}": composite unique constraints differ between code and store`);
+    }
+    for (const [col, def] of Object.entries(codeTable.columns)) {
+      const liveCol = live.columns[col];
+      if (liveCol && (liveCol.sequence ?? false) !== (def.sequence ?? false)) {
+        drift.push(`table "${table}.${col}": sequence flag differs between code and store`);
+      }
     }
   }
   return drift;

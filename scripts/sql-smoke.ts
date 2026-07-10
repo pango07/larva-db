@@ -56,7 +56,7 @@ await expectSqlError("nested aggregates", () => parse("SELECT SUM(COUNT(x)) FROM
 await expectSqlError("aggregate in WHERE points to HAVING", () => parse("SELECT * FROM a WHERE COUNT(*) > 1"), "AGGREGATE_IN_WHERE", "HAVING");
 await expectSqlError("wrong function arity", () => parse("SELECT ROUND(x, 1, 2) FROM a"), "WRONG_ARGUMENT_COUNT", "ROUND");
 await expectSqlError("DO UPDATE needs a conflict target", () => parse("INSERT INTO t (id) VALUES (?) ON CONFLICT DO UPDATE SET n = 1"), "PARSE_ERROR", "conflict target");
-await expectSqlError("multi-column conflict targets", () => parse("INSERT INTO t (id) VALUES (?) ON CONFLICT (a, b) DO NOTHING"), "UNSUPPORTED_FEATURE", "multi-column");
+ok("multi-column conflict target parses", parse("INSERT INTO t (id) VALUES (?) ON CONFLICT (a, b) DO NOTHING").kind === "insert");
 await expectSqlError("WHERE on DO UPDATE", () => parse("INSERT INTO t (id) VALUES (?) ON CONFLICT (id) DO UPDATE SET n = 1 WHERE n < 5"), "UNSUPPORTED_FEATURE", "WHERE clause");
 ok("trailing semicolon is fine", parse("SELECT * FROM a;").kind === "select");
 ok("arithmetic parses", parse("UPDATE inv SET count = count - 1 WHERE sku = ?").kind === "update");
@@ -220,6 +220,54 @@ ok("increment upsert (count = count + 1)", (await db.sql`SELECT count FROM count
 await db.sql`DROP TABLE counters`;
 await expectSqlError("conflict target must be pk or unique", () => db.sql`INSERT INTO customers (name, email, createdAt) VALUES (${"X"}, ${"x@example.com"}, ${"2026-06-08T00:00:00Z"}) ON CONFLICT (name) DO NOTHING`, "INVALID_CONFLICT_TARGET", "name");
 await expectSqlError("a conflict outside the target still fails loudly", () => db.sql`INSERT INTO customers (id, name, email, createdAt) VALUES (${String(ada.id)}, ${"X"}, ${"fresh@example.com"}, ${"2026-06-08T00:00:00Z"}) ON CONFLICT (email) DO NOTHING`, "PRIMARY_KEY_CONFLICT", "does not cover");
+
+// v2 schema features: sequences + composite uniques (a format-2 database)
+const v2schema = defineSchema(
+  {
+    invoices: {
+      number: t.sequence().primaryKey(),
+      customer: t.text(),
+    },
+    entitlements: {
+      id: t.text().primaryKey(),
+      userId: t.text(),
+      feature: t.text(),
+      level: t.integer(),
+    },
+  },
+  { uniques: { entitlements: [["userId", "feature"]] } },
+);
+const db2 = larva({ schema: v2schema, prefix: `${prefix}v2/` });
+const invs = await db2.sql`INSERT INTO invoices (customer) VALUES (${"ada"}), (${"grace"}), (${"alan"}) RETURNING number, customer`;
+ok(
+  "sequence pk auto-assigned, distinct and increasing",
+  invs.length === 3 && invs.every((r) => Number.isInteger(r.number)) && new Set(invs.map((r) => r.number)).size === 3 && (invs[0].number as number) < (invs[2].number as number),
+  fmt(invs),
+);
+const explicit = await db2.sql`INSERT INTO invoices (number, customer) VALUES (${9000}, ${"manual"}) RETURNING number`;
+ok("explicit sequence value accepted", explicit[0].number === 9000);
+await db2.sql`INSERT INTO entitlements (userId, feature, level) VALUES (${"u1"}, ${"exports"}, ${1})`;
+await expectSqlError(
+  "composite unique rejects the duplicate pair",
+  () => db2.sql`INSERT INTO entitlements (userId, feature, level) VALUES (${"u1"}, ${"exports"}, ${2})`,
+  "UNIQUE_CONFLICT",
+  "(userId, feature)",
+);
+const bumped = await db2.sql`INSERT INTO entitlements (userId, feature, level) VALUES (${"u1"}, ${"exports"}, ${5})
+  ON CONFLICT (userId, feature) DO UPDATE SET level = excluded.level RETURNING level`;
+ok(
+  "upsert on the composite target",
+  bumped[0].level === 5 && (await db2.sql`SELECT COUNT(*) AS n FROM entitlements`)[0].n === 1,
+  fmt(bumped),
+);
+await db2.sql`INSERT INTO entitlements (userId, feature, level) VALUES (${"u1"}, ${null}, ${1}), (${"u1"}, ${null}, ${2})`;
+ok("NULL never conflicts in a composite unique", (await db2.sql`SELECT COUNT(*) AS n FROM entitlements`)[0].n === 3);
+await expectSqlError(
+  "undeclared composite target is rejected",
+  () => db2.sql`INSERT INTO entitlements (userId, level) VALUES (${"u2"}, ${1}) ON CONFLICT (userId, level) DO NOTHING`,
+  "INVALID_CONFLICT_TARGET",
+  "composite unique",
+);
 
 // time-series shapes: dates, GROUP BY expressions and aliases
 // (orders: Ada 200/220/240 on June 5/10/15, Grace 130/140 on July 1/3)

@@ -15,7 +15,7 @@
  *
  *   bun scripts/group-commit-test.ts
  */
-import { defineSchema, larva, S3Adapter, SqlError, t } from "@larva-db/core";
+import { defineSchema, larva, S3Adapter, SqlError, SUPPORTED_FORMAT_VERSION, t } from "@larva-db/core";
 import { runProperty } from "@larva-db/core/testing";
 
 let passed = 0;
@@ -217,7 +217,7 @@ const schema = defineSchema({
 
   // simulate a store already upgraded by a future client
   const stored = objects.get("gc-format/manifest.json")!;
-  const future = { ...JSON.parse(stored.body), formatVersion: 2 };
+  const future = { ...JSON.parse(stored.body), formatVersion: SUPPORTED_FORMAT_VERSION + 1 };
   objects.set("gc-format/manifest.json", { ...stored, body: JSON.stringify(future) });
 
   const err = await larva({ schema, prefix: "gc-format/", store })
@@ -231,6 +231,47 @@ const schema = defineSchema({
     (err?.message ?? "").startsWith("FORMAT_UNSUPPORTED:") && (err?.message ?? "").includes("npm install"),
     err?.message,
   );
+}
+
+// ---------- 8. v2 schema features: sequences + composite uniques ----------
+{
+  const v2schema = defineSchema(
+    {
+      invoices: { number: t.sequence().primaryKey(), writer: t.text() },
+      grants: { id: t.text().primaryKey(), userId: t.text(), feature: t.text() },
+    },
+    { uniques: { grants: [["userId", "feature"]] } },
+  );
+  const dbA = larva({ schema: v2schema, prefix: "v2-seq/", store });
+  await dbA.sql`SELECT COUNT(*) AS n FROM invoices`; // force init
+  const dbB = larva({ schema: v2schema, prefix: "v2-seq/", store });
+
+  // The marquee claim: two processes drawing from one sequence never collide,
+  // because claimed ranges are disjoint by CAS construction.
+  const N = 20;
+  await Promise.all(
+    Array.from({ length: N }, (_, i) =>
+      (i % 2 === 0 ? dbA : dbB).sql`INSERT INTO invoices (writer) VALUES (${i % 2 === 0 ? "a" : "b"})`,
+    ),
+  );
+  const rows = await dbA.sql`SELECT number FROM invoices`;
+  ok(
+    "sequence numbers distinct across two instances",
+    rows.length === N && new Set(rows.map((r) => r.number)).size === N && rows.every((r) => Number.isInteger(r.number)),
+    `${new Set(rows.map((r) => r.number)).size}/${N} distinct`,
+  );
+
+  const stored = JSON.parse(objects.get("v2-seq/manifest.json")!.body) as { formatVersion: number };
+  ok("store using v2 features declares formatVersion 2", stored.formatVersion === 2);
+  const plain = JSON.parse(objects.get("gc-insert/manifest.json")!.body) as { formatVersion: number };
+  ok("plain store still declares formatVersion 1", plain.formatVersion === 1);
+
+  await dbA.sql`INSERT INTO grants (userId, feature) VALUES (${"u"}, ${"exports"})`;
+  const err = await dbB.sql`INSERT INTO grants (userId, feature) VALUES (${"u"}, ${"exports"})`.then(
+    () => null,
+    (e: unknown) => e as SqlError,
+  );
+  ok("composite unique enforced across instances", err?.code === "UNIQUE_CONFLICT", err?.message);
 }
 
 server.stop();

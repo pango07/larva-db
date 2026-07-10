@@ -79,8 +79,9 @@ export interface SelectStmt {
 }
 
 export interface OnConflict {
-  /** The conflict target: must be the primary key or a UNIQUE column. */
-  column?: string;
+  /** The conflict target: the primary key, a UNIQUE column, or (multi-column)
+   * a declared composite unique constraint. Absent = the primary key. */
+  columns?: string[];
   /** "nothing" = DO NOTHING; otherwise the DO UPDATE SET list (values may reference excluded.*) */
   action: "nothing" | { set: { column: string; value: Expr }[] };
 }

@@ -33,9 +33,20 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
   including `COUNT(DISTINCT col)`, plus `HAVING`.
 - Two-table `INNER JOIN` and `LEFT JOIN` on equality.
 - `INSERT ... RETURNING`, multi-row, with upsert:
-  `ON CONFLICT (col) DO NOTHING` or `DO UPDATE SET col = excluded.col`
-  (the conflict target must be the primary key or a UNIQUE column).
+  `ON CONFLICT (col) DO NOTHING` or `DO UPDATE SET col = excluded.col`.
+  The conflict target must be the primary key, a UNIQUE column, or the exact
+  columns of a composite unique declared in the schema
+  (`ON CONFLICT (userId, feature) DO UPDATE ...`).
 - `UPDATE ... WHERE`, `DELETE ... WHERE`, `CREATE TABLE`, `DROP TABLE`.
+
+## Schema features to know
+
+- A `t.sequence()` column is an auto-assigned integer: OMIT it on INSERT and
+  read the assigned value back with `RETURNING`. Never generate the number
+  yourself. Numbers are unique across concurrent writers but gappy (like a
+  Postgres sequence).
+- Composite unique constraints come from `defineSchema`'s second argument:
+  `defineSchema(spec, { uniques: { orders: [["customerId", "sku"]] } })`.
 
 ## NOT supported — do not emit
 

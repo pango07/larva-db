@@ -22,8 +22,26 @@ export interface ChunkRef {
 }
 
 /** Highest on-store format this client can read and write. A manifest
- * declaring a newer version is refused loudly (FormatError) — never opened. */
-export const SUPPORTED_FORMAT_VERSION = 1;
+ * declaring a newer version is refused loudly (FormatError) — never opened.
+ *
+ * Format history:
+ *   1 — original layout: manifest + chunks + history.
+ *   2 — v2 schema features: sequence columns (CAS-claimed ranges in a
+ *       sequences blob) and composite unique constraints. A store only
+ *       declares 2 when its schema actually uses one of them, so plain
+ *       stores stay readable by format-1 clients. */
+export const SUPPORTED_FORMAT_VERSION = 2;
+
+/** The lowest format a store with this schema can declare. Kept minimal so
+ * stores that don't use v2 features remain openable by older clients. */
+export function requiredFormatVersion(schema: unknown): number {
+  const s = (schema ?? {}) as import("./schema").DatabaseSchema;
+  for (const table of Object.values(s)) {
+    if (table.uniques?.length) return 2;
+    for (const col of Object.values(table.columns ?? {})) if (col.sequence) return 2;
+  }
+  return 1;
+}
 
 export interface Manifest {
   formatVersion: number;
@@ -151,6 +169,10 @@ function backoffMs(attempt: number): number {
  * under deliberate hammering (the stress harness uses 50). */
 const DEFAULT_MAX_ATTEMPTS = 15;
 
+/** Sequence values claimed per CAS on the sequences blob. Larger = fewer
+ * claims under load; smaller = smaller gaps on crash. */
+const SEQ_RANGE_SIZE = 32;
+
 /** One queued commit awaiting the group-commit drain loop. */
 interface QueuedCommit {
   plan: Planner;
@@ -198,7 +220,7 @@ export class LarvaProto {
   /** Create the empty database. Fails if one already exists at this prefix. */
   async init(tables: string[], schema?: unknown): Promise<void> {
     const manifest: Manifest = {
-      formatVersion: SUPPORTED_FORMAT_VERSION,
+      formatVersion: requiredFormatVersion(schema),
       version: 0,
       commitId: ulid(),
       committedAt: new Date().toISOString(),
@@ -285,6 +307,57 @@ export class LarvaProto {
     const refs = s.manifest.tables[table]?.chunks ?? [];
     const chunks = await Promise.all(refs.map((r) => this.readChunk(r)));
     return chunks.flat();
+  }
+
+  /**
+   * Draw `count` values for a sequence (key "table.column"). Values come from
+   * an in-memory range claimed via CAS on the sequences blob — off the
+   * manifest hot path, so sequence draws never contend with commits. Ranges
+   * are disjoint across processes (uniqueness by construction); a crash
+   * strands the unclaimed remainder of a range (gaps, like Postgres).
+   */
+  claimSequence(key: string, count: number): Promise<number[]> {
+    const run = this.seqLock.then(() => this.claimSequenceInner(key, count));
+    this.seqLock = run.catch(() => {});
+    return run;
+  }
+
+  private seqRanges = new Map<string, { next: number; end: number }>();
+  private seqLock: Promise<unknown> = Promise.resolve();
+
+  private async claimSequenceInner(key: string, count: number): Promise<number[]> {
+    const out: number[] = [];
+    let range = this.seqRanges.get(key);
+    while (out.length < count) {
+      if (!range || range.next >= range.end) {
+        range = await this.claimRange(key, Math.max(SEQ_RANGE_SIZE, count - out.length));
+        this.seqRanges.set(key, range);
+      }
+      while (range.next < range.end && out.length < count) out.push(range.next++);
+    }
+    return out;
+  }
+
+  private async claimRange(key: string, size: number): Promise<{ next: number; end: number }> {
+    const path = `${this.prefix}sequences.json`;
+    for (let attempt = 0; ; attempt++) {
+      const res = await this.store.get(path, { fresh: true });
+      const counters = res ? (JSON.parse(res.body) as Record<string, number>) : {};
+      const start = counters[key] ?? 1;
+      const body = JSON.stringify({ ...counters, [key]: start + size });
+      try {
+        // A range is used only after a put observed to succeed, so duplicates
+        // are impossible; an ambiguous outcome retries and strands the range.
+        if (res) await this.store.put(path, body, { ifMatch: res.etag });
+        else await this.store.put(path, body, { createOnly: true });
+        return { next: start, end: start + size };
+      } catch (err) {
+        const conflict = err instanceof CasConflictError;
+        if (!conflict && !isTransientStorageError(err)) throw err;
+        if (attempt >= DEFAULT_MAX_ATTEMPTS) throw new ConflictError(attempt + 1);
+        await sleep(backoffMs(attempt));
+      }
+    }
   }
 
   /**
@@ -422,6 +495,9 @@ export class LarvaProto {
       next.version = snap.manifest.version + 1;
       next.commitId = lastCommitId = ulid();
       next.committedAt = new Date().toISOString();
+      // A commit that embeds a schema using v2 features raises the store's
+      // format so pre-v2 clients refuse it instead of ignoring the features.
+      next.formatVersion = Math.max(next.formatVersion ?? 1, requiredFormatVersion(next.schema));
 
       try {
         await this.store.put(this.manifestPath(), JSON.stringify(next), {
