@@ -175,7 +175,7 @@ npx larva vacuum
 npx larva version
 ```
 
-Credentials auto-load from `.env.local` (`vercel env pull .env.local`); `--prefix` targets a specific database.
+Credentials auto-load from `.env.local` (`vercel env pull .env.local`); `--prefix` targets a specific database. Full reference — every command, flag, and troubleshooting — in [docs/cli.md](https://github.com/pango07/larva-db/blob/main/docs/cli.md).
 
 ### Any S3-compatible store
 

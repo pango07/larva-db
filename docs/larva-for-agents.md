@@ -84,3 +84,5 @@ error message and follow it.
   `psql $DATABASE_URL < export.sql`.
 - `db.export({ format: "sqlite" })` → a genuine SQLite `.db` file.
 - `db.export({ format: "json" })` / `{ format: "csv" }` for everything else.
+- From a shell: `npx larva sql "..."`, `npx larva export --format postgres` —
+  same database, same dialect, same errors (needs BLOB_READ_WRITE_TOKEN).

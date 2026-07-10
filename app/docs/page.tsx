@@ -133,7 +133,14 @@ export default function DocsPage() {
           </table>
         </div>
         <p className="text-ink-secondary mt-3 text-sm">
-          Full docs live in the repo:{" "}
+          The <code className="font-mono">larva</code> CLI (<code className="font-mono">npx larva sql | export | upgrade | rollback | vacuum</code>) has its own reference:{" "}
+          <a
+            href="https://github.com/pango07/larva-db/blob/main/docs/cli.md"
+            className="underline underline-offset-4"
+          >
+            docs/cli.md
+          </a>
+          . Full docs live in the repo:{" "}
           <a
             href="https://github.com/pango07/larva-db/blob/main/docs/test-lab.md"
             className="underline underline-offset-4"

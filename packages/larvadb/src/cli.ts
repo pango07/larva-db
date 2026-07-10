@@ -172,7 +172,9 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   if (err instanceof SqlError || err instanceof SchemaError || err instanceof FormatError || err instanceof ConflictError) {
-    fail(err.message);
+    // Same machine-readable messages as the API, with API-speak translated
+    // into this CLI's flags where one exists.
+    fail(err.message.replace("pass { allowFullTable: true } if that is intended", "add --allow-full-table if that is intended"));
   }
   fail(err instanceof Error ? err.message : String(err));
 });

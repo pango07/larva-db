@@ -176,7 +176,7 @@ npx larva vacuum
 npx larva version
 ```
 
-Credentials auto-load from `.env.local` (`vercel env pull .env.local`); `--prefix` targets a specific database.
+Credentials auto-load from `.env.local` (`vercel env pull .env.local`); `--prefix` targets a specific database. Full reference — every command, flag, and troubleshooting (starting with the missing-token case) — in **[docs/cli.md](docs/cli.md)**.
 
 ### Any S3-compatible store
 

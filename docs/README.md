@@ -3,6 +3,7 @@
 | File | What it is |
 |---|---|
 | [`larva-for-agents.md`](larva-for-agents.md) | the paste-into-your-agent prompt — dialect, guardrails, patterns. Served at `/llms.txt` on a deployed test lab |
+| [`cli.md`](cli.md) | the `larva` CLI reference — every command, flag, and troubleshooting |
 | [`test-lab.md`](test-lab.md) | how the demo dashboard works and every command to develop, test, and deploy |
 | [`how-larva-db-works-1/2/3.png`](how-larva-db-works-1.png) | the architecture in three pictures — layers, concurrency, graduation (shown in the main README) |
 | [`larvadb.png`](larvadb.png) | the logo (shown at the top of the main README) |

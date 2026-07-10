@@ -39,7 +39,7 @@ Larva is a deliberate miniaturization of the Delta Lake / Iceberg pattern on top
 
 - A chunk blob, once written, is never modified. All mutation is copy-on-write plus one manifest CAS.
 - No silently lost writes, ever. Conflicts fail loudly after retries.
-- Private Blob stores only; refuse public stores at connect time. Larva never generates public URLs for data blobs.
+- Data blobs are private by construction: the storage adapter writes `access: "private"` on every put. Larva never generates public URLs for data blobs.
 - The SQL dialect is a closed, documented subset (Design §7). Precise, machine-readable error messages for unsupported SQL are a design feature — agents self-correct from specific errors. Do not quietly accept SQL outside the subset.
 - `UPDATE`/`DELETE` without `WHERE` requires explicit `{ allowFullTable: true }`.
 - The parser rejects multiple statements per string (injection stacking vector).
