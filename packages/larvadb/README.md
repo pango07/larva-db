@@ -1,4 +1,6 @@
-# 🐛 larvadb
+<p align="center">
+  <img src="https://raw.githubusercontent.com/pango07/larva-db/main/docs/larvadb.png" alt="larvadb" width="340">
+</p>
 
 **A tiny SQL database that lives inside your Vercel Blob store.** No signup, no new vendor, no server, no connection string. When your app grows up, export to a bigger database with one command — that's why it's called Larva.
 
