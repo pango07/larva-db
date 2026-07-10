@@ -265,6 +265,8 @@ await db.vacuum();                               // reclaim storage outside rete
 await db.upgrade();                              // one-way flip to format 3 (the commit log)
 ```
 
+The same surface ships as a shell command — the package's `larva` bin (`npx larva sql | export | upgrade | rollback | vacuum | version`, credentials auto-loaded from `.env.local`). One surface, two doors; the CLI is validated end to end by `scripts/cli-smoke.ts`.
+
 ## 14. Roadmap and open questions
 
 v1 ships: the storage engine and commit protocol, the SQL subset of Section 7, code-first schema, transactions, time travel and rollback, vacuum, export to SQLite/JSON/CSV, the Vercel Blob adapter, and the two documents (this spec and the quickstart). Deferred, in rough priority order: secondary index blobs; `ALTER TABLE` with a migration story that respects time travel; a columnar chunk format; S3/R2/GCS/Azure adapters; a tiny read-only web UI for browsing tables (non-engineers love to *see* their data); an optional Edge Config read-accelerator for flag-shaped tables.

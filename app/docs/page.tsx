@@ -18,6 +18,7 @@ const COMMANDS: [string, string][] = [
   ["bun scripts/group-commit-test.ts", "commit coalescing + conflict matrix — offline"],
   ["bun scripts/sql-smoke.ts", "the whole dialect, live against the real store"],
   ["bun scripts/api-smoke.ts", "transactions, exports, vacuum — live"],
+  ["bun scripts/cli-smoke.ts", "the larva CLI end to end — live"],
   ["bun scripts/stress.ts --writers 4 --commits 6", "concurrent-writer audit — live; add --log for format 3"],
   ["bun scripts/property.ts --writers 4 --ops 10", "randomized workloads vs. a model — live; add --log for format 3"],
   ["bun scripts/bench.ts", "write-throughput benchmark, both formats — offline"],

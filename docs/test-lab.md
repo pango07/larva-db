@@ -88,6 +88,7 @@ bun scripts/group-commit-test.ts   # commit coalescing + conflict matrix
 # live — need BLOB_READ_WRITE_TOKEN in .env.local
 bun scripts/sql-smoke.ts           # the whole dialect, end to end
 bun scripts/api-smoke.ts           # transactions, exports, vacuum
+bun scripts/cli-smoke.ts           # the larva CLI, end to end
 bun scripts/stress.ts --writers 4 --commits 6    # add --log for format 3
 bun scripts/property.ts --writers 4 --ops 10     # add --log for format 3
 bun scripts/bench.ts               # throughput benchmark, both formats (simulated latency)

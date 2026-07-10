@@ -16,6 +16,7 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bun scripts/stress.ts` — commit-protocol stress test against the real Blob store (requires `BLOB_READ_WRITE_TOKEN` in `.env.local`; pull with `vercel env pull .env.local`)
 - `bun scripts/property.ts` — property-based random-workload conflict test (same token requirement)
 - `bun scripts/sql-smoke.ts` — full v1 dialect walkthrough (parser error catalog offline, then live queries, pruning, time travel)
+- `bun scripts/cli-smoke.ts` — drives the `larva` CLI (`packages/larvadb/src/cli.ts`, shipped as the package `bin`) as a subprocess against the real store: args, exit codes, export files (requires the Blob token)
 - `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite/postgres), vacuum retention
 - `bun scripts/s3-adapter-test.ts` — S3Adapter contract + stress harness over an in-process fake S3 with 409/500 chaos injection (no credentials needed)
 - `bun scripts/group-commit-test.ts` — group-commit coalescing, batch error isolation, nested-commit deadlock guard, and the property conflict harness, all over the chaos fake S3 (no credentials needed)

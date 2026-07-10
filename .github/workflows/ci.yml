@@ -46,6 +46,7 @@ jobs:
           fi
           bun scripts/sql-smoke.ts
           bun scripts/api-smoke.ts
+          bun scripts/cli-smoke.ts
           bun scripts/stress.ts --writers 4 --commits 6 --mode mixed
           bun scripts/property.ts --writers 4 --ops 10
 

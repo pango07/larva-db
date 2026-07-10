@@ -1,6 +1,6 @@
 {
   "name": "@larva-db/core",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "A tiny SQL database that lives inside your Vercel Blob store. Real SQL, atomic transactions, time travel, and a guaranteed exit path when you outgrow it.",
   "license": "MIT",
   "type": "module",
@@ -23,9 +23,10 @@
       "default": "./dist/testing.js"
     }
   },
+  "bin": { "larva": "./dist/cli.js" },
   "files": ["dist", "README.md"],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts --outfile dist/index.js --target node --format esm --external '@vercel/blob' && bun build src/testing/index.ts --outfile dist/testing.js --target node --format esm --external '@vercel/blob' && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && bun build src/index.ts --outfile dist/index.js --target node --format esm --external '@vercel/blob' && bun build src/testing/index.ts --outfile dist/testing.js --target node --format esm --external '@vercel/blob' && bun build src/cli.ts --outfile dist/cli.js --target node --format esm --external '@vercel/blob' --banner '#!/usr/bin/env node' && tsc -p tsconfig.build.json",
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
