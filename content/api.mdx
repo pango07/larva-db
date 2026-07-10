@@ -21,7 +21,7 @@ const past = await db.asOf(new Date(Date.now() - 600_000)); // read-only past sn
 await db.rollbackTo(past.version);                          // restore (itself undoable)
 await db.export({ format: "postgres" });                    // the escape hatch
 await db.vacuum();                                          // reclaim storage outside retention
-await db.upgrade();                                         // one-way flip to format 3
+await db.upgrade();                                         // one-way flip to the top format
 ```
 
 ## `larva(options)`
@@ -119,7 +119,7 @@ Drops history outside retention (`retainDays: 7`, `retainVersions: 50` — which
 
 ## `db.upgrade()`
 
-Flips the store to [format 3, the ordered commit log](/docs/how-it-works/format-versioning) — one atomic commit, one-way, idempotent. Data, history, and rollback survive; clients older than the format then refuse loudly instead of writing through the wrong protocol.
+Flips the store to the top format — [the ordered commit log plus two-tier fast appends](/docs/how-it-works/format-versioning) — one atomic commit, one-way, idempotent. Data, history, and rollback survive; clients older than the format then refuse loudly instead of writing through the wrong protocol.
 
 ## Errors
 

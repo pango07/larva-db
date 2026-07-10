@@ -23,6 +23,10 @@ const CHUNK_TARGET_ROWS = 1000;
 export interface ExecOptions {
   allowFullTable?: boolean;
   maxAttempts?: number;
+  /** Format 4: this instance's not-yet-folded append rows, per table. SELECTs
+   * scan them alongside chunk rows (read-your-writes); write planning never
+   * sees them — ordered writes fold first instead (the barrier in LarvaDb). */
+  overlay?: Record<string, Row[]>;
 }
 
 export interface QueryStats {
@@ -60,7 +64,7 @@ export class Executor {
   }
 
   async execute(stmt: Statement, params: Scalar[], opts: ExecOptions, snap?: Snapshot): Promise<Row[]> {
-    if (stmt.kind === "select") return this.select(stmt, params, snap ?? (await this.proto.snapshot()));
+    if (stmt.kind === "select") return this.select(stmt, params, snap ?? (await this.proto.snapshot()), opts.overlay);
     // Single-statement write: plan against each (re)fetched snapshot, one CAS.
     let rows: Row[] = [];
     await this.proto.commit(async (s) => {
@@ -104,11 +108,19 @@ export class Executor {
 
   // ---------- reads ----------
 
-  private async select(stmt: SelectStmt, params: Scalar[], snap: Snapshot): Promise<Row[]> {
+  /** Chunk rows plus this instance's un-folded append rows, deduped by pk —
+   * a row both folded and still pending must not appear twice. */
+  private withOverlay(rows: Row[], extra: Row[] | undefined, schema: TableSchema): Row[] {
+    if (!extra?.length) return rows;
+    const seen = new Set(rows.map((r) => r[schema.primaryKey]));
+    return rows.concat(extra.filter((r) => !seen.has(r[schema.primaryKey])));
+  }
+
+  private async select(stmt: SelectStmt, params: Scalar[], snap: Snapshot, overlay?: Record<string, Row[]>): Promise<Row[]> {
     const fromName = stmt.from.alias ?? stmt.from.table;
     const fromSchema = this.schemaOf(snap.manifest, stmt.from.table);
     const leftChunks = await this.fetchTable(snap, stmt.from.table, fromSchema, stmt.where, fromName, params);
-    const leftRows = leftChunks.flatMap((c) => c.rows);
+    const leftRows = this.withOverlay(leftChunks.flatMap((c) => c.rows), overlay?.[stmt.from.table], fromSchema);
     const realCols = new Set(Object.keys(fromSchema.columns));
 
     let contexts: Ctx[];
@@ -116,9 +128,11 @@ export class Executor {
       const joinName = stmt.join.table.alias ?? stmt.join.table.table;
       const joinSchema = this.schemaOf(snap.manifest, stmt.join.table.table);
       Object.keys(joinSchema.columns).forEach((c) => realCols.add(c));
-      const rightRows = (
-        await this.fetchTable(snap, stmt.join.table.table, joinSchema, undefined, joinName, params)
-      ).flatMap((c) => c.rows);
+      const rightRows = this.withOverlay(
+        (await this.fetchTable(snap, stmt.join.table.table, joinSchema, undefined, joinName, params)).flatMap((c) => c.rows),
+        overlay?.[stmt.join.table.table],
+        joinSchema,
+      );
 
       // Resolve which side of ON belongs to which table.
       const sideOf = (col: ColumnRef): "from" | "join" => {
@@ -721,8 +735,13 @@ export class Executor {
     });
   }
 
-  private async planInsert(stmt: InsertStmt, params: Scalar[], snap: Snapshot): Promise<PlanOutcome> {
-    const schema = this.schemaOf(snap.manifest, stmt.table);
+  /**
+   * Evaluate an INSERT's rows to final, validated form: expressions evaluated,
+   * omitted sequence columns claimed (locally-leased ranges), auto ids filled.
+   * After this, the rows' content is fully client-determined — which is what
+   * the tier-A append path (LarvaDb) relies on to acknowledge at durability.
+   */
+  async prepareRows(stmt: InsertStmt, params: Scalar[], schema: TableSchema): Promise<Row[]> {
     const rawRows: Row[] = stmt.rows.map((values) => {
       const raw: Row = {};
       stmt.columns.forEach((col, i) => {
@@ -742,7 +761,17 @@ export class Executor {
         needy.forEach((r, i) => (r[col] = vals[i]));
       }
     }
-    const incoming = rawRows.map((raw) => validateInsert(stmt.table, schema, raw));
+    return rawRows.map((raw) => validateInsert(stmt.table, schema, raw));
+  }
+
+  /** RETURNING projection for rows that never went through a plan (tier A). */
+  projectReturning(rows: Row[], returning: SelectItem[] | null | undefined, table: string): Row[] {
+    return this.returningRows(rows, returning, table);
+  }
+
+  private async planInsert(stmt: InsertStmt, params: Scalar[], snap: Snapshot): Promise<PlanOutcome> {
+    const schema = this.schemaOf(snap.manifest, stmt.table);
+    const incoming = await this.prepareRows(stmt, params, schema);
 
     // Uniqueness, treated uniformly: the pk, single UNIQUE columns, and
     // declared composite constraints. A constraint's key is null when any of

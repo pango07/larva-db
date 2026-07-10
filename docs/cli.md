@@ -75,11 +75,11 @@ The Postgres file has `CREATE TABLE`s with real types, data as fast `COPY` block
 
 ### `larva upgrade`
 
-Flip the database to **format 3, the ordered commit log** — cheaper conflicts and commit cost that stops scaling with database size ([design §6](../LARVA-DESIGN.md#6-the-commit-protocol-and-consistency-model)). One atomic commit, one-way, idempotent; data, history, and rollback all survive:
+Flip the database to the top format — **the ordered commit log plus two-tier writes (fast appends)** — cheaper conflicts and commit cost that stops scaling with database size ([design §6](../LARVA-DESIGN.md#6-the-commit-protocol-and-consistency-model)). One atomic commit, one-way, idempotent; data, history, and rollback all survive:
 
 ```
 $ npx larva upgrade
-format 3 (the ordered commit log), version 3
+format 4 (the ordered commit log + two-tier writes), version 3
 ```
 
 After the flip, clients older than the format refuse loudly (`FORMAT_UNSUPPORTED`) instead of writing through the wrong protocol.

@@ -11,7 +11,10 @@
  *   - a nested write inside a transaction callback does not deadlock the queue;
  *   - two LarvaDb instances contending on one database stay correct with
  *     chaos injection on;
- *   - the property-based conflict harness passes over the chaos store.
+ *   - the property-based conflict harness passes over the chaos store;
+ *   - format 4 tier-A appends: durable at one PUT, overlay read-your-writes,
+ *     fold visibility + cleanup, the ordered-write barrier, and idempotent
+ *     re-folds after a simulated folder crash.
  *
  *   bun scripts/group-commit-test.ts
  */
@@ -319,7 +322,7 @@ const schema = defineSchema({
   const preVersion = await db.currentVersion();
 
   const up = await db.upgrade();
-  ok("upgrade() flips to format 3", up.formatVersion === 3);
+  ok("upgrade() flips to the top format", up.formatVersion === SUPPORTED_FORMAT_VERSION);
   ok("upgrade() is idempotent", (await db.upgrade()).version === up.version);
 
   await db.sql`INSERT INTO notes (id, body, score) VALUES (${"post"}, ${"after upgrade"}, ${2})`;
@@ -337,7 +340,7 @@ const schema = defineSchema({
   const rolled = await db.sql`SELECT id FROM notes`;
   const raw = JSON.parse(objects.get("log-upgrade/manifest.json")!.body) as { formatVersion: number };
   ok("rollback across the boundary restores data", rolled.length === 1 && rolled[0].id === "pre");
-  ok("rollback preserves the format version (never re-admits old writers)", raw.formatVersion === 3);
+  ok("rollback preserves the format version (never re-admits old writers)", raw.formatVersion === SUPPORTED_FORMAT_VERSION);
   const postRollback = await db.asOf((await db.currentVersion()) - 1);
   ok("the rollback itself is rollbackable", (await postRollback.sql`SELECT COUNT(*) AS n FROM notes`)[0].n === 2);
 }
@@ -391,6 +394,96 @@ const schema = defineSchema({
   for (const c of report.checks) ok(`log property: ${c.name}`, c.pass, c.detail);
   ok("log property harness passed overall", report.pass);
   chaos = false;
+}
+
+// ---------- 12. format 4: tier-A appends — durable at one PUT ----------
+{
+  chaos = false;
+  const f4schema = defineSchema({
+    events: { id: t.uuid().primaryKey(), kind: t.text(), at: t.timestamp() },
+    tickets: { num: t.sequence().primaryKey(), note: t.text() },
+  });
+  const dbA = larva({ schema: f4schema, prefix: "f4-append/", store, commitLog: true });
+  await dbA.sql`SELECT COUNT(*) AS n FROM events`; // force init
+  const born = JSON.parse(objects.get("f4-append/manifest.json")!.body) as { formatVersion: number };
+  ok("commitLog:true births stores at the top format", born.formatVersion === SUPPORTED_FORMAT_VERSION);
+
+  // The ack point: RETURNING resolves while the write is still only an intent.
+  const [ev] = await dbA.sql`INSERT INTO events (kind, at) VALUES (${"signup"}, ${"2026-07-10T00:00:00Z"}) RETURNING id`;
+  const queuedAtAck = [...objects.keys()].some((k) => k.startsWith("f4-append/queue/"));
+  ok("append acks with a generated id while still queued (durable at one PUT)", queuedAtAck && typeof ev.id === "string");
+
+  // Read-your-writes before the fold: the overlay feeds the scan, so filters
+  // and aggregates treat pending rows exactly like chunk rows.
+  const seen = await dbA.sql`SELECT COUNT(*) AS n FROM events WHERE kind = ${"signup"}`;
+  ok("overlay read-your-writes: aggregate sees the un-folded append", seen[0].n === 1);
+
+  // Fold: wait out the debounce, then confirm global visibility + cleanup.
+  await sleep(400);
+  const dbB = larva({ schema: f4schema, prefix: "f4-append/", store, commitLog: true });
+  ok("cross-instance visibility after the fold", (await dbB.sql`SELECT COUNT(*) AS n FROM events`)[0].n === 1);
+  ok("folded intents are deleted from the queue", ![...objects.keys()].some((k) => k.startsWith("f4-append/queue/")));
+  const foldEntry = [...objects.entries()].find(
+    ([k, o]) => k.startsWith("f4-append/log/") && (JSON.parse(o.body) as { folds?: string[] }).folds?.length,
+  );
+  ok("the folding log entry records which intents it folded", foldEntry !== undefined);
+
+  // An explicit pk means the outcome depends on ordering — never an append.
+  await dbA.sql`INSERT INTO events (id, kind, at) VALUES (${"explicit-1"}, ${"import"}, ${"2026-07-10T00:00:00Z"})`;
+  ok("explicit-pk INSERT takes the ordered path, not the queue", ![...objects.keys()].some((k) => k.startsWith("f4-append/queue/")));
+
+  // Sequences stay unique across instances even when both sides append.
+  const N = 10;
+  await Promise.all(
+    Array.from({ length: N }, (_, i) => (i % 2 ? dbA : dbB).sql`INSERT INTO tickets (note) VALUES (${`t${i}`})`),
+  );
+  await sleep(400);
+  const nums = await dbB.sql`SELECT num FROM tickets`;
+  ok(
+    "appended sequence values distinct across two instances",
+    nums.length === N && new Set(nums.map((r) => r.num)).size === N,
+    `${new Set(nums.map((r) => r.num)).size}/${N} distinct`,
+  );
+
+  // The ordered-write barrier: an UPDATE right after an append must see it.
+  await dbA.sql`INSERT INTO events (kind, at) VALUES (${"pending"}, ${"2026-07-10T01:00:00Z"})`;
+  await dbA.sql`UPDATE events SET kind = ${"processed"} WHERE kind = ${"pending"}`;
+  const processed = await dbA.sql`SELECT COUNT(*) AS n FROM events WHERE kind = ${"processed"}`;
+  ok("ordered writes fold pending appends first (the barrier)", processed[0].n === 1);
+}
+
+// ---------- 13. format 4: fold idempotence — a crashed folder re-folds harmlessly ----------
+{
+  const f4schema = defineSchema({ items: { id: t.uuid().primaryKey(), label: t.text() } });
+  const db = larva({ schema: f4schema, prefix: "f4-refold/", store, commitLog: true });
+  await db.sql`INSERT INTO items (label) VALUES (${"only-once"})`;
+  await sleep(400); // fold completes, intent deleted
+
+  // Simulate the crash window: the log entry landed but the intent blob
+  // survived. Re-plant an identical intent and let the next fold find it.
+  const rows = await db.sql`SELECT id, label FROM items`;
+  const replant = {
+    kind: "append",
+    id: "01REPLANTEDINTENT0000000AA",
+    writerId: "01CRASHEDWRITER0000000000A",
+    createdAt: new Date().toISOString(),
+    tables: { items: rows.map((r) => ({ id: r.id, label: r.label })) },
+  };
+  objects.set("f4-refold/queue/01CRASHEDWRITER0000000000A/intent-000000000000.json", {
+    body: JSON.stringify(replant),
+    etag: `"replant-${++etagCounter}"`,
+    uploadedAt: new Date().toISOString(),
+  });
+  // Any new append triggers a fold, which must skip the replanted rows by pk.
+  await db.sql`INSERT INTO items (label) VALUES (${"second"})`;
+  await sleep(400);
+  const after = await db.sql`SELECT label FROM items ORDER BY label`;
+  ok(
+    "re-folding a crashed folder's intent adds no duplicate rows",
+    after.length === 2 && after.filter((r) => r.label === "only-once").length === 1,
+    JSON.stringify(after.map((r) => r.label)),
+  );
+  ok("the replanted intent was cleaned up by the healing fold", ![...objects.keys()].some((k) => k.startsWith("f4-refold/queue/")));
 }
 
 server.stop();

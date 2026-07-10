@@ -74,11 +74,11 @@ Defaults: `larva-export.sql` / `.db` / `.json`; `csv` writes one `larva-export-<
 
 ### `larva upgrade`
 
-Flip to [format 3, the ordered commit log](/docs/how-it-works/format-versioning). One atomic commit, one-way, idempotent:
+Flip to the top format — [the ordered commit log plus two-tier writes](/docs/how-it-works/format-versioning). One atomic commit, one-way, idempotent:
 
 ```
 $ npx larva upgrade
-format 3 (the ordered commit log), version 3
+format 4 (the ordered commit log + two-tier writes), version 3
 ```
 
 ### `larva rollback VERSION`

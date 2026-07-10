@@ -29,7 +29,7 @@ commands:
   export                write the whole database to a file
                           --format postgres|sqlite|json|csv (required)
                           --out FILE (default larva-export.<ext>; csv writes one file per table)
-  upgrade               flip the store to format 3, the ordered commit log (one-way, atomic)
+  upgrade               flip the store to the top format: the ordered commit log + two-tier writes (one-way, atomic)
   rollback VERSION      restore a past version (itself a new, undoable commit)
   vacuum                reclaim storage outside retention
                           --retain-days N (default 7)  --retain-versions N (default 50)
@@ -134,7 +134,7 @@ async function main(): Promise<void> {
 
     case "upgrade": {
       const result = await db.upgrade();
-      console.log(`format ${result.formatVersion} (the ordered commit log), version ${result.version}`);
+      console.log(`format ${result.formatVersion} (the ordered commit log + two-tier writes), version ${result.version}`);
       return;
     }
 
