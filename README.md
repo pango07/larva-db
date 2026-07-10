@@ -6,11 +6,11 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-213_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-219_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Current release: 2.1.0.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Current release: 2.2.0.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -75,21 +75,24 @@ await db.sql`INSERT INTO counters (slug, count) VALUES (${"visits"}, ${1})
              ON CONFLICT (slug) DO UPDATE SET count = count + ${1}`;
 ```
 
-### Sequences & composite uniques
+### Auto IDs, sequences & composite uniques
 
-Invoice numbers without running a server: `t.sequence()` auto-assigns integers that are unique across concurrent processes (drawn from CAS-claimed ranges, gappy on crash — exactly a Postgres sequence). Composite uniques guard pairs, and work as upsert targets:
+`t.uuid()` fills a time-ordered UUID on insert — nothing to coordinate, so ID generation never contends. `t.sequence()` auto-assigns small integers that are unique across concurrent processes (drawn from CAS-claimed ranges, gappy on crash — exactly a Postgres sequence). Composite uniques guard pairs, and work as upsert targets:
 
 ```ts
 const schema = defineSchema(
   {
+    orders: { id: t.uuid().primaryKey(), memo: t.text() },
     invoices: { number: t.sequence().primaryKey(), customer: t.text() },
     grants: { id: t.text().primaryKey(), userId: t.text(), feature: t.text(), level: t.integer() },
   },
   { uniques: { grants: [["userId", "feature"]] } },
 );
 
+await db.sql`INSERT INTO orders (memo) VALUES (${"first"}) RETURNING id`;
+// → [{ id: "0197f8c2-…" }] — omit the column, read it back
 await db.sql`INSERT INTO invoices (customer) VALUES (${"ada"}) RETURNING number`;
-// → [{ number: 42 }]   — omit the column, read it back
+// → [{ number: 42 }]      — same ergonomics, human-facing numbers
 
 await db.sql`INSERT INTO grants (userId, feature, level) VALUES (${"u1"}, ${"exports"}, ${2})
              ON CONFLICT (userId, feature) DO UPDATE SET level = excluded.level`;
@@ -263,7 +266,7 @@ The editable source for these lives at [docs/larva-architecture.excalidraw](docs
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **213 checks across seven suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **219 checks across seven suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|

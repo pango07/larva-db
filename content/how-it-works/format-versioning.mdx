@@ -13,7 +13,7 @@ A Larva store is **shared mutable state between independently deployed clients**
 | Format | What it added |
 |---|---|
 | **1** | the original layout: manifest + chunks + history |
-| **2** | sequence columns (`t.sequence()`) and composite unique constraints — a store only declares 2 when its schema actually uses one, so plain stores stay readable by format-1 clients |
+| **2** | sequence columns (`t.sequence()`), auto-UUID columns (`t.uuid()`), and composite unique constraints — a store only declares 2 when its schema actually uses one, so plain stores stay readable by format-1 clients |
 | **3** | [the ordered commit log](/docs/how-it-works/commit-protocol#format-3-the-ordered-commit-log) — entered only by explicit `db.upgrade()` or `larva({ commitLog: true })` |
 
 ## The guard

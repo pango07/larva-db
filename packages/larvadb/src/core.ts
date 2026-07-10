@@ -27,13 +27,20 @@ export interface ChunkRef {
  * Format history:
  *   1 — original layout: manifest + chunks + history.
  *   2 — v2 schema features: sequence columns (CAS-claimed ranges in a
- *       sequences blob) and composite unique constraints. A store only
- *       declares 2 when its schema actually uses one of them, so plain
- *       stores stay readable by format-1 clients.
+ *       sequences blob), composite unique constraints, and auto-UUID columns
+ *       (t.uuid(), writer-generated UUIDv7 — older writers would silently
+ *       insert NULL instead). A store only declares 2 when its schema
+ *       actually uses one of them, so plain stores stay readable by
+ *       format-1 clients.
  *   3 — the ordered commit log: commits are create-only numbered entries
  *       under log/ (slot number = version); manifest.json is demoted to a
  *       periodic checkpoint that snapshots replay the log tail onto. Entered
- *       only by explicit db.upgrade() or larva({ commitLog: true }). */
+ *       only by explicit db.upgrade() or larva({ commitLog: true }).
+ *
+ * Note: formatVersion >= 3 is also how clients detect log mode, so a
+ * CAS-mode store can only ever declare 1 or 2 — new schema-level features
+ * must extend format 2's meaning, and new storage-protocol levels stack
+ * above 3. */
 export const SUPPORTED_FORMAT_VERSION = 3;
 
 /** The lowest format a store with this schema can declare. Kept minimal so
@@ -42,7 +49,7 @@ export function requiredFormatVersion(schema: unknown): number {
   const s = (schema ?? {}) as import("./schema").DatabaseSchema;
   for (const table of Object.values(s)) {
     if (table.uniques?.length) return 2;
-    for (const col of Object.values(table.columns ?? {})) if (col.sequence) return 2;
+    for (const col of Object.values(table.columns ?? {})) if (col.sequence || col.uuid) return 2;
   }
   return 1;
 }
@@ -202,6 +209,22 @@ export function ulid(): string {
   let tail = "";
   for (const byte of rand) tail += CROCKFORD[byte % 32];
   return time + tail;
+}
+
+/** RFC 9562 UUIDv7: 48-bit unix-ms timestamp + random tail. Time-ordered like
+ * a ULID (new rows cluster in chunk zone maps) but in the canonical UUID
+ * format the wider ecosystem expects. Backs t.uuid() columns. */
+export function uuidv7(): string {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  let ts = Date.now(); // > 2^32, so arithmetic — not 32-bit bitwise ops
+  for (let i = 5; i >= 0; i--) {
+    b[i] = ts % 256;
+    ts = Math.floor(ts / 256);
+  }
+  b[6] = 0x70 | (b[6] & 0x0f);
+  b[8] = 0x80 | (b[8] & 0x3f);
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

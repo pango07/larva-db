@@ -30,10 +30,10 @@ That's the whole setup. No migrations to run, no dashboard to visit, no second b
 ## What you get
 
 - **Real SQL** — a deliberately scoped dialect that covers ~90% of what small apps write: joins, `GROUP BY` over expressions, `HAVING`, upserts, JSON functions, date bucketing. Everything outside it is rejected *by name, with an alternative*.
-- **No silently lost writes, ever.** Every commit goes through an atomic protocol; conflicts rebase, re-execute, or fail loudly. Verified by 213 checks including randomized concurrent-writer gauntlets.
+- **No silently lost writes, ever.** Every commit goes through an atomic protocol; conflicts rebase, re-execute, or fail loudly. Verified by 219 checks including randomized concurrent-writer gauntlets.
 - **Atomic transactions** — several statements, one commit, all or nothing.
 - **Time travel** — every commit is a new immutable version; `db.asOf()` reads the past and `db.rollbackTo()` is a one-line undo button.
-- **Sequences** — `t.sequence()` auto-numbers rows, unique across concurrent writers, without a server.
+- **Auto IDs** — `t.uuid()` fills a time-ordered UUID on insert with nothing to coordinate; `t.sequence()` auto-numbers rows (invoice #42), unique across concurrent writers, without a server.
 - **A guaranteed exit** — `db.export({ format: "postgres" })` produces one pg_dump-shaped file; `psql $DATABASE_URL < export.sql` is the entire migration.
 
 ## Who it's for — and honest limits

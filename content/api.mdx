@@ -68,7 +68,7 @@ const schema = defineSchema(
 );
 ```
 
-**Column types**: `t.text()`, `t.integer()`, `t.real()`, `t.boolean()`, `t.timestamp()` (ISO 8601 text), `t.sequence()`.
+**Column types**: `t.text()`, `t.integer()`, `t.real()`, `t.boolean()`, `t.timestamp()` (ISO 8601 text), `t.sequence()`, `t.uuid()`.
 
 **Column modifiers**:
 
@@ -80,6 +80,10 @@ const schema = defineSchema(
 ### `t.sequence()`
 
 An auto-assigned integer: omit it on INSERT and read it back with `RETURNING`. Values come from CAS-claimed ranges **off the commit hot path**, so drawing numbers never contends with writes; ranges are disjoint across processes, so numbers are **unique across concurrent writers by construction**. Gappy on crash — exactly the Postgres sequence contract.
+
+### `t.uuid()`
+
+An auto-ID text column: omit it on INSERT and Larva fills a **time-ordered UUID (v7)**, readable back with `RETURNING`. Unlike `t.sequence()` there is nothing to coordinate — each writer invents its own value, so ID generation can never contend, even across many processes. Time-ordering keeps new rows clustered in chunk zone maps, so primary-key pruning stays effective (a random UUIDv4 would scatter). Supplying an explicit value is respected. Prefer this over `t.sequence()` unless you need small human-facing numbers (invoice #42).
 
 ### Composite unique constraints
 
