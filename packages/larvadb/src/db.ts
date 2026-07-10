@@ -1,9 +1,12 @@
-import { LarvaProto, Manifest, Row, Scalar, Snapshot } from "./core";
-import { DatabaseSchema, SchemaError, schemaDrift } from "./schema";
+import { AppendIntent, cmpScalar, ConflictError, LarvaProto, Manifest, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
+import { DatabaseSchema, SchemaError, schemaDrift, TableSchema } from "./schema";
+import { InsertStmt } from "./sql/ast";
 import { SqlError } from "./sql/errors";
 import { ExecOptions, Executor, PlanOutcome, QueryStats } from "./sql/executor";
 import { parse } from "./sql/parser";
 import { CasConflictError, StorageAdapter, VercelBlobAdapter } from "./storage";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Internal signal: the transaction callback issued no writes, so skip the CAS. */
 class TxNoWrites extends Error {}
@@ -51,9 +54,10 @@ export interface LarvaOptions {
   prefix?: string;
   /** Storage backend. Defaults to Vercel Blob via BLOB_READ_WRITE_TOKEN. */
   store?: StorageAdapter;
-  /** Create NEW databases in format 3 (the ordered commit log — cheaper
-   * conflicts, higher cross-process throughput). Existing databases are
-   * never changed by this flag; flip them explicitly with db.upgrade(). */
+  /** Create NEW databases at the current top format (the ordered commit log
+   * plus two-tier writes — cheaper conflicts, durable-at-PUT appends).
+   * Existing databases are never changed by this flag; flip them explicitly
+   * with db.upgrade(). */
   commitLog?: boolean;
 }
 
@@ -84,6 +88,13 @@ export class LarvaDb {
   private proto: LarvaProto;
   private executor: Executor;
   private ready?: Promise<void>;
+  /** The store's format, learned at connect and raised by our own upgrade().
+   * Another process raising it mid-session only means we skip tier A — safe. */
+  private format = 1;
+  /** This instance's durable-but-not-yet-folded appends (format 4, tier A). */
+  private pending = new Map<string, { intent: AppendIntent; path: string }>();
+  private foldChain: Promise<void> = Promise.resolve();
+  private foldScheduled = false;
 
   constructor(private opts: LarvaOptions = {}) {
     // Group commit on: concurrent writes through one LarvaDb instance coalesce
@@ -94,6 +105,8 @@ export class LarvaDb {
     this.proto = new LarvaProto(opts.store ?? new VercelBlobAdapter(), opts.prefix ?? "larva/", undefined, {
       groupCommit: true,
     });
+    // Snapshots passing over a fold entry clear the overlays it made obsolete.
+    this.proto.onFold = (ids) => ids.forEach((id) => this.pending.delete(id));
     this.executor = new Executor(this.proto);
   }
 
@@ -121,6 +134,7 @@ export class LarvaDb {
       }
       manifest = (await this.proto.snapshot()).manifest;
     }
+    this.format = manifest.formatVersion ?? 1;
     if (!code) return;
 
     const live = (manifest.schema ?? {}) as DatabaseSchema;
@@ -156,7 +170,169 @@ export class LarvaDb {
   /** Raw string + positional ? params. Prefer db.sql`...` — it parameterizes for you. */
   async query<T extends Row = Row>(text: string, params: Scalar[] = [], opts: ExecOptions = {}): Promise<T[]> {
     await this.ensureReady();
-    return (await this.executor.execute(parse(text), params, opts)) as T[];
+    const stmt = parse(text);
+    // SELECTs scan this instance's un-folded appends alongside chunks, so a
+    // caller always reads its own writes regardless of tier.
+    if (stmt.kind === "select") {
+      return (await this.executor.execute(stmt, params, { ...opts, overlay: this.overlayFor() })) as T[];
+    }
+    // Tier A (format 4): a write whose outcome is fully client-determined is
+    // acknowledged at durability — one create-only PUT — instead of at ordering.
+    if (this.format >= 4 && stmt.kind === "insert" && this.appendSchema(stmt)) {
+      return (await this.append(stmt, params)) as T[];
+    }
+    // Ordered writes see prior appends: fold them into the log first, so an
+    // UPDATE can never silently miss a row the caller just inserted.
+    if (this.pending.size > 0) await this.foldNow();
+    return (await this.executor.execute(stmt, params, opts)) as T[];
+  }
+
+  // ---------- format 4, tier A: durable-at-PUT appends ----------
+
+  /**
+   * The classification insight (Design §6): a pure INSERT into a table whose
+   * primary key is auto-generated and which carries no other uniqueness
+   * constraints cannot fail ordering — nothing about its outcome depends on
+   * what other writers did. Returns the table schema when the statement
+   * qualifies. Conservative on purpose: code-first schemas only, and any
+   * doubt means the ordered path.
+   */
+  private appendSchema(stmt: InsertStmt): TableSchema | null {
+    const table = this.opts.schema?.[stmt.table];
+    if (!table) return null;
+    if (stmt.onConflict) return null;
+    if (stmt.columns.includes(table.primaryKey)) return null;
+    if (table.uniques?.length) return null;
+    if (Object.values(table.columns).some((c) => c.unique)) return null;
+    return table;
+  }
+
+  private async append(stmt: InsertStmt, params: Scalar[]): Promise<Row[]> {
+    const schema = this.appendSchema(stmt)!;
+    // Sequences claim locally-leased ranges and auto ids are invented here, so
+    // after prepareRows the rows are final — RETURNING needs no round-trip.
+    const rows = await this.executor.prepareRows(stmt, params, schema);
+    const intent: AppendIntent = {
+      kind: "append",
+      id: ulid(),
+      writerId: this.proto.writerId,
+      createdAt: new Date().toISOString(),
+      tables: { [stmt.table]: rows },
+    };
+    const path = await this.proto.putIntent(intent); // ← durable here; this is the ack point
+    this.pending.set(intent.id, { intent, path });
+    this.scheduleFold();
+    return this.executor.projectReturning(rows, stmt.returning, stmt.table);
+  }
+
+  private overlayFor(): Record<string, Row[]> | undefined {
+    if (this.pending.size === 0) return undefined;
+    const out: Record<string, Row[]> = {};
+    for (const { intent } of this.pending.values()) {
+      for (const [t, rows] of Object.entries(intent.tables)) (out[t] ??= []).push(...rows);
+    }
+    return out;
+  }
+
+  /** Debounced background fold: bursts of appends land as one log commit. A
+   * failure here only delays visibility (the intents are durable) — the next
+   * append, ordered write, or any other writer's fold picks them up. */
+  private scheduleFold(delayMs = 25): void {
+    if (this.foldScheduled) return;
+    this.foldScheduled = true;
+    setTimeout(() => {
+      this.foldScheduled = false;
+      void this.foldNow().catch(() => {});
+    }, delayMs);
+  }
+
+  /** Fold every pending intent in the store (ours and anyone's) into one log
+   * commit. Serialized per instance; lease-coordinated across instances. */
+  private foldNow(): Promise<void> {
+    const run = this.foldChain.then(() => this.foldOnce());
+    this.foldChain = run.catch(() => {});
+    return run;
+  }
+
+  private async foldOnce(): Promise<void> {
+    if (this.format < 4 || this.pending.size === 0) return;
+
+    // The lease is a performance mechanism, never a correctness one: if we
+    // fold concurrently with another leaseholder anyway, the pk-idempotence
+    // check plus re-execution-on-changed-table keeps rows from doubling.
+    for (let attempt = 0; !(await this.proto.tryLease()); attempt++) {
+      if (attempt >= 100) throw new ConflictError(attempt);
+      await sleep(150);
+      await this.proto.snapshot(); // another folder may have cleared us (onFold)
+      if (this.pending.size === 0) return;
+    }
+
+    try {
+      const intents = await this.proto.listIntents();
+      if (intents.length === 0) return;
+
+      await this.proto.commit(async (snap) => {
+        const schema = (snap.manifest.schema ?? {}) as DatabaseSchema;
+        // Merge every intent's rows per table, deduped by pk within the batch.
+        const merged = new Map<string, Row[]>();
+        for (const { intent } of intents) {
+          for (const [t, rows] of Object.entries(intent.tables)) {
+            const bucket = merged.get(t) ?? [];
+            const seen = new Set(bucket.map((r) => r[schema[t]?.primaryKey ?? "id"]));
+            bucket.push(...rows.filter((r) => !seen.has(r[schema[t]?.primaryKey ?? "id"])));
+            merged.set(t, bucket);
+          }
+        }
+
+        const staged: { table: string; ref: Awaited<ReturnType<LarvaProto["stageChunk"]>>; baseSig: string }[] = [];
+        for (const [table, rows] of merged) {
+          const ts = schema[table];
+          if (!ts || !snap.manifest.tables[table]) continue; // table dropped since the append — rows go with it
+          const fresh = await this.dropExisting(snap, table, ts, rows);
+          if (fresh.length === 0) continue;
+          const ref = await this.proto.stageChunk(table, fresh, { pk: ts.primaryKey, part: ts.partitionColumn });
+          staged.push({ table, ref, baseSig: snap.manifest.tables[table].chunks.map((c) => c.id).join(",") });
+        }
+
+        return {
+          apply: (m) => {
+            for (const { table, ref, baseSig } of staged) {
+              const t = m.tables[table];
+              if (!t) continue;
+              // The idempotence check ran against the planning snapshot; any
+              // change to the table since (a racing fold, a normal write)
+              // forces re-execution so it runs again. Correctness keystone.
+              if (t.chunks.map((c) => c.id).join(",") !== baseSig) return null;
+              t.chunks.push(ref);
+            }
+            return m;
+          },
+          folds: intents.map((i) => i.intent.id),
+        };
+      });
+
+      for (const { intent } of intents) this.pending.delete(intent.id);
+      await this.proto.store.del(intents.map((i) => i.path)).catch(() => {});
+    } finally {
+      await this.proto.releaseLease();
+    }
+  }
+
+  /** Idempotence: drop rows whose pk already exists in the snapshot (a crashed
+   * folder's re-fold, a split lease). Zone maps prune the check to the chunks
+   * whose pk range could contain time-ordered fresh ids — usually the tail. */
+  private async dropExisting(snap: Snapshot, table: string, ts: TableSchema, rows: Row[]): Promise<Row[]> {
+    const pks = rows.map((r) => r[ts.primaryKey]);
+    const min = pks.reduce((a, b) => (cmpScalar(a, b) <= 0 ? a : b));
+    const max = pks.reduce((a, b) => (cmpScalar(a, b) >= 0 ? a : b));
+    const candidates = (snap.manifest.tables[table]?.chunks ?? []).filter(
+      (c) => !c.stats || !(cmpScalar(c.stats.pkMax, min) < 0 || cmpScalar(c.stats.pkMin, max) > 0),
+    );
+    if (candidates.length === 0) return rows;
+    const existing = new Set(
+      (await Promise.all(candidates.map((c) => this.proto.readChunk(c)))).flat().map((r) => r[ts.primaryKey]),
+    );
+    return rows.filter((r) => !existing.has(r[ts.primaryKey]));
   }
 
   /**
@@ -168,6 +344,9 @@ export class LarvaDb {
    */
   async transaction<T>(fn: (tx: LarvaTx) => Promise<T>, opts: ExecOptions = {}): Promise<T> {
     await this.ensureReady();
+    // Transactions are ordered by definition: fold our pending appends first
+    // so the callback's snapshot contains everything this instance wrote.
+    if (this.pending.size > 0) await this.foldNow();
     let result!: T;
     try {
       await this.proto.commit(async (snap) => {
@@ -453,25 +632,27 @@ export class LarvaDb {
   }
 
   /**
-   * Flip this database to format 3, the ordered commit log (Design §6):
-   * cheaper conflicts and higher cross-process commit throughput. One atomic
-   * commit; one-way; clients older than the format then refuse loudly with
-   * FormatError instead of writing through the wrong protocol. Data,
-   * history, and rollback all survive the flip.
+   * Flip this database to the current top format (Design §6): the ordered
+   * commit log (format 3) plus two-tier writes (format 4 — durable-at-PUT
+   * appends). One atomic commit; one-way; clients older than the format then
+   * refuse loudly with FormatError instead of writing through the wrong
+   * protocol. Data, history, and rollback all survive the flip.
    */
   async upgrade(): Promise<{ version: number; formatVersion: number }> {
     await this.ensureReady();
     const current = await this.proto.snapshot();
-    if ((current.manifest.formatVersion ?? 1) >= 3) {
+    this.format = Math.max(this.format, current.manifest.formatVersion ?? 1);
+    if ((current.manifest.formatVersion ?? 1) >= SUPPORTED_FORMAT_VERSION) {
       return { version: current.manifest.version, formatVersion: current.manifest.formatVersion };
     }
     const result = await this.proto.commit(async () => ({
       apply: (m) => {
-        m.formatVersion = Math.max(m.formatVersion ?? 1, 3);
+        m.formatVersion = Math.max(m.formatVersion ?? 1, SUPPORTED_FORMAT_VERSION);
         return m;
       },
     }));
-    return { version: result.version, formatVersion: 3 };
+    this.format = SUPPORTED_FORMAT_VERSION;
+    return { version: result.version, formatVersion: SUPPORTED_FORMAT_VERSION };
   }
 
   /** Restore a past version. Itself a commit — non-destructive and rollbackable (Design §9). */

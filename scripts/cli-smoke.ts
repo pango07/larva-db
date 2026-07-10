@@ -77,7 +77,7 @@ const v1 = run("version");
 const versionBefore = Number(v1.out.trim());
 ok("version prints an integer", v1.code === 0 && Number.isInteger(versionBefore), v1.out);
 const up = run("upgrade");
-ok("upgrade flips to format 3", up.code === 0 && up.out.includes("format 3"), up.out + up.err);
+ok("upgrade flips to the top format", up.code === 0 && up.out.includes("format 4"), up.out + up.err);
 ok("upgrade is idempotent", run("upgrade").code === 0);
 ok("sql: writes work after upgrade (log mode)", run("sql", "INSERT INTO notes (id, body, score) VALUES ('c', 'post-upgrade', 3)").code === 0);
 const preRollback = Number(run("version").out.trim());

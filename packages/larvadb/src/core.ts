@@ -36,12 +36,17 @@ export interface ChunkRef {
  *       under log/ (slot number = version); manifest.json is demoted to a
  *       periodic checkpoint that snapshots replay the log tail onto. Entered
  *       only by explicit db.upgrade() or larva({ commitLog: true }).
+ *   4 — two-tier writes (Design §6): per-writer intent queues under queue/
+ *       plus a compactor lease. Constraint-free appends are durable at one
+ *       create-only PUT and folded into the log later; log entries may carry
+ *       fold metadata. Requires the log; entered by db.upgrade() (and
+ *       larva({ commitLog: true }) births new stores here).
  *
  * Note: formatVersion >= 3 is also how clients detect log mode, so a
  * CAS-mode store can only ever declare 1 or 2 — new schema-level features
  * must extend format 2's meaning, and new storage-protocol levels stack
  * above 3. */
-export const SUPPORTED_FORMAT_VERSION = 3;
+export const SUPPORTED_FORMAT_VERSION = 4;
 
 /** The lowest format a store with this schema can declare. Kept minimal so
  * stores that don't use v2 features remain openable by older clients. */
@@ -86,6 +91,21 @@ export interface LogEntry {
   /** Per-table chunk delta; null drops the table; an entry with empty
    * add/remove creates it. Untouched tables are absent. */
   tables: Record<string, { add: ChunkRef[]; remove: string[] } | null>;
+  /** Intent ids folded into this commit (format 4). Metadata only: writers
+   * use it to clear pending overlays and vacuum uses it to sweep processed
+   * intent blobs; replay ignores it. */
+  folds?: string[];
+}
+
+/** One durable-at-PUT append awaiting fold into the log (format 4). Rows are
+ * fully validated and id-filled before the intent is written, so its outcome
+ * is client-determined — which is exactly what makes early ack honest. */
+export interface AppendIntent {
+  kind: "append";
+  id: string;
+  writerId: string;
+  createdAt: string;
+  tables: Record<string, Row[]>;
 }
 
 /** Delta between two manifests (base → next) in LogEntry form. */
@@ -190,6 +210,9 @@ interface CommitPlan {
    * the commit loop will then re-execute the planner on a fresh snapshot.
    */
   apply(base: Manifest): Manifest | null;
+  /** Intent ids this commit folds (format 4, log mode only) — recorded on the
+   * log entry so writers clear overlays and vacuum sweeps the blobs. */
+  folds?: string[];
 }
 
 /** Stage phase: write new chunk blobs (touching nothing live), return the plan. */
@@ -313,10 +336,78 @@ export class LarvaProto {
     return `${this.prefix}log/${padVersion(version)}.json`;
   }
 
+  // ---------- format 4: per-writer intent queues + the compactor lease ----------
+
+  /** Identity of this instance in the queue — its own contention-free prefix. */
+  readonly writerId = ulid();
+  private intentSeq = 0;
+  /** Called with the fold lists of log entries as snapshots pass over them,
+   * so LarvaDb can clear pending-intent overlays. */
+  onFold?: (intentIds: string[]) => void;
+
+  /** One create-only PUT: durable at return. The path never collides — the
+   * writer prefix is ours alone and seq is monotonic per instance. */
+  async putIntent(intent: AppendIntent): Promise<string> {
+    const path = `${this.prefix}queue/${intent.writerId}/intent-${padVersion(this.intentSeq++)}.json`;
+    await this.putCreateOnly(path, JSON.stringify(intent));
+    return path;
+  }
+
+  /** Every pending intent in the store, all writers. Intent blobs are
+   * immutable; they only ever disappear (fold cleanup / vacuum). */
+  async listIntents(): Promise<{ path: string; intent: AppendIntent }[]> {
+    const objects = await this.store.list(`${this.prefix}queue/`);
+    const out: { path: string; intent: AppendIntent }[] = [];
+    for (const o of objects) {
+      if (!o.path.endsWith(".json")) continue;
+      const res = await this.store.get(o.path, { fresh: true });
+      if (res) out.push({ path: o.path, intent: JSON.parse(res.body) as AppendIntent });
+    }
+    return out;
+  }
+
+  /**
+   * Try to become the compactor. The lease is a PERFORMANCE mechanism, never
+   * a correctness one (Design §6): the log slot stays the sole arbiter, so a
+   * split lease merely wastes work. TTL is local-clock based on purpose —
+   * generous enough that skew only delays a steal.
+   */
+  async tryLease(ttlMs = 5_000): Promise<boolean> {
+    const path = `${this.prefix}lease.json`;
+    const body = JSON.stringify({ holder: this.writerId, expiresAt: new Date(Date.now() + ttlMs).toISOString() });
+    try {
+      const res = await this.store.get(path, { fresh: true });
+      if (!res) {
+        await this.store.put(path, body, { createOnly: true });
+        return true;
+      }
+      const lease = JSON.parse(res.body) as { holder: string; expiresAt: string };
+      if (lease.holder !== this.writerId && lease.expiresAt > new Date().toISOString()) return false;
+      await this.store.put(path, body, { ifMatch: res.etag });
+      return true;
+    } catch (err) {
+      if (err instanceof CasConflictError || isTransientStorageError(err)) return false;
+      throw err;
+    }
+  }
+
+  /** Best-effort: let the next writer elect immediately instead of waiting out the TTL. */
+  async releaseLease(): Promise<void> {
+    try {
+      const res = await this.store.get(`${this.prefix}lease.json`, { fresh: true });
+      if (!res) return;
+      const lease = JSON.parse(res.body) as { holder: string };
+      if (lease.holder === this.writerId) await this.store.del([`${this.prefix}lease.json`]);
+    } catch {
+      // expiry will free it
+    }
+  }
+
   /** Create the empty database. Fails if one already exists at this prefix. */
   async init(tables: string[], schema?: unknown, opts?: { commitLog?: boolean }): Promise<void> {
     const manifest: Manifest = {
-      formatVersion: opts?.commitLog ? 3 : requiredFormatVersion(schema),
+      // commitLog births at the current top format: the log plus two-tier writes.
+      formatVersion: opts?.commitLog ? SUPPORTED_FORMAT_VERSION : requiredFormatVersion(schema),
       version: 0,
       commitId: ulid(),
       committedAt: new Date().toISOString(),
@@ -364,6 +455,7 @@ export class LarvaProto {
         const entry = await this.readLogEntry(v);
         if (!entry) break;
         applyLogEntry(manifest, entry);
+        if (entry.folds?.length) this.onFold?.(entry.folds);
       }
     }
     return { manifest, etag: res.etag };
@@ -566,6 +658,7 @@ export class LarvaProto {
         }
       }
       if (planned.length === 0) throw new EmptyBatch();
+      const folds = planned.flatMap(({ plan }) => plan.folds ?? []);
       return {
         apply: (m) => {
           let cur: Manifest | null = m;
@@ -575,6 +668,7 @@ export class LarvaProto {
           }
           return cur;
         },
+        ...(folds.length ? { folds } : {}),
       };
     };
 
@@ -655,6 +749,7 @@ export class LarvaProto {
             ...(JSON.stringify(snap.manifest.schema) !== JSON.stringify(next.schema) ? { schema: next.schema } : {}),
             ...(next.formatVersion !== snap.manifest.formatVersion ? { formatVersion: next.formatVersion } : {}),
             tables: diffManifests(snap.manifest, next),
+            ...(current.folds?.length ? { folds: current.folds } : {}),
           };
           await this.store.put(this.logPath(next.version), JSON.stringify(entry), { createOnly: true });
           this.logCache.set(next.version, entry);
@@ -794,6 +889,7 @@ export class LarvaProto {
       const entry = await this.readLogEntry(v);
       if (!entry) break;
       applyLogEntry(manifest, entry);
+      if (entry.folds?.length) this.onFold?.(entry.folds);
     }
     return { manifest, etag: snap.etag };
   }

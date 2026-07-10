@@ -50,7 +50,7 @@ bun run dev                       # http://localhost:3000
 vercel deploy --prod --yes        # or ship it
 ```
 
-## The test suites — 219 checks across seven suites
+## The test suites — 230 checks across seven suites
 
 Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate. All of it runs in CI on every push; merges to `main` publish to npm.
 
@@ -60,7 +60,7 @@ bun run lint
 
 # offline — no credentials needed
 bun scripts/s3-adapter-test.ts     # storage contract + injected 409/500 chaos
-bun scripts/group-commit-test.ts   # coalescing, conflict matrix, format 3, upgrade flow
+bun scripts/group-commit-test.ts   # coalescing, conflict matrix, formats 3–4, upgrade flow
 
 # live — need BLOB_READ_WRITE_TOKEN in .env.local
 bun scripts/sql-smoke.ts           # the whole dialect, end to end

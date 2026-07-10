@@ -156,9 +156,11 @@ type Customer = InferRow<typeof schema, "customers">;
 const rows = await db.sql<Customer>`SELECT * FROM customers`;
 ```
 
-### More write headroom — the commit log
+### More write headroom — the commit log + fast appends
 
 Format 3 changes how commits land: instead of re-uploading the whole manifest per commit, each commit is a tiny immutable delta in an ordered log, and the manifest becomes a periodic checkpoint. Conflicts get cheap (losing a race costs one small read, not a manifest round-trip), write cost stops scaling with database size, and contention tails shrink — same guarantees, verified by the same stress/property gauntlet. One-way, explicit, and old clients refuse loudly instead of corrupting:
+
+Format 4 adds **fast appends** on top: an INSERT whose outcome is fully client-determined — auto-generated id (`t.uuid()`, `t.sequence()`, or the implicit ULID), no unique constraints — is acknowledged the moment one durable PUT lands in a per-writer queue, then folded into the log in the background. Zero contention with anyone, your own reads see the rows immediately, and ordered writes (UPDATE/DELETE/transactions) fold first so they never miss them. Event logs, activity feeds, and telemetry stop touching the ordered path entirely.
 
 ```ts
 await db.upgrade();                      // flip an existing database
@@ -172,7 +174,7 @@ The whole API is also a shell command — `npx larva` works wherever `@larva-db/
 ```bash
 npx larva sql "SELECT name, email FROM customers LIMIT 5"
 npx larva export --format postgres --out export.sql  # then: psql $DATABASE_URL < export.sql
-npx larva upgrade                                    # flip to format 3, the commit log
+npx larva upgrade                                    # flip to format 4: the commit log + fast appends
 npx larva rollback 41                                # the undo button, from your shell
 npx larva vacuum
 npx larva version
@@ -263,7 +265,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## Tested where it matters
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **219 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **230 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
 
 The stress and property harnesses ship in the package for testing your own setup:
 
