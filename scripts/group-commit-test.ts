@@ -15,7 +15,7 @@
  *
  *   bun scripts/group-commit-test.ts
  */
-import { defineSchema, larva, S3Adapter, SqlError, t } from "@larva-db/core";
+import { defineSchema, larva, S3Adapter, SqlError, SUPPORTED_FORMAT_VERSION, t } from "@larva-db/core";
 import { runProperty } from "@larva-db/core/testing";
 
 let passed = 0;
@@ -217,7 +217,7 @@ const schema = defineSchema({
 
   // simulate a store already upgraded by a future client
   const stored = objects.get("gc-format/manifest.json")!;
-  const future = { ...JSON.parse(stored.body), formatVersion: 2 };
+  const future = { ...JSON.parse(stored.body), formatVersion: SUPPORTED_FORMAT_VERSION + 1 };
   objects.set("gc-format/manifest.json", { ...stored, body: JSON.stringify(future) });
 
   const err = await larva({ schema, prefix: "gc-format/", store })
@@ -231,6 +231,129 @@ const schema = defineSchema({
     (err?.message ?? "").startsWith("FORMAT_UNSUPPORTED:") && (err?.message ?? "").includes("npm install"),
     err?.message,
   );
+}
+
+// ---------- 8. v2 schema features: sequences + composite uniques ----------
+{
+  const v2schema = defineSchema(
+    {
+      invoices: { number: t.sequence().primaryKey(), writer: t.text() },
+      grants: { id: t.text().primaryKey(), userId: t.text(), feature: t.text() },
+    },
+    { uniques: { grants: [["userId", "feature"]] } },
+  );
+  const dbA = larva({ schema: v2schema, prefix: "v2-seq/", store });
+  await dbA.sql`SELECT COUNT(*) AS n FROM invoices`; // force init
+  const dbB = larva({ schema: v2schema, prefix: "v2-seq/", store });
+
+  // The marquee claim: two processes drawing from one sequence never collide,
+  // because claimed ranges are disjoint by CAS construction.
+  const N = 20;
+  await Promise.all(
+    Array.from({ length: N }, (_, i) =>
+      (i % 2 === 0 ? dbA : dbB).sql`INSERT INTO invoices (writer) VALUES (${i % 2 === 0 ? "a" : "b"})`,
+    ),
+  );
+  const rows = await dbA.sql`SELECT number FROM invoices`;
+  ok(
+    "sequence numbers distinct across two instances",
+    rows.length === N && new Set(rows.map((r) => r.number)).size === N && rows.every((r) => Number.isInteger(r.number)),
+    `${new Set(rows.map((r) => r.number)).size}/${N} distinct`,
+  );
+
+  const stored = JSON.parse(objects.get("v2-seq/manifest.json")!.body) as { formatVersion: number };
+  ok("store using v2 features declares formatVersion 2", stored.formatVersion === 2);
+  const plain = JSON.parse(objects.get("gc-insert/manifest.json")!.body) as { formatVersion: number };
+  ok("plain store still declares formatVersion 1", plain.formatVersion === 1);
+
+  await dbA.sql`INSERT INTO grants (userId, feature) VALUES (${"u"}, ${"exports"})`;
+  const err = await dbB.sql`INSERT INTO grants (userId, feature) VALUES (${"u"}, ${"exports"})`.then(
+    () => null,
+    (e: unknown) => e as SqlError,
+  );
+  ok("composite unique enforced across instances", err?.code === "UNIQUE_CONFLICT", err?.message);
+}
+
+// ---------- 9. format 3: upgrade + the ordered commit log ----------
+{
+  // Born format 1, upgraded mid-life — the migration every existing store takes.
+  const db = larva({ schema, prefix: "log-upgrade/", store });
+  await db.sql`INSERT INTO notes (id, body, score) VALUES (${"pre"}, ${"before upgrade"}, ${1})`;
+  const preVersion = await db.currentVersion();
+
+  const up = await db.upgrade();
+  ok("upgrade() flips to format 3", up.formatVersion === 3);
+  ok("upgrade() is idempotent", (await db.upgrade()).version === up.version);
+
+  await db.sql`INSERT INTO notes (id, body, score) VALUES (${"post"}, ${"after upgrade"}, ${2})`;
+  const all = await db.sql`SELECT id FROM notes ORDER BY id`;
+  ok("reads span the upgrade boundary", all.length === 2);
+  ok(
+    "post-upgrade commits are log entries, not manifest swaps",
+    [...objects.keys()].some((k) => k.startsWith("log-upgrade/log/")),
+  );
+
+  // Time travel across the boundary, at log-entry granularity.
+  const past = await db.asOf(preVersion);
+  ok("asOf() reaches a pre-upgrade version", (await past.sql`SELECT COUNT(*) AS n FROM notes`)[0].n === 1);
+  await db.rollbackTo(preVersion);
+  const rolled = await db.sql`SELECT id FROM notes`;
+  const raw = JSON.parse(objects.get("log-upgrade/manifest.json")!.body) as { formatVersion: number };
+  ok("rollback across the boundary restores data", rolled.length === 1 && rolled[0].id === "pre");
+  ok("rollback preserves the format version (never re-admits old writers)", raw.formatVersion === 3);
+  const postRollback = await db.asOf((await db.currentVersion()) - 1);
+  ok("the rollback itself is rollbackable", (await postRollback.sql`SELECT COUNT(*) AS n FROM notes`)[0].n === 2);
+}
+
+// ---------- 10. format 3 under load: cross-instance writers + chaos ----------
+{
+  chaos = true;
+  const dbA = larva({ schema, prefix: "log-load/", store, commitLog: true });
+  await dbA.sql`INSERT INTO notes (id, body, score) VALUES (${"ctr"}, ${"counter"}, ${0})`;
+  const dbB = larva({ schema, prefix: "log-load/", store });
+
+  const WRITERS_PER_DB = 4;
+  const OPS = 5;
+  let inserts = 0;
+  let increments = 0;
+  const writer = async (db: typeof dbA, name: string) => {
+    for (let i = 0; i < OPS; i++) {
+      if (i % 2 === 0) {
+        await db.sql`INSERT INTO notes (id, body, score) VALUES (${`${name}-${i}`}, ${"w"}, ${i})`;
+        inserts++;
+      } else {
+        await db.sql`UPDATE notes SET score = score + 1 WHERE id = ${"ctr"}`;
+        increments++;
+      }
+    }
+  };
+  await Promise.all([
+    ...Array.from({ length: WRITERS_PER_DB }, (_, w) => writer(dbA, `a${w}`)),
+    ...Array.from({ length: WRITERS_PER_DB }, (_, w) => writer(dbB, `b${w}`)),
+  ]);
+  const rows = await dbA.sql`SELECT id, score FROM notes`;
+  const ctr = rows.find((r) => r.id === "ctr");
+  ok("log mode: cross-instance appends all present under chaos", rows.length === inserts + 1, `${rows.length - 1}/${inserts} rows`);
+  ok("log mode: cross-instance counter exact under chaos", ctr?.score === increments, `score=${ctr?.score}, expected ${increments}`);
+
+  const cp = JSON.parse(objects.get("log-load/manifest.json")!.body) as { version: number };
+  const tip = await dbA.currentVersion();
+  ok(
+    "checkpoint advances behind the log tip",
+    cp.version > 0 && cp.version % 8 === 0 && cp.version <= tip,
+    `checkpoint v${cp.version}, tip v${tip}`,
+  );
+  chaos = false;
+}
+
+// ---------- 11. property-based conflict matrix over the log, chaos on ----------
+{
+  chaos = true;
+  console.log("\nrunning property harness over the commit log + chaos store (6 writers × 15 ops)...");
+  const report = await runProperty({ writers: 6, opsPerWriter: 15, commitLog: true }, () => {}, store);
+  for (const c of report.checks) ok(`log property: ${c.name}`, c.pass, c.detail);
+  ok("log property harness passed overall", report.pass);
+  chaos = false;
 }
 
 server.stop();

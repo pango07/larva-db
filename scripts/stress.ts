@@ -2,7 +2,7 @@
  * Commit-protocol stress test: concurrent writers hammer one Larva database
  * on a real Vercel Blob store; asserts zero lost updates.
  *
- *   bun scripts/stress.ts --writers 10 --commits 20 --mode mixed
+ *   bun scripts/stress.ts --writers 10 --commits 20 --mode mixed [--log]
  *
  * Requires BLOB_READ_WRITE_TOKEN (bun auto-loads .env.local).
  */
@@ -31,6 +31,7 @@ const config: Partial<StressConfig> = {
   maxAttempts: Number(arg("max-attempts") ?? DEFAULTS.maxAttempts),
   mode,
   cleanup: !process.argv.includes("--keep"),
+  commitLog: process.argv.includes("--log"),
 };
 
 console.log("larva commit-protocol stress test");

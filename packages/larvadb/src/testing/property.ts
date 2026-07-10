@@ -20,6 +20,8 @@ export interface PropertyConfig {
   opsPerWriter: number;
   maxAttempts: number;
   cleanup: boolean;
+  /** Run the database in format 3 (ordered commit log) instead of manifest CAS. */
+  commitLog?: boolean;
 }
 
 export const PROPERTY_DEFAULTS: PropertyConfig = {
@@ -67,7 +69,7 @@ export async function runProperty(
   const db = new LarvaProto(store, prefix);
 
   log(`run ${runId}: init db at ${prefix}`);
-  await db.init(["rows", "hot"]);
+  await db.init(["rows", "hot"], undefined, { commitLog: config.commitLog });
   const hotSeed: Row = { id: "main", rev: 0 };
   for (let w = 0; w < config.writers; w++) hotSeed[`w${w}`] = 0;
   await db.insert("hot", [hotSeed]);

@@ -76,6 +76,7 @@ const tenMinutesAgo = await db.asOf(new Date(Date.now() - 10 * 60 * 1000));
 await tenMinutesAgo.sql`SELECT COUNT(*) FROM customers`;  // peek at the past
 
 await db.rollbackTo(tenMinutesAgo.version);               // restore it
+await db.upgrade();  // optional: format 3, the ordered commit log — cheaper conflicts at scale
 ```
 
 History is kept for 7 days (or the last 50 versions, whichever is more).
@@ -100,7 +101,7 @@ Your data is never trapped. That's a promise, not a feature.
 
 > This project uses **Larva** (`larvadb`), a SQL database on Vercel Blob. Query with `db.sql` tagged templates and always interpolate values with `${...}` (parameterized automatically) — never build SQL by string concatenation. The schema is defined in `schema.ts`; use those exact table and column names.
 >
-> **Supported SQL:** SELECT (with DISTINCT) over expressions — arithmetic, || concatenation, CASE WHEN, CAST(x AS text/integer/real/boolean), scalar functions UPPER, LOWER, LENGTH, TRIM, ROUND, ABS, COALESCE, NULLIF, IFNULL, REPLACE, CEIL, FLOOR, MOD, SUBSTR, date helpers NOW()/CURRENT_TIMESTAMP, DATE(x), STRFTIME('%Y-%m', x), and JSON over text columns via JSON_EXTRACT(col, '$.a.b[0]') or col ->> 'key'; WHERE (=, !=, <, >, <=, >=, AND, OR, NOT, IN, BETWEEN, LIKE, IS NULL), ORDER BY (columns or aliases), LIMIT/OFFSET, GROUP BY over expressions or aliases (e.g. GROUP BY DATE(createdAt)) with COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT (incl. COUNT(DISTINCT col)) and HAVING, two-table INNER JOIN and LEFT JOIN on equality; INSERT (with RETURNING), including upsert via ON CONFLICT (col) DO NOTHING or DO UPDATE SET col = excluded.col where the target is the primary key or a UNIQUE column; UPDATE ... WHERE, DELETE ... WHERE, CREATE TABLE, DROP TABLE. For fast filters, compare the raw timestamp column (createdAt >= '2026-07-01') rather than wrapping it in DATE().
+> **Supported SQL:** SELECT (with DISTINCT) over expressions — arithmetic, || concatenation, CASE WHEN, CAST(x AS text/integer/real/boolean), scalar functions UPPER, LOWER, LENGTH, TRIM, ROUND, ABS, COALESCE, NULLIF, IFNULL, REPLACE, CEIL, FLOOR, MOD, SUBSTR, date helpers NOW()/CURRENT_TIMESTAMP, DATE(x), STRFTIME('%Y-%m', x), and JSON over text columns via JSON_EXTRACT(col, '$.a.b[0]') or col ->> 'key'; WHERE (=, !=, <, >, <=, >=, AND, OR, NOT, IN, BETWEEN, LIKE, IS NULL), ORDER BY (columns or aliases), LIMIT/OFFSET, GROUP BY over expressions or aliases (e.g. GROUP BY DATE(createdAt)) with COUNT/SUM/AVG/MIN/MAX/GROUP_CONCAT (incl. COUNT(DISTINCT col)) and HAVING, two-table INNER JOIN and LEFT JOIN on equality; INSERT (with RETURNING), including upsert via ON CONFLICT (col) DO NOTHING or DO UPDATE SET col = excluded.col where the target is the primary key, a UNIQUE column, or a declared composite unique (ON CONFLICT (userId, feature) ...); UPDATE ... WHERE, DELETE ... WHERE, CREATE TABLE, DROP TABLE. For fast filters, compare the raw timestamp column (createdAt >= '2026-07-01') rather than wrapping it in DATE().
 >
 > **Not supported (do not emit):** subqueries, window functions, UNION, self-joins, 3+ table joins, ALTER TABLE, views, triggers, nested aggregates. If a query needs these, fetch the data and compute in TypeScript instead — tables here are small.
 >

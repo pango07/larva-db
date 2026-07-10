@@ -51,6 +51,10 @@ export interface LarvaOptions {
   prefix?: string;
   /** Storage backend. Defaults to Vercel Blob via BLOB_READ_WRITE_TOKEN. */
   store?: StorageAdapter;
+  /** Create NEW databases in format 3 (the ordered commit log — cheaper
+   * conflicts, higher cross-process throughput). Existing databases are
+   * never changed by this flag; flip them explicitly with db.upgrade(). */
+  commitLog?: boolean;
 }
 
 /** A pinned read-only view of a past database version (Design §9). */
@@ -111,7 +115,7 @@ export class LarvaDb {
     } catch {
       // No manifest yet: create the database from the code-first schema.
       try {
-        await this.proto.init(Object.keys(code ?? {}), code);
+        await this.proto.init(Object.keys(code ?? {}), code, { commitLog: this.opts.commitLog });
       } catch (err) {
         if (!(err instanceof CasConflictError)) throw err; // lost the init race — someone else created it
       }
@@ -369,11 +373,45 @@ export class LarvaDb {
       }
     }
 
+    // Format 3: log entries are history too. An entry is needed while it is
+    // inside the retention window OR still required to replay from the oldest
+    // retained checkpoint (reconstruction has no other path to those versions).
+    const logPrefix = `${prefix}log/`;
+    const minKeptHistory = keepVersions.size > 0 ? Math.min(...keepVersions) : 0;
+    const keepEntryVersions: number[] = [];
+    const dropLog: string[] = [];
+    for (const o of objects) {
+      if (!o.path.startsWith(logPrefix) || !o.path.endsWith(".json")) continue;
+      const version = Number(o.path.slice(logPrefix.length, -".json".length));
+      if (!Number.isInteger(version)) continue;
+      if (
+        version > snap.manifest.version - retainVersions ||
+        o.uploadedAt.getTime() >= dayCutoff ||
+        version > minKeptHistory
+      ) {
+        keepEntryVersions.push(version);
+      } else {
+        dropLog.push(o.path);
+      }
+    }
+
     const referenced = new Set<string>();
     for (const t of Object.values(snap.manifest.tables)) for (const c of t.chunks) referenced.add(c.path);
     for (const v of keepVersions) {
       const m = await this.proto.historyManifest(v);
       if (m) for (const t of Object.values(m.tables)) for (const c of t.chunks) referenced.add(c.path);
+    }
+    // Chunks introduced by retained log entries are reachable by time travel;
+    // the raw checkpoint's chunks guard the rare case where its twin history
+    // write was lost.
+    for (const v of keepEntryVersions) {
+      const e = await this.proto.readLogEntry(v);
+      if (e) for (const d of Object.values(e.tables)) if (d) for (const c of d.add) referenced.add(c.path);
+    }
+    const rawCheckpoint = await this.proto.store.get(`${prefix}manifest.json`);
+    if (rawCheckpoint) {
+      const cp = JSON.parse(rawCheckpoint.body) as Manifest;
+      for (const t of Object.values(cp.tables)) for (const c of t.chunks) referenced.add(c.path);
     }
 
     const dropChunks = objects
@@ -385,8 +423,8 @@ export class LarvaDb {
       )
       .map((o) => o.path);
 
-    await this.proto.store.del([...dropHistory, ...dropChunks]);
-    return { historyDeleted: dropHistory.length, chunksDeleted: dropChunks.length, retainedVersions: keepVersions.size };
+    await this.proto.store.del([...dropHistory, ...dropLog, ...dropChunks]);
+    return { historyDeleted: dropHistory.length + dropLog.length, chunksDeleted: dropChunks.length, retainedVersions: keepVersions.size };
   }
 
   /** Read-only snapshot of the database as of a past version or moment (Design §9). */
@@ -395,7 +433,7 @@ export class LarvaDb {
     const current = await this.proto.snapshot();
     let manifest: Manifest | null;
     if (typeof target === "number") {
-      manifest = target === current.manifest.version ? current.manifest : await this.proto.historyManifest(target);
+      manifest = target === current.manifest.version ? current.manifest : await this.proto.manifestAt(target);
       if (!manifest) {
         throw new SqlError("VERSION_NOT_FOUND", `version ${target} is not in retained history (current version: ${current.manifest.version})`);
       }
@@ -403,7 +441,7 @@ export class LarvaDb {
       const cutoff = target.toISOString();
       manifest = current.manifest.committedAt <= cutoff ? current.manifest : null;
       for (let v = current.manifest.version - 1; manifest === null && v >= 1; v--) {
-        const h = await this.proto.historyManifest(v);
+        const h = await this.proto.manifestAt(v);
         if (h && h.committedAt <= cutoff) manifest = h;
         if (!h && v < current.manifest.version - 1) break; // walked past retention
       }
@@ -414,10 +452,32 @@ export class LarvaDb {
     return new LarvaSnapshot(this.executor, { manifest, etag: "" });
   }
 
+  /**
+   * Flip this database to format 3, the ordered commit log (Design §6):
+   * cheaper conflicts and higher cross-process commit throughput. One atomic
+   * commit; one-way; clients older than the format then refuse loudly with
+   * FormatError instead of writing through the wrong protocol. Data,
+   * history, and rollback all survive the flip.
+   */
+  async upgrade(): Promise<{ version: number; formatVersion: number }> {
+    await this.ensureReady();
+    const current = await this.proto.snapshot();
+    if ((current.manifest.formatVersion ?? 1) >= 3) {
+      return { version: current.manifest.version, formatVersion: current.manifest.formatVersion };
+    }
+    const result = await this.proto.commit(async () => ({
+      apply: (m) => {
+        m.formatVersion = Math.max(m.formatVersion ?? 1, 3);
+        return m;
+      },
+    }));
+    return { version: result.version, formatVersion: 3 };
+  }
+
   /** Restore a past version. Itself a commit — non-destructive and rollbackable (Design §9). */
   async rollbackTo(version: number): Promise<{ version: number }> {
     await this.ensureReady();
-    const past = await this.proto.historyManifest(version);
+    const past = await this.proto.manifestAt(version);
     if (!past) {
       throw new SqlError("VERSION_NOT_FOUND", `version ${version} is not in retained history`);
     }

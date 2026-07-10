@@ -723,24 +723,58 @@ export class Executor {
 
   private async planInsert(stmt: InsertStmt, params: Scalar[], snap: Snapshot): Promise<PlanOutcome> {
     const schema = this.schemaOf(snap.manifest, stmt.table);
-    const incoming: Row[] = stmt.rows.map((values) => {
+    const rawRows: Row[] = stmt.rows.map((values) => {
       const raw: Row = {};
       stmt.columns.forEach((col, i) => {
         raw[col] = this.evalExpr(values[i], {}, params);
       });
-      return validateInsert(stmt.table, schema, raw);
+      return raw;
     });
 
-    const oc = stmt.onConflict;
-    const target = oc ? (oc.column ?? schema.primaryKey) : null;
-    if (oc && target) {
-      if (!(target in schema.columns)) {
-        throw new SqlError("UNKNOWN_COLUMN", `ON CONFLICT target "${target}" does not exist in table "${stmt.table}"`);
+    // Fill omitted sequence columns before validation. Claims go through the
+    // sequences blob, off the manifest hot path; on re-execution fresh values
+    // are drawn (gaps, never duplicates).
+    for (const [col, def] of Object.entries(schema.columns)) {
+      if (!def.sequence) continue;
+      const needy = rawRows.filter((r) => (r[col] ?? null) === null);
+      if (needy.length > 0) {
+        const vals = await this.proto.claimSequence(`${stmt.table}.${col}`, needy.length);
+        needy.forEach((r, i) => (r[col] = vals[i]));
       }
-      if (target !== schema.primaryKey && !schema.columns[target].unique) {
+    }
+    const incoming = rawRows.map((raw) => validateInsert(stmt.table, schema, raw));
+
+    // Uniqueness, treated uniformly: the pk, single UNIQUE columns, and
+    // declared composite constraints. A constraint's key is null when any of
+    // its columns is NULL (SQL semantics: NULLs never conflict).
+    type Constraint = { label: string; cols: string[]; isPk: boolean };
+    const constraints: Constraint[] = [
+      { label: schema.primaryKey, cols: [schema.primaryKey], isPk: true },
+      ...Object.entries(schema.columns)
+        .filter(([, c]) => c.unique)
+        .map(([n]) => ({ label: n, cols: [n], isPk: false })),
+      ...(schema.uniques ?? []).map((cols) => ({ label: `(${cols.join(", ")})`, cols, isPk: false })),
+    ];
+    const keyOf = (c: Constraint, row: Row): string | null =>
+      c.cols.some((col) => (row[col] ?? null) === null) ? null : JSON.stringify(c.cols.map((col) => row[col]));
+
+    const oc = stmt.onConflict;
+    let target: Constraint | null = null;
+    if (oc) {
+      const cols = oc.columns ?? [schema.primaryKey];
+      for (const c of cols) {
+        if (!(c in schema.columns)) {
+          throw new SqlError("UNKNOWN_COLUMN", `ON CONFLICT target "${c}" does not exist in table "${stmt.table}"`);
+        }
+      }
+      const setKey = (list: string[]) => [...list].sort().join(" ");
+      target = constraints.find((c) => setKey(c.cols) === setKey(cols)) ?? null;
+      if (!target) {
         throw new SqlError(
           "INVALID_CONFLICT_TARGET",
-          `ON CONFLICT target "${target}" must be the primary key or a UNIQUE column — conflicts are only detectable where uniqueness is enforced`,
+          cols.length === 1
+            ? `ON CONFLICT target "${cols[0]}" must be the primary key or a UNIQUE column — conflicts are only detectable where uniqueness is enforced`
+            : `ON CONFLICT (${cols.join(", ")}) must match a composite unique constraint declared in defineSchema's uniques option`,
         );
       }
     }
@@ -748,10 +782,9 @@ export class Executor {
     // Conflict detection against the snapshot (pruned lookup). Note:
     // snapshot-isolated — two concurrent inserts of the same pk are write
     // skew (Design §6) and not detected; ULID defaults make this moot.
-    const uniqueCols = Object.entries(schema.columns).filter(([, c]) => c.unique).map(([n]) => n);
     const pks = incoming.map((r) => r[schema.primaryKey]);
     const candidates = (snap.manifest.tables[stmt.table]?.chunks ?? []).filter((ref) => {
-      if (!ref.stats || uniqueCols.length > 0) return true; // unique columns force full scan
+      if (!ref.stats || constraints.length > 1) return true; // unique constraints force full scan
       return pks.some((pk) => cmpScalar(ref.stats!.pkMin, pk) <= 0 && cmpScalar(ref.stats!.pkMax, pk) >= 0);
     });
     const loaded = await Promise.all(
@@ -762,13 +795,12 @@ export class Executor {
     // previous ones (SQLite upsert semantics): a row can conflict with an
     // earlier row of the same INSERT.
     type Loc = { kind: "chunk"; chunk: number; idx: number } | { kind: "pending"; idx: number };
-    const pkMap = new Map<Scalar, Loc>();
-    const uniqMaps = new Map<string, Map<Scalar, Loc>>(uniqueCols.map((c) => [c, new Map()]));
+    const maps = new Map<string, Map<string, Loc>>(constraints.map((c) => [c.label, new Map()]));
     loaded.forEach((c, ci) =>
       c.rows.forEach((row, ri) => {
-        pkMap.set(row[schema.primaryKey], { kind: "chunk", chunk: ci, idx: ri });
-        for (const u of uniqueCols) {
-          if (row[u] !== null) uniqMaps.get(u)!.set(row[u], { kind: "chunk", chunk: ci, idx: ri });
+        for (const con of constraints) {
+          const k = keyOf(con, row);
+          if (k !== null) maps.get(con.label)!.set(k, { kind: "chunk", chunk: ci, idx: ri });
         }
       }),
     );
@@ -786,32 +818,31 @@ export class Executor {
     };
 
     for (const row of incoming) {
-      let conflictCol: string | null = null;
-      let loc = pkMap.get(row[schema.primaryKey]);
-      if (loc) conflictCol = schema.primaryKey;
-      else {
-        for (const u of uniqueCols) {
-          const l = row[u] !== null ? uniqMaps.get(u)!.get(row[u]) : undefined;
-          if (l) {
-            conflictCol = u;
-            loc = l;
-            break;
-          }
+      let hit: { con: Constraint; loc: Loc } | null = null;
+      for (const con of constraints) {
+        const k = keyOf(con, row);
+        const l = k !== null ? maps.get(con.label)!.get(k) : undefined;
+        if (l) {
+          hit = { con, loc: l };
+          break;
         }
       }
 
-      if (!conflictCol || !loc) {
+      if (!hit) {
         const ploc: Loc = { kind: "pending", idx: pending.length };
         pending.push(row);
-        pkMap.set(row[schema.primaryKey], ploc);
-        for (const u of uniqueCols) if (row[u] !== null) uniqMaps.get(u)!.set(row[u], ploc);
+        for (const con of constraints) {
+          const k = keyOf(con, row);
+          if (k !== null) maps.get(con.label)!.set(k, ploc);
+        }
         resultRows.push(row);
         continue;
       }
+      const loc = hit.loc;
 
-      if (!oc || conflictCol !== target) {
-        const hint = oc ? `; the ON CONFLICT target is "${target}", which does not cover this conflict` : "";
-        if (conflictCol === schema.primaryKey) {
+      if (!oc || !target || hit.con.label !== target.label) {
+        const hint = oc && target ? `; the ON CONFLICT target is "${target.label}", which does not cover this conflict` : "";
+        if (hit.con.isPk) {
           throw new SqlError(
             "PRIMARY_KEY_CONFLICT",
             loc.kind === "pending"
@@ -819,9 +850,12 @@ export class Executor {
               : `primary key ${JSON.stringify(row[schema.primaryKey])} already exists in "${stmt.table}"${hint}`,
           );
         }
+        const vals = hit.con.cols.map((c) => JSON.stringify(row[c])).join(", ");
         throw new SqlError(
           "UNIQUE_CONFLICT",
-          `value ${JSON.stringify(row[conflictCol])} already exists in unique column "${stmt.table}.${conflictCol}"${hint}`,
+          hit.con.cols.length === 1
+            ? `value ${vals} already exists in unique column "${stmt.table}.${hit.con.label}"${hint}`
+            : `values (${vals}) already exist for unique constraint ${hit.con.label} on "${stmt.table}"${hint}`,
         );
       }
 
@@ -854,14 +888,22 @@ export class Executor {
       if (invalid) {
         throw new SqlError("TYPE_MISMATCH", `column "${stmt.table}.${invalid[0]}" is ${invalid[1].type}, got ${JSON.stringify(next[invalid[0]])}`);
       }
-      for (const u of uniqueCols) {
-        if (existing[u] === next[u]) continue;
-        if (existing[u] !== null) uniqMaps.get(u)!.delete(existing[u]);
-        if (next[u] !== null) {
-          if (uniqMaps.get(u)!.has(next[u])) {
-            throw new SqlError("UNIQUE_CONFLICT", `ON CONFLICT DO UPDATE would duplicate value ${JSON.stringify(next[u])} in unique column "${stmt.table}.${u}"`);
+      for (const con of constraints) {
+        if (con.isPk) continue; // pk updates are rejected above
+        const oldK = keyOf(con, existing);
+        const newK = keyOf(con, next);
+        if (oldK === newK) continue;
+        if (oldK !== null) maps.get(con.label)!.delete(oldK);
+        if (newK !== null) {
+          if (maps.get(con.label)!.has(newK)) {
+            throw new SqlError(
+              "UNIQUE_CONFLICT",
+              con.cols.length === 1
+                ? `ON CONFLICT DO UPDATE would duplicate value ${JSON.stringify(next[con.cols[0]])} in unique column "${stmt.table}.${con.label}"`
+                : `ON CONFLICT DO UPDATE would duplicate unique constraint ${con.label} on "${stmt.table}"`,
+            );
           }
-          uniqMaps.get(u)!.set(next[u], loc);
+          maps.get(con.label)!.set(newK, loc);
         }
       }
       setRow(loc, next);

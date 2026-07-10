@@ -90,15 +90,16 @@ const percentile = (xs: number[], p: number): number => {
   return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
 };
 
-async function scenario(label: string, instances: number, mode: "mixed" | "counter"): Promise<void> {
+async function scenario(label: string, instances: number, mode: "mixed" | "counter", commitLog = false): Promise<void> {
   const prefix = `bench/${ulid()}/`;
-  const dbs: LarvaDb[] = Array.from({ length: instances }, () => larva({ schema, prefix, store }));
+  const dbs: LarvaDb[] = Array.from({ length: instances }, () => larva({ schema, prefix, store, commitLog }));
   await dbs[0].sql`INSERT INTO counters (id, value) VALUES (${"main"}, ${0})`;
   const versionBefore = await dbs[0].currentVersion();
 
   const latencies: number[] = [];
   let increments = 0;
   let inserts = 0;
+  let failedLoudly = 0; // ConflictError after exhausting retries — counted, never silent
   const started = performance.now();
   await Promise.all(
     Array.from({ length: WRITERS }, (_, w) => {
@@ -107,12 +108,16 @@ async function scenario(label: string, instances: number, mode: "mixed" | "count
       return (async () => {
         for (let seq = 0; seq < OPS; seq++) {
           const t0 = performance.now();
-          if (isAppend) {
-            await db.sql`INSERT INTO events (writer, seq) VALUES (${w}, ${seq})`;
-            inserts++;
-          } else {
-            await db.sql`UPDATE counters SET value = value + 1 WHERE id = ${"main"}`;
-            increments++;
+          try {
+            if (isAppend) {
+              await db.sql`INSERT INTO events (writer, seq) VALUES (${w}, ${seq})`;
+              inserts++;
+            } else {
+              await db.sql`UPDATE counters SET value = value + 1 WHERE id = ${"main"}`;
+              increments++;
+            }
+          } catch {
+            failedLoudly++;
           }
           latencies.push(performance.now() - t0);
         }
@@ -129,7 +134,8 @@ async function scenario(label: string, instances: number, mode: "mixed" | "count
   console.log(
     `${label.padEnd(42)} ${((WRITERS * OPS) / (durationMs / 1000)).toFixed(2).padStart(7)} ops/s  ` +
       `p50 ${percentile(latencies, 50).toFixed(0).padStart(5)}ms  p95 ${percentile(latencies, 95).toFixed(0).padStart(6)}ms  ` +
-      `CAS swaps ${String(versionAfter - versionBefore).padStart(4)}/${WRITERS * OPS} ops  verify ${verify}`,
+      `CAS swaps ${String(versionAfter - versionBefore).padStart(4)}/${WRITERS * OPS} ops  verify ${verify}` +
+      (failedLoudly > 0 ? `  (${failedLoudly} failed loudly)` : ""),
   );
 }
 
@@ -139,5 +145,12 @@ await scenario(`mixed    2 instances`, 2, "mixed");
 await scenario(`mixed    1 instance  (full coalescing)`, 1, "mixed");
 await scenario(`counter  ${WRITERS} instances (no coalescing)`, WRITERS, "counter");
 await scenario(`counter  1 instance  (full coalescing)`, 1, "counter");
+
+console.log("\n--- format 3: ordered commit log (same workloads) ---\n");
+await scenario(`LOG mixed    ${WRITERS} instances`, WRITERS, "mixed", true);
+await scenario(`LOG mixed    2 instances`, 2, "mixed", true);
+await scenario(`LOG mixed    1 instance`, 1, "mixed", true);
+await scenario(`LOG counter  ${WRITERS} instances`, WRITERS, "counter", true);
+await scenario(`LOG counter  1 instance`, 1, "counter", true);
 
 server.stop();

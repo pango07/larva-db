@@ -72,6 +72,26 @@ await db.sql`INSERT INTO counters (slug, count) VALUES (${"visits"}, ${1})
              ON CONFLICT (slug) DO UPDATE SET count = count + ${1}`;
 ```
 
+### Sequences & composite uniques
+
+Invoice numbers without running a server: `t.sequence()` auto-assigns integers that are unique across concurrent processes (drawn from CAS-claimed ranges, gappy on crash — exactly a Postgres sequence). Composite uniques guard pairs, and work as upsert targets:
+
+```ts
+const schema = defineSchema(
+  {
+    invoices: { number: t.sequence().primaryKey(), customer: t.text() },
+    grants: { id: t.text().primaryKey(), userId: t.text(), feature: t.text(), level: t.integer() },
+  },
+  { uniques: { grants: [["userId", "feature"]] } },
+);
+
+await db.sql`INSERT INTO invoices (customer) VALUES (${"ada"}) RETURNING number`;
+// → [{ number: 42 }]   — omit the column, read it back
+
+await db.sql`INSERT INTO grants (userId, feature, level) VALUES (${"u1"}, ${"exports"}, ${2})
+             ON CONFLICT (userId, feature) DO UPDATE SET level = excluded.level`;
+```
+
 ### Transactions — several statements, one atomic commit
 
 ```ts
@@ -129,6 +149,15 @@ type Customer = InferRow<typeof schema, "customers">;
 // { id: string; name: string | null; email: string | null; createdAt: string | null }
 
 const rows = await db.sql<Customer>`SELECT * FROM customers`;
+```
+
+### More write headroom — the commit log
+
+Format 3 changes how commits land: instead of re-uploading the whole manifest per commit, each commit is a tiny immutable delta in an ordered log, and the manifest becomes a periodic checkpoint. Conflicts get cheap (losing a race costs one small read, not a manifest round-trip), write cost stops scaling with database size, and contention tails shrink — same guarantees, verified by the same stress/property gauntlet. One-way, explicit, and old clients refuse loudly instead of corrupting:
+
+```ts
+await db.upgrade();                      // flip an existing database
+const db2 = larva({ schema, commitLog: true }); // or start new ones there
 ```
 
 ### Any S3-compatible store
@@ -214,7 +243,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## Tested where it matters
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **158 checks across six suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **194 checks across six suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
 
 The stress and property harnesses ship in the package for testing your own setup:
 

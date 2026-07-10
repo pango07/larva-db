@@ -180,6 +180,24 @@ try {
 await db.rollbackTo(vNow - 1);
 ok("rollback to a retained version works after vacuum", (await db.currentVersion()) === vNow + 1);
 
+// --- format 3 (ordered commit log) against the real store ---
+const logDb = larva({ schema, prefix: `${prefix}log/db/`, commitLog: true });
+await logDb.transaction(async (tx) => {
+  await tx.sql`INSERT INTO inventory (sku, count) VALUES (${"sprocket"}, ${5})`;
+  await tx.sql`INSERT INTO orders (sku, qty) VALUES (${"sprocket"}, ${1})`;
+});
+ok("log mode: transaction commits atomically on the real store", (await logDb.sql`SELECT COUNT(*) AS n FROM orders`)[0].n === 1);
+const logV = await logDb.currentVersion();
+for (let i = 0; i < 10; i++) await logDb.sql`UPDATE inventory SET count = count + 1 WHERE sku = ${"sprocket"}`;
+ok("log mode: 10 commits apply exactly", (await logDb.sql`SELECT count FROM inventory WHERE sku = ${"sprocket"}`)[0].count === 15);
+const logPast = await logDb.asOf(logV + 4);
+ok("log mode: asOf reaches a non-checkpoint version", (await logPast.sql`SELECT count FROM inventory WHERE sku = ${"sprocket"}`)[0].count === 9);
+await logDb.rollbackTo(logV + 4);
+ok("log mode: rollback to a mid-log version", (await logDb.sql`SELECT count FROM inventory WHERE sku = ${"sprocket"}`)[0].count === 9);
+const logReport = await logDb.vacuum({ retainVersions: 5, retainDays: 0, graceMinutes: 0 });
+ok("log mode: vacuum drops old log entries", logReport.historyDeleted > 0, JSON.stringify(logReport));
+ok("log mode: reads survive vacuum", (await logDb.sql`SELECT COUNT(*) AS n FROM inventory`)[0].n === 1);
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed === 0) await db.destroy();
 else console.log(`keeping ${prefix} for inspection`);
