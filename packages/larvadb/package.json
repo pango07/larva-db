@@ -1,6 +1,6 @@
 {
   "name": "@larva-db/core",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "A tiny SQL database that lives inside your Vercel Blob store. Real SQL, atomic transactions, time travel, and a guaranteed exit path when you outgrow it.",
   "license": "MIT",
   "type": "module",
@@ -12,7 +12,16 @@
     "url": "git+https://github.com/pango07/larva-db.git",
     "directory": "packages/larvadb"
   },
-  "keywords": ["database", "sql", "vercel", "blob", "serverless", "sqlite", "s3", "r2"],
+  "keywords": [
+    "database",
+    "sql",
+    "vercel",
+    "blob",
+    "serverless",
+    "sqlite",
+    "s3",
+    "r2"
+  ],
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
@@ -23,8 +32,13 @@
       "default": "./dist/testing.js"
     }
   },
-  "bin": { "larva": "./dist/cli.js" },
-  "files": ["dist", "README.md"],
+  "bin": {
+    "larva": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "rm -rf dist && bun build src/index.ts --outfile dist/index.js --target node --format esm --external '@vercel/blob' && bun build src/testing/index.ts --outfile dist/testing.js --target node --format esm --external '@vercel/blob' && bun build src/cli.ts --outfile dist/cli.js --target node --format esm --external '@vercel/blob' --banner '#!/usr/bin/env node' && tsc -p tsconfig.build.json",
     "prepublishOnly": "bun run build"

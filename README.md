@@ -6,11 +6,11 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-240_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-275_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Current release: 2.4.0.** Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Current release: 2.5.0.** Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -216,8 +216,8 @@ The short version of what it teaches:
 Errors are machine-readable on purpose — agents self-correct from specific messages:
 
 ```
-UNSUPPORTED_FEATURE: subqueries are not supported in Larva v1 (found one in IN);
-run the inner query first and interpolate its result
+UNSUPPORTED_FEATURE: window functions are not supported in Larva v1;
+compute windows in application code — tables at this scale fit in memory
 ```
 
 ## Who it's for — and honest limits
@@ -234,13 +234,13 @@ When you get there, congratulations: run the export and graduate — `psql $DATA
 
 ## SQL dialect
 
-Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, `CAST`, scalar functions (`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ROUND`, `ABS`, `COALESCE`, `NULLIF`, `IFNULL`, `REPLACE`, `CEIL`, `FLOOR`, `MOD`, `SUBSTR`), date helpers (`NOW()`/`CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` — timestamps are ISO text, so this is cheap and range filters stay prunable), and JSON over text columns (`JSON_EXTRACT(col, '$.a[0]')`, `->>`); `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` over expressions or aliases (`GROUP BY DATE(createdAt)`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`GROUP_CONCAT` (incl. `COUNT(DISTINCT …)`) and `HAVING`, two-table `INNER`/`LEFT JOIN`; `INSERT` (multi-row, `RETURNING`) with `ON CONFLICT` upsert — single-column or composite targets; `UPDATE`/`DELETE ... WHERE`; `CREATE`/`DROP TABLE`.
+Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, `CAST`, scalar functions (`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ROUND`, `ABS`, `COALESCE`, `NULLIF`, `IFNULL`, `REPLACE`, `CEIL`, `FLOOR`, `MOD`, `SUBSTR`), date helpers (`NOW()`/`CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` — timestamps are ISO text, so this is cheap and range filters stay prunable), and JSON over text columns (`JSON_EXTRACT(col, '$.a[0]')`, `->>`); `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` over expressions or aliases (`GROUP BY DATE(createdAt)`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`GROUP_CONCAT` (incl. `COUNT(DISTINCT …)`) and `HAVING`, `INNER`/`LEFT JOIN` across any number of tables including self-joins; uncorrelated subqueries (`WHERE id IN (SELECT …)`, scalar comparisons); `INSERT` (multi-row, `RETURNING`) with `ON CONFLICT` upsert — single-column or composite targets; `UPDATE`/`DELETE ... WHERE`; `CREATE`/`DROP TABLE`; additive `ALTER TABLE … ADD COLUMN` (existing rows read the new column as `NULL` — and with a code-first schema, adding a plain column to `defineSchema` auto-migrates at connect).
 
-Not supported: subqueries, window functions, `UNION`, self-joins, 3+ table joins, `ALTER TABLE`, views, triggers. Every exclusion is rejected **by name, with an alternative**, and near-miss spellings are redirected (`CONCAT` → `||`, `SUBSTRING` → `SUBSTR`, `DATE_TRUNC` → `DATE`/`STRFTIME`).
+Not supported: correlated subqueries, derived tables, window functions, `UNION`, `RIGHT`/`FULL`/`CROSS` joins, `DROP COLUMN`/`RENAME`, views, triggers. Every exclusion is rejected **by name, with an alternative**, and near-miss spellings are redirected (`CONCAT` → `||`, `SUBSTRING` → `SUBSTR`, `DATE_TRUNC` → `DATE`/`STRFTIME`).
 
 `UPDATE`/`DELETE` without a `WHERE` clause requires an explicit `{ allowFullTable: true }` — the most common catastrophic agent mistake becomes a specific error instead.
 
-The bar for adding to the dialect, recorded in [LARVA-DESIGN.md](LARVA-DESIGN.md) §7: agents writing conservative SQL emit it routinely, **and** it executes within the existing engine shape. Subqueries never will; `HAVING` and upsert cleared it.
+The bar for adding to the dialect, recorded in [LARVA-DESIGN.md](LARVA-DESIGN.md) §7: agents writing conservative SQL emit it routinely, **and** it executes within the existing engine shape. `HAVING` and upsert cleared it first; uncorrelated subqueries, 3+ table joins, and additive `ALTER TABLE` cleared it in 2.5. Correlated subqueries and window functions change the engine shape, so they stay out.
 
 ## How it works
 
@@ -268,7 +268,7 @@ The editable source for these lives at [docs/larva-architecture.excalidraw](docs
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **240 checks across seven suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **275 checks across seven suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|
@@ -329,7 +329,7 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, 
 - New SQL features need three things: parser + executor + a named, helpful rejection message for whatever adjacent thing is still unsupported.
 - Keep `LARVA-DESIGN.md` in sync — it's the spec of record, and it documents *why*, not just *what*.
 
-**Good first issues**: additional storage adapters (Azure Blob, GCS — the contract is four operations, ~200 lines), columnar chunk format, secondary index blobs, `ALTER TABLE` with a time-travel-safe migration story.
+**Good first issues**: additional storage adapters (Azure Blob, GCS — the contract is four operations, ~200 lines), columnar chunk format, secondary index blobs, `DROP COLUMN`/`RENAME` with a time-travel-safe migration story.
 
 ## License
 

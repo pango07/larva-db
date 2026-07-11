@@ -446,6 +446,21 @@ const schema = defineSchema({
   await dbA.sql`INSERT INTO events (id, kind, at) VALUES (${"explicit-1"}, ${"import"}, ${"2026-07-10T00:00:00Z"})`;
   ok("explicit-pk INSERT takes the ordered path, not the queue", ![...objects.keys()].some((k) => k.startsWith("f4-append/queue/")));
 
+  // A subquery in VALUES reads database state — not client-determined, so it
+  // takes the ordered path too (only there does plan-time resolution run).
+  const [sq] = await dbA.sql`INSERT INTO events (kind, at) VALUES ((SELECT kind FROM events WHERE id = ${"explicit-1"}), ${"2026-07-10T02:00:00Z"}) RETURNING kind`;
+  ok(
+    "subquery INSERT takes the ordered path and resolves",
+    sq.kind === "import" && ![...objects.keys()].some((k) => k.startsWith("f4-append/queue/")),
+    JSON.stringify(sq),
+  );
+
+  // A column added by runtime SQL ALTER is unknown to the code schema, so the
+  // insert must skip tier A and validate against the live manifest schema.
+  await dbA.sql`ALTER TABLE events ADD COLUMN src text`;
+  const [withSrc] = await dbA.sql`INSERT INTO events (kind, at, src) VALUES (${"webhook"}, ${"2026-07-10T03:00:00Z"}, ${"stripe"}) RETURNING src`;
+  ok("INSERT into a SQL-ALTERed column bypasses tier A and succeeds", withSrc.src === "stripe", JSON.stringify(withSrc));
+
   // Sequences stay unique across instances even when both sides append.
   const N = 10;
   await Promise.all(

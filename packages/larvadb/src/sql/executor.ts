@@ -1,5 +1,5 @@
 import { ChunkRef, cmpScalar, CommitStats, LarvaProto, Manifest, Row, Scalar, Snapshot } from "../core";
-import { DatabaseSchema, TableSchema, validateInsert } from "../schema";
+import { DatabaseSchema, fillAbsentColumns, TableSchema, validateInsert } from "../schema";
 import {
   Aggregate,
   CastType,
@@ -8,6 +8,7 @@ import {
   DeleteStmt,
   Expr,
   hasAggregate,
+  hasSubquery,
   InsertStmt,
   mapColumnRefs,
   SelectItem,
@@ -19,6 +20,13 @@ import {
 import { SqlError } from "./errors";
 
 const CHUNK_TARGET_ROWS = 1000;
+
+/** SQL type names (and common aliases) → Larva column types. */
+const COLUMN_TYPES: Record<string, TableSchema["columns"][string]["type"]> = {
+  text: "text", varchar: "text", integer: "integer", int: "integer", real: "real",
+  float: "real", double: "real", boolean: "boolean", bool: "boolean",
+  timestamp: "timestamp", datetime: "timestamp",
+};
 
 export interface ExecOptions {
   allowFullTable?: boolean;
@@ -94,7 +102,10 @@ export class Executor {
     return plan.rows;
   }
 
-  private plan(stmt: Statement, params: Scalar[], opts: ExecOptions, snap: Snapshot): Promise<PlanOutcome> {
+  private async plan(stmt: Statement, params: Scalar[], opts: ExecOptions, snap: Snapshot): Promise<PlanOutcome> {
+    // Subqueries in writes resolve against the same snapshot the plan uses, so
+    // a commit retry that re-plans also re-evaluates them on the fresh state.
+    if (this.statementHasSubquery(stmt)) stmt = await this.resolveSubqueries(stmt, params, snap);
     switch (stmt.kind) {
       case "select":
         throw new SqlError("PARSE_ERROR", "SELECT has no write plan"); // unreachable
@@ -108,6 +119,8 @@ export class Executor {
         return this.planCreate(stmt, snap);
       case "drop":
         return this.planDrop(stmt.table, snap);
+      case "alter":
+        return this.planAlter(stmt, snap);
     }
   }
 
@@ -122,40 +135,60 @@ export class Executor {
   }
 
   private async select(stmt: SelectStmt, params: Scalar[], snap: Snapshot, overlay?: Record<string, Row[]>): Promise<Row[]> {
+    if (this.statementHasSubquery(stmt)) {
+      stmt = (await this.resolveSubqueries(stmt, params, snap, overlay)) as SelectStmt;
+    }
     const fromName = stmt.from.alias ?? stmt.from.table;
     const fromSchema = this.schemaOf(snap.manifest, stmt.from.table);
     const leftChunks = await this.fetchTable(snap, stmt.from.table, fromSchema, stmt.where, fromName, params);
     const leftRows = this.withOverlay(leftChunks.flatMap((c) => c.rows), overlay?.[stmt.from.table], fromSchema);
     const realCols = new Set(Object.keys(fromSchema.columns));
 
-    let contexts: Ctx[];
-    if (stmt.join) {
-      const joinName = stmt.join.table.alias ?? stmt.join.table.table;
-      const joinSchema = this.schemaOf(snap.manifest, stmt.join.table.table);
+    // Left-deep hash joins, in statement order: each JOIN's ON compares a
+    // column of the joined table against a column of any table already in
+    // scope. Self-joins are ordinary — the parser guarantees distinct names.
+    const scopes: { name: string; schema: TableSchema }[] = [{ name: fromName, schema: fromSchema }];
+    let contexts: Ctx[] = leftRows.map((r) => ({ [fromName]: r }));
+    for (const join of stmt.joins ?? []) {
+      const joinName = join.table.alias ?? join.table.table;
+      const joinSchema = this.schemaOf(snap.manifest, join.table.table);
       Object.keys(joinSchema.columns).forEach((c) => realCols.add(c));
       const rightRows = this.withOverlay(
-        (await this.fetchTable(snap, stmt.join.table.table, joinSchema, undefined, joinName, params)).flatMap((c) => c.rows),
-        overlay?.[stmt.join.table.table],
+        (await this.fetchTable(snap, join.table.table, joinSchema, undefined, joinName, params)).flatMap((c) => c.rows),
+        overlay?.[join.table.table],
         joinSchema,
       );
 
-      // Resolve which side of ON belongs to which table.
-      const sideOf = (col: ColumnRef): "from" | "join" => {
-        if (col.table === fromName) return "from";
-        if (col.table === joinName) return "join";
-        if (!col.table) {
-          const inFrom = col.name in fromSchema.columns;
-          const inJoin = col.name in joinSchema.columns;
-          if (inFrom && inJoin) throw new SqlError("AMBIGUOUS_COLUMN", `"${col.name}" exists in both joined tables; qualify it`);
-          if (inFrom) return "from";
-          if (inJoin) return "join";
+      // Resolve each side of ON to the joined table or a table already in scope.
+      const resolve = (col: ColumnRef): { name: string; isJoined: boolean } => {
+        if (col.table === joinName) return { name: joinName, isJoined: true };
+        if (col.table) {
+          const prior = scopes.find((s) => s.name === col.table);
+          if (prior) return { name: prior.name, isJoined: false };
+          throw new SqlError(
+            "UNKNOWN_TABLE",
+            `JOIN condition references "${col.table}", which is not in scope (tables: ${[...scopes.map((s) => s.name), joinName].join(", ")})`,
+          );
         }
-        throw new SqlError("UNKNOWN_COLUMN", `JOIN condition references unknown column "${col.table ?? ""}${col.table ? "." : ""}${col.name}"`);
+        const inJoined = col.name in joinSchema.columns;
+        const priors = scopes.filter((s) => col.name in s.schema.columns);
+        if (inJoined && priors.length === 0) return { name: joinName, isJoined: true };
+        if (!inJoined && priors.length === 1) return { name: priors[0].name, isJoined: false };
+        if (!inJoined && priors.length === 0) {
+          throw new SqlError("UNKNOWN_COLUMN", `JOIN condition references unknown column "${col.name}"`);
+        }
+        throw new SqlError("AMBIGUOUS_COLUMN", `"${col.name}" exists in more than one joined table; qualify it`);
       };
-      const [fromKey, joinKey] =
-        sideOf(stmt.join.leftCol) === "from"
-          ? [stmt.join.leftCol.name, stmt.join.rightCol.name]
-          : [stmt.join.rightCol.name, stmt.join.leftCol.name];
+      const left = resolve(join.leftCol);
+      const right = resolve(join.rightCol);
+      if (left.isJoined === right.isJoined) {
+        throw new SqlError(
+          "INVALID_JOIN_CONDITION",
+          `JOIN ${joinName} … ON must compare a column of "${joinName}" with a column of an earlier table`,
+        );
+      }
+      const joinKey = (left.isJoined ? join.leftCol : join.rightCol).name;
+      const prior = left.isJoined ? { name: right.name, col: join.rightCol.name } : { name: left.name, col: join.leftCol.name };
 
       const index = new Map<Scalar, Row[]>();
       for (const r of rightRows) {
@@ -163,13 +196,13 @@ export class Executor {
         index.set(k, [...(index.get(k) ?? []), r]);
       }
       const nullRight: Row = Object.fromEntries(Object.keys(joinSchema.columns).map((c) => [c, null]));
-      contexts = leftRows.flatMap((l) => {
-        const matches = l[fromKey] === null ? [] : (index.get(l[fromKey]) ?? []);
-        if (matches.length > 0) return matches.map((r) => ({ [fromName]: l, [joinName]: r }));
-        return stmt.join?.type === "left" ? [{ [fromName]: l, [joinName]: nullRight }] : [];
+      contexts = contexts.flatMap((ctx) => {
+        const v = ctx[prior.name][prior.col];
+        const matches = v === null ? [] : (index.get(v) ?? []);
+        if (matches.length > 0) return matches.map((r) => ({ ...ctx, [joinName]: r }));
+        return join.type === "left" ? [{ ...ctx, [joinName]: nullRight }] : [];
       });
-    } else {
-      contexts = leftRows.map((r) => ({ [fromName]: r }));
+      scopes.push({ name: joinName, schema: joinSchema });
     }
 
     if (stmt.where) {
@@ -225,6 +258,177 @@ export class Executor {
     const limit = stmt.limit !== undefined ? this.intOf(stmt.limit, params, "LIMIT") : undefined;
     const offset = stmt.offset !== undefined ? this.intOf(stmt.offset, params, "OFFSET") : 0;
     return output.slice(offset, limit !== undefined ? offset + limit : undefined);
+  }
+
+  // ---------- uncorrelated subqueries (Design §7) ----------
+
+  /** Any subquery node in the statement's expressions? (RETURNING is excluded:
+   * it accepts plain columns only and rejects anything else on its own.) */
+  private statementHasSubquery(stmt: Statement): boolean {
+    switch (stmt.kind) {
+      case "select":
+        return (
+          (stmt.items ?? []).some((i) => hasSubquery(i.expr)) ||
+          (stmt.where !== undefined && hasSubquery(stmt.where)) ||
+          (stmt.having !== undefined && hasSubquery(stmt.having)) ||
+          (stmt.groupBy ?? []).some(hasSubquery) ||
+          (stmt.limit !== undefined && hasSubquery(stmt.limit)) ||
+          (stmt.offset !== undefined && hasSubquery(stmt.offset))
+        );
+      case "insert":
+        return (
+          stmt.rows.some((r) => r.some(hasSubquery)) ||
+          (stmt.onConflict !== undefined &&
+            stmt.onConflict.action !== "nothing" &&
+            stmt.onConflict.action.set.some((s) => hasSubquery(s.value)))
+        );
+      case "update":
+        return stmt.set.some((s) => hasSubquery(s.value)) || (stmt.where !== undefined && hasSubquery(stmt.where));
+      case "delete":
+        return stmt.where !== undefined && hasSubquery(stmt.where);
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Inner-query-first evaluation, exactly as Design §7 planned it: each
+   * subquery executes against the same snapshot as the outer statement, and
+   * its node is rewritten into plain literals before the outer plan runs.
+   * Rewriting (not late binding) is what lets IN lists participate in
+   * zone-map pruning — and it never mutates the parsed AST, so a re-planned
+   * commit re-evaluates subqueries on the fresh snapshot.
+   */
+  private async resolveSubqueries(
+    stmt: Statement,
+    params: Scalar[],
+    snap: Snapshot,
+    overlay?: Record<string, Row[]>,
+  ): Promise<Statement> {
+    const run = async (query: SelectStmt, where: string): Promise<Scalar[]> => {
+      let rows: Row[];
+      try {
+        rows = await this.select(query, params, snap, overlay);
+      } catch (err) {
+        if (err instanceof SqlError && ["UNKNOWN_TABLE", "UNKNOWN_COLUMN", "AMBIGUOUS_COLUMN"].includes(err.code)) {
+          throw new SqlError(
+            err.code,
+            `${err.message} — thrown inside a subquery, which cannot see the outer query's tables (correlated subqueries are not supported; use a JOIN instead)`,
+          );
+        }
+        throw err;
+      }
+      if (query.items && query.items.length !== 1) {
+        throw new SqlError("SUBQUERY_SHAPE", `a subquery used ${where} must select exactly one column; this one selects ${query.items.length}`);
+      }
+      return rows.map((r) => {
+        const keys = Object.keys(r);
+        if (keys.length !== 1) {
+          throw new SqlError("SUBQUERY_SHAPE", `a subquery used ${where} must select exactly one column; this one returns ${keys.length}`);
+        }
+        return r[keys[0]];
+      });
+    };
+
+    const rewrite = async (e: Expr): Promise<Expr> => {
+      switch (e.kind) {
+        case "subquery": {
+          const vals = await run(e.query, "as a value");
+          if (vals.length > 1) {
+            throw new SqlError(
+              "SUBQUERY_MULTIPLE_ROWS",
+              `a scalar subquery returned ${vals.length} rows; use IN (SELECT …) for set membership, or make the subquery yield one row (LIMIT 1 or an aggregate)`,
+            );
+          }
+          return { kind: "literal", value: vals[0] ?? null };
+        }
+        case "insub": {
+          // NULLs are dropped from the list: Larva is two-valued throughout
+          // (Design §7), so x IN (…) never matches NULL and x NOT IN (…)
+          // deliberately does NOT inherit SQL's NULL-poisoning trap.
+          const vals = (await run(e.query, "with IN")).filter((v) => v !== null);
+          return {
+            kind: "in",
+            expr: await rewrite(e.expr),
+            list: vals.map((value): Expr => ({ kind: "literal", value })),
+            negated: e.negated,
+          };
+        }
+        case "column":
+        case "literal":
+        case "param":
+          return e;
+        case "aggregate":
+          return {
+            ...e,
+            arg: e.arg === null ? null : await rewrite(e.arg),
+            sep: e.sep === undefined ? undefined : await rewrite(e.sep),
+          };
+        case "binary":
+          return { ...e, left: await rewrite(e.left), right: await rewrite(e.right) };
+        case "not":
+        case "isnull":
+          return { ...e, expr: await rewrite(e.expr) };
+        case "cast":
+          return { ...e, expr: await rewrite(e.expr) };
+        case "in":
+          return { ...e, expr: await rewrite(e.expr), list: await Promise.all(e.list.map(rewrite)) };
+        case "between":
+          return { ...e, expr: await rewrite(e.expr), lo: await rewrite(e.lo), hi: await rewrite(e.hi) };
+        case "like":
+          return { ...e, expr: await rewrite(e.expr), pattern: await rewrite(e.pattern) };
+        case "func":
+          return { ...e, args: await Promise.all(e.args.map(rewrite)) };
+        case "case":
+          return {
+            ...e,
+            branches: await Promise.all(e.branches.map(async (b) => ({ when: await rewrite(b.when), then: await rewrite(b.then) }))),
+            else: e.else === undefined ? undefined : await rewrite(e.else),
+          };
+      }
+    };
+
+    switch (stmt.kind) {
+      case "select":
+        return {
+          ...stmt,
+          items:
+            stmt.items === null
+              ? null
+              : await Promise.all(stmt.items.map(async (i) => ({ ...i, expr: await rewrite(i.expr) }))),
+          where: stmt.where === undefined ? undefined : await rewrite(stmt.where),
+          having: stmt.having === undefined ? undefined : await rewrite(stmt.having),
+          groupBy: stmt.groupBy === undefined ? undefined : await Promise.all(stmt.groupBy.map(rewrite)),
+          limit: stmt.limit === undefined ? undefined : await rewrite(stmt.limit),
+          offset: stmt.offset === undefined ? undefined : await rewrite(stmt.offset),
+        };
+      case "insert":
+        return {
+          ...stmt,
+          rows: await Promise.all(stmt.rows.map((r) => Promise.all(r.map(rewrite)))),
+          onConflict:
+            stmt.onConflict === undefined || stmt.onConflict.action === "nothing"
+              ? stmt.onConflict
+              : {
+                  ...stmt.onConflict,
+                  action: {
+                    set: await Promise.all(
+                      stmt.onConflict.action.set.map(async (s) => ({ ...s, value: await rewrite(s.value) })),
+                    ),
+                  },
+                },
+        };
+      case "update":
+        return {
+          ...stmt,
+          set: await Promise.all(stmt.set.map(async (s) => ({ ...s, value: await rewrite(s.value) }))),
+          where: stmt.where === undefined ? undefined : await rewrite(stmt.where),
+        };
+      case "delete":
+        return { ...stmt, where: stmt.where === undefined ? undefined : await rewrite(stmt.where) };
+      default:
+        return stmt;
+    }
   }
 
   private grouped(stmt: SelectStmt, contexts: Ctx[], params: Scalar[], realCols: Set<string>): Row[] {
@@ -380,7 +584,11 @@ export class Executor {
       return true;
     });
     this.lastStats = { chunksTotal: refs.length, chunksFetched: survivors.length };
-    return Promise.all(survivors.map(async (ref) => ({ ref, rows: await this.proto.readChunk(ref) })));
+    // Chunks written before an ALTER TABLE lack the added columns — absent
+    // keys read as NULL. fillAbsentColumns never mutates the cached rows.
+    return Promise.all(
+      survivors.map(async (ref) => ({ ref, rows: fillAbsentColumns(await this.proto.readChunk(ref), schema) })),
+    );
   }
 
   /**
@@ -475,6 +683,9 @@ export class Executor {
   /** `group` carries the rows of the current group so aggregate nodes can evaluate; absent outside GROUP BY/HAVING contexts. */
   private evalExpr(e: Expr, ctx: Ctx, params: Scalar[], group?: Ctx[]): Scalar {
     switch (e.kind) {
+      case "subquery":
+      case "insub":
+        throw new SqlError("INTERNAL", "subquery nodes must be resolved before evaluation"); // unreachable — resolveSubqueries runs first
       case "aggregate": {
         if (!group) {
           throw new SqlError(
@@ -821,8 +1032,10 @@ export class Executor {
       if (!ref.stats || constraints.length > 1) return true; // unique constraints force full scan
       return pks.some((pk) => cmpScalar(ref.stats!.pkMin, pk) <= 0 && cmpScalar(ref.stats!.pkMax, pk) >= 0);
     });
+    // Copy (never mutate the chunk cache) and NULL-fill columns added by
+    // ALTER TABLE, so DO UPDATE SET expressions can read them on old rows.
     const loaded = await Promise.all(
-      candidates.map(async (ref) => ({ ref, rows: [...(await this.proto.readChunk(ref))] })),
+      candidates.map(async (ref) => ({ ref, rows: [...fillAbsentColumns(await this.proto.readChunk(ref), schema)] })),
     );
 
     // Rows are processed in statement order, each seeing the effect of the
@@ -1067,14 +1280,9 @@ export class Executor {
   // ---------- DDL ----------
 
   private async planCreate(stmt: Extract<Statement, { kind: "create" }>, snap: Snapshot): Promise<PlanOutcome> {
-    const TYPES: Record<string, "text" | "integer" | "real" | "boolean" | "timestamp"> = {
-      text: "text", varchar: "text", integer: "integer", int: "integer", real: "real",
-      float: "real", double: "real", boolean: "boolean", bool: "boolean",
-      timestamp: "timestamp", datetime: "timestamp",
-    };
     const columns: TableSchema["columns"] = {};
     for (const col of stmt.columns) {
-      const type = TYPES[col.type];
+      const type = COLUMN_TYPES[col.type];
       if (!type) {
         throw new SqlError("UNKNOWN_TYPE", `type "${col.type}" is not available; Larva v1 types are text, integer, real, boolean, timestamp`);
       }
@@ -1095,6 +1303,33 @@ export class Executor {
         if (m.tables[stmt.table]) return null;
         m.tables[stmt.table] = { chunks: [] };
         m.schema = { ...((m.schema ?? {}) as DatabaseSchema), [stmt.table]: tableSchema };
+        return m;
+      },
+      rows: [],
+    };
+  }
+
+  /** ADD COLUMN of a plain nullable column: a schema-only commit. Existing
+   * chunks are untouched — absent keys read as NULL (fillAbsentColumns). */
+  private async planAlter(stmt: Extract<Statement, { kind: "alter" }>, snap: Snapshot): Promise<PlanOutcome> {
+    const schema = this.schemaOf(snap.manifest, stmt.table);
+    const type = COLUMN_TYPES[stmt.column.type];
+    if (!type) {
+      throw new SqlError("UNKNOWN_TYPE", `type "${stmt.column.type}" is not available; Larva types are text, integer, real, boolean, timestamp`);
+    }
+    if (stmt.column.name in schema.columns) {
+      throw new SqlError("DUPLICATE_COLUMN", `column "${stmt.column.name}" already exists in table "${stmt.table}"`);
+    }
+    const { table, column } = stmt;
+    return {
+      apply: (m) => {
+        const live = ((m.schema ?? {}) as DatabaseSchema)[table];
+        if (!live || column.name in live.columns) return null; // changed underneath us — re-execute for the precise error
+        const next: TableSchema = {
+          ...live,
+          columns: { ...live.columns, [column.name]: { type, primaryKey: false, unique: false, partitionBy: false } },
+        };
+        m.schema = { ...((m.schema ?? {}) as DatabaseSchema), [table]: next };
         return m;
       },
       rows: [],

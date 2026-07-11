@@ -24,7 +24,18 @@ LIMIT 10 OFFSET 20
 - Full scalar expressions in the select list: arithmetic, `||` concatenation, `CASE WHEN` (searched and simple), `CAST(x AS text/integer/real/boolean)`.
 - `WHERE` with `=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`.
 - `ORDER BY` source columns *or* select-item aliases; `LIMIT` / `OFFSET`.
-- **Two-table** `INNER JOIN` and `LEFT JOIN` on equality predicates.
+- `INNER JOIN` and `LEFT JOIN` on equality predicates — **any number of tables**, including self-joins (give each occurrence its own alias: `FROM staff e JOIN staff m ON e.managerId = m.id`). Each `ON` compares a column of the joined table with a column of any table already in scope.
+
+### Uncorrelated subqueries
+
+```sql
+SELECT name FROM customers
+WHERE id IN (SELECT customerId FROM orders WHERE total > 500)
+
+SELECT * FROM orders WHERE total > (SELECT AVG(total) FROM orders)
+```
+
+The inner query runs first against the same snapshot; its result feeds the outer plan as plain values (so an `IN (SELECT …)` list even participates in [zone-map pruning](/docs/how-it-works)). Scalar subqueries must yield one row and one column. `NULL`s in the subquery result are ignored — so `NOT IN (SELECT …)` behaves the way you intend even when the inner column has `NULL`s, instead of inheriting SQL's NULL-poisoning trap. **Correlated** subqueries — ones that reference the outer query's tables — are not supported and never will be; the error says so and points at `JOIN`.
 
 ### Scalar functions
 
@@ -75,23 +86,24 @@ INSERT INTO customers (name, email) VALUES ('Ada', 'ada@example.com') RETURNING 
 - **Upsert**: `ON CONFLICT (col) DO NOTHING` / `DO UPDATE SET col = excluded.col`. The conflict target must be the primary key, a `UNIQUE` column, or the exact columns of a [composite unique](/docs/api#composite-unique-constraints) — `ON CONFLICT (userId, feature) DO UPDATE …`.
 - `UPDATE … WHERE`, `DELETE … WHERE` — without a `WHERE` clause they are **rejected** unless you pass `{ allowFullTable: true }` (the most common catastrophic agent mistake becomes a specific error instead).
 - `CREATE TABLE` / `DROP TABLE` (agents doing interactive setup use this; a code-first schema stays authoritative).
+- `ALTER TABLE t ADD COLUMN name type` — **additive only**: a plain nullable column, no rewrite of existing data. Rows written before the `ALTER` read the new column as `NULL`; backfill with `UPDATE` if needed. (With a code-first schema you rarely write this by hand: adding a plain column to `defineSchema` auto-migrates at connect.) `DROP COLUMN` and `RENAME` are rejected — they need a migration story that respects time travel.
 
 ## Not supported — on purpose
 
-Subqueries, window functions, `UNION`, self-joins, joins of three or more tables, `ALTER TABLE`, views, triggers, nested aggregates. Each exclusion is either rarely emitted by agents writing conservative SQL, or expressible in application code at Larva's scale.
+Correlated subqueries, derived tables (subqueries in `FROM`), window functions, `UNION`, `RIGHT`/`FULL`/`CROSS` joins, `DROP COLUMN`/`RENAME`, views, triggers, nested aggregates. Each exclusion is either rarely emitted by agents writing conservative SQL, or expressible in application code at Larva's scale.
 
 Every rejection **names the feature and says what to do instead**, and near-miss spellings are redirected (`CONCAT` → `||`, `SUBSTRING` → `SUBSTR`, `DATE_TRUNC` → `DATE`/`STRFTIME`):
 
 ```
-UNSUPPORTED_FEATURE: subqueries are not supported in Larva v1 (found one in IN);
-run the inner query first and interpolate its result
+UNSUPPORTED_FEATURE: window functions are not supported in Larva v1;
+compute windows in application code — tables at this scale fit in memory
 ```
 
 This is a design feature, not a limitation dressed up — agents self-correct well when errors are specific.
 
 ## The bar for growing the dialect
 
-Recorded in [design decisions](/docs/design-decisions): a construct joins the dialect when **agents writing conservative SQL emit it routinely, and it executes within the existing engine shape** — in-memory relational algebra after pruning, one atomic commit per write. `HAVING`, `DISTINCT`, scalar functions, `CASE`, and upsert cleared that bar. Subqueries never will; the answer to needing them is `larva export`.
+Recorded in [design decisions](/docs/design-decisions): a construct joins the dialect when **agents writing conservative SQL emit it routinely, and it executes within the existing engine shape** — in-memory relational algebra after pruning, one atomic commit per write. `HAVING`, `DISTINCT`, scalar functions, `CASE`, and upsert cleared that bar first; uncorrelated subqueries, 3+ table joins, self-joins, and additive `ALTER TABLE` were re-judged against it in July 2026 and shipped in 2.5. Correlated subqueries and window functions change the engine shape, so they stay out regardless of demand; the answer to needing them is `larva export`.
 
 ## Injection safety
 

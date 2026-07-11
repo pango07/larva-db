@@ -50,7 +50,13 @@ export type Expr =
   | { kind: "isnull"; expr: Expr; negated: boolean }
   | { kind: "func"; name: ScalarFunc; args: Expr[] }
   | { kind: "case"; branches: { when: Expr; then: Expr }[]; else?: Expr }
-  | { kind: "cast"; expr: Expr; to: CastType };
+  | { kind: "cast"; expr: Expr; to: CastType }
+  // Uncorrelated subqueries (Design §7): evaluated inner-query-first by the
+  // executor and rewritten into plain literals before the outer plan runs.
+  // Their inner scope is their own — the expression walkers below never
+  // descend into `query`.
+  | { kind: "subquery"; query: SelectStmt }
+  | { kind: "insub"; expr: Expr; query: SelectStmt; negated: boolean };
 
 export interface SelectItem {
   expr: Expr;
@@ -62,13 +68,23 @@ export interface TableRef {
   alias?: string;
 }
 
+/** One JOIN clause. ON is a single equality between a column of the joined
+ * table and a column of any table already in scope (left-deep hash joins). */
+export interface JoinClause {
+  type: "inner" | "left";
+  table: TableRef;
+  leftCol: ColumnRef;
+  rightCol: ColumnRef;
+}
+
 export interface SelectStmt {
   kind: "select";
   /** null = SELECT * */
   items: SelectItem[] | null;
   distinct: boolean;
   from: TableRef;
-  join?: { type: "inner" | "left"; table: TableRef; leftCol: ColumnRef; rightCol: ColumnRef };
+  /** In statement order; self-joins are legal (each occurrence needs its own alias). */
+  joins?: JoinClause[];
   where?: Expr;
   /** Full expressions: GROUP BY DATE(createdAt) and GROUP BY <select alias> are both legal. */
   groupBy?: Expr[];
@@ -121,7 +137,15 @@ export interface DropTableStmt {
   table: string;
 }
 
-export type Statement = SelectStmt | InsertStmt | UpdateStmt | DeleteStmt | CreateTableStmt | DropTableStmt;
+/** ADD COLUMN of a plain nullable column — the only supported ALTER TABLE
+ * form (Design §7). Existing chunks are untouched: absent keys read as NULL. */
+export interface AlterTableStmt {
+  kind: "alter";
+  table: string;
+  column: { name: string; type: string };
+}
+
+export type Statement = SelectStmt | InsertStmt | UpdateStmt | DeleteStmt | CreateTableStmt | DropTableStmt | AlterTableStmt;
 
 /** True if the expression contains an aggregate anywhere (aggregates cannot nest). */
 export function hasAggregate(e: Expr): boolean {
@@ -147,6 +171,41 @@ export function hasAggregate(e: Expr): boolean {
       return (
         e.branches.some((b) => hasAggregate(b.when) || hasAggregate(b.then)) ||
         (e.else !== undefined && hasAggregate(e.else))
+      );
+    case "insub":
+      return hasAggregate(e.expr); // the inner query's aggregates are its own
+    default:
+      return false;
+  }
+}
+
+/** True if the expression contains a subquery node anywhere (does not descend
+ * into inner queries — a nested subquery resolves when its parent executes). */
+export function hasSubquery(e: Expr): boolean {
+  switch (e.kind) {
+    case "subquery":
+    case "insub":
+      return true;
+    case "binary":
+      return hasSubquery(e.left) || hasSubquery(e.right);
+    case "not":
+    case "isnull":
+    case "cast":
+      return hasSubquery(e.expr);
+    case "in":
+      return hasSubquery(e.expr) || e.list.some(hasSubquery);
+    case "between":
+      return hasSubquery(e.expr) || hasSubquery(e.lo) || hasSubquery(e.hi);
+    case "like":
+      return hasSubquery(e.expr) || hasSubquery(e.pattern);
+    case "func":
+      return e.args.some(hasSubquery);
+    case "aggregate":
+      return (e.arg !== null && hasSubquery(e.arg)) || (e.sep !== undefined && hasSubquery(e.sep));
+    case "case":
+      return (
+        e.branches.some((b) => hasSubquery(b.when) || hasSubquery(b.then)) ||
+        (e.else !== undefined && hasSubquery(e.else))
       );
     default:
       return false;
@@ -191,6 +250,10 @@ export function mapColumnRefs(e: Expr, fn: (c: ColumnRef) => Expr | null): Expr 
         branches: e.branches.map((b) => ({ when: m(b.when), then: m(b.then) })),
         else: e.else === undefined ? undefined : m(e.else),
       };
+    case "subquery":
+      return e; // inner scope is its own — excluded.*/alias resolution never reaches in
+    case "insub":
+      return { ...e, expr: m(e.expr) };
   }
 }
 
@@ -236,6 +299,10 @@ export function ungroupedColumns(e: Expr, out: ColumnRef[] = []): ColumnRef[] {
       });
       if (e.else) ungroupedColumns(e.else, out);
       break;
+    case "insub":
+      ungroupedColumns(e.expr, out);
+      break;
+    // "subquery" resolves to a constant before grouping — no outer columns
   }
   return out;
 }
@@ -274,6 +341,10 @@ export function coveredByGroupBy(e: Expr, groupBy: Expr[]): boolean {
         return x.args.every(ok);
       case "case":
         return x.branches.every((b) => ok(b.when) && ok(b.then)) && (x.else === undefined || ok(x.else));
+      case "subquery":
+        return true; // a constant once evaluated
+      case "insub":
+        return ok(x.expr);
     }
   };
   return ok(e);

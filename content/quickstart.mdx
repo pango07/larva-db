@@ -46,7 +46,7 @@ export const schema = defineSchema({
 });
 ```
 
-No migrations to run — tables declared in code are created on first connect, and drift between code and store is a loud startup error, never a silent guess.
+No migrations to run — tables declared in code are created on first connect, adding a plain column to the schema auto-migrates (existing rows read it as `NULL`), and any other drift between code and store is a loud startup error, never a silent guess.
 
 ### Use it
 

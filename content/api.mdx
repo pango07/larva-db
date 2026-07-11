@@ -28,7 +28,7 @@ await db.upgrade();                                         // one-way flip to t
 
 | Option | Default | |
 |---|---|---|
-| `schema` | — | code-first schema from `defineSchema` — authoritative; drift vs. the store is a loud startup error |
+| `schema` | — | code-first schema from `defineSchema` — authoritative; drift vs. the store is a loud startup error, except a plain nullable column added in code, which auto-migrates as additive `ALTER TABLE` |
 | `prefix` | `"larva/"` | blob-path prefix the database lives under; one store can hold many databases |
 | `store` | Vercel Blob | any `StorageAdapter` — ships with `S3Adapter` for AWS S3 / Cloudflare R2 |
 | `commitLog` | `false` | create **new** databases in [format 3](/docs/how-it-works/format-versioning); never changes existing ones |

@@ -251,6 +251,26 @@ export function validateInsert(table: string, schema: TableSchema, row: Row): Ro
   return out;
 }
 
+/**
+ * Columns added by ALTER TABLE (or additive drift migration) after a chunk was
+ * written are absent from its stored rows — they read as NULL (Design §7).
+ * Returns the input array untouched when every row is already complete;
+ * never mutates rows (chunk caches hand out shared arrays).
+ */
+export function fillAbsentColumns(rows: Row[], schema: TableSchema): Row[] {
+  const cols = Object.keys(schema.columns);
+  let filled = false;
+  const out = rows.map((r) => {
+    const missing = cols.filter((c) => !(c in r));
+    if (missing.length === 0) return r;
+    filled = true;
+    const full = { ...r };
+    for (const c of missing) full[c] = null;
+    return full;
+  });
+  return filled ? out : rows;
+}
+
 /** Compare code-first schema against the manifest's; return human-readable drift descriptions. */
 export function schemaDrift(code: DatabaseSchema, manifest: DatabaseSchema): string[] {
   const drift: string[] = [];

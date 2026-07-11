@@ -31,13 +31,23 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
 - `GROUP BY` over expressions or aliases (e.g. `GROUP BY DATE(createdAt)`)
   with `COUNT` / `SUM` / `AVG` / `MIN` / `MAX` / `GROUP_CONCAT(x, sep)`,
   including `COUNT(DISTINCT col)`, plus `HAVING`.
-- Two-table `INNER JOIN` and `LEFT JOIN` on equality.
+- `INNER JOIN` and `LEFT JOIN` on equality — any number of tables, including
+  self-joins (alias each occurrence: `FROM staff e JOIN staff m ON
+  e.managerId = m.id`).
+- Uncorrelated subqueries: `WHERE id IN (SELECT ...)`, `NOT IN (SELECT ...)`,
+  and scalar comparisons like `WHERE total > (SELECT AVG(total) FROM orders)`.
+  The subquery must NOT reference the outer query's tables (no correlation) —
+  use a JOIN for that. NULLs in the subquery result are ignored, so
+  `NOT IN (SELECT ...)` behaves the way you intend even when the inner column
+  has NULLs (unlike standard SQL's NULL trap).
 - `INSERT ... RETURNING`, multi-row, with upsert:
   `ON CONFLICT (col) DO NOTHING` or `DO UPDATE SET col = excluded.col`.
   The conflict target must be the primary key, a UNIQUE column, or the exact
   columns of a composite unique declared in the schema
   (`ON CONFLICT (userId, feature) DO UPDATE ...`).
 - `UPDATE ... WHERE`, `DELETE ... WHERE`, `CREATE TABLE`, `DROP TABLE`.
+- `ALTER TABLE t ADD COLUMN name type` — plain nullable columns only.
+  Existing rows read the new column as NULL; backfill with UPDATE if needed.
 
 ## Schema features to know
 
@@ -55,11 +65,12 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
 
 ## NOT supported — do not emit
 
-Subqueries, window functions, `UNION`, self-joins, joins of 3+ tables,
-`ALTER TABLE`, views, triggers, nested aggregates. If a query needs these,
-fetch the data and compute in application code instead — tables here are
-small. Rejections name the feature and say what to do instead; read the
-error message and follow it.
+Correlated subqueries, subqueries in `FROM` (derived tables), window
+functions, `UNION`, `RIGHT`/`FULL`/`CROSS` joins, `DROP COLUMN`/`RENAME`,
+views, triggers, nested aggregates. If a query needs these, fetch the data
+and compute in application code instead — tables here are small. Rejections
+name the feature and say what to do instead; read the error message and
+follow it.
 
 ## Guardrails
 

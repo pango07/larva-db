@@ -9,7 +9,7 @@
 [![types](https://img.shields.io/badge/types-included-blue)](https://github.com/pango07/larva-db/blob/main/packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](https://github.com/pango07/larva-db/blob/main/LICENSE)
 
-Real SQL (time series, upserts, JSON), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -215,8 +215,8 @@ The short version of what it teaches:
 Errors are machine-readable on purpose — agents self-correct from specific messages:
 
 ```
-UNSUPPORTED_FEATURE: subqueries are not supported in Larva v1 (found one in IN);
-run the inner query first and interpolate its result
+UNSUPPORTED_FEATURE: window functions are not supported in Larva v1;
+compute windows in application code — tables at this scale fit in memory
 ```
 
 ## Who it's for — and honest limits
@@ -233,9 +233,9 @@ When you get there, congratulations: run the export and graduate — `psql $DATA
 
 ## SQL dialect
 
-Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, `CAST`, scalar functions (`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ROUND`, `ABS`, `COALESCE`, `NULLIF`, `IFNULL`, `REPLACE`, `CEIL`, `FLOOR`, `MOD`, `SUBSTR`), date helpers (`NOW()`/`CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` — timestamps are ISO text, so this is cheap and range filters stay prunable), and JSON over text columns (`JSON_EXTRACT(col, '$.a[0]')`, `->>`); `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` over expressions or aliases (`GROUP BY DATE(createdAt)`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`GROUP_CONCAT` (incl. `COUNT(DISTINCT …)`) and `HAVING`, two-table `INNER`/`LEFT JOIN`; `INSERT` (multi-row, `RETURNING`) with `ON CONFLICT` upsert; `UPDATE`/`DELETE ... WHERE`; `CREATE`/`DROP TABLE`.
+Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, `CAST`, scalar functions (`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ROUND`, `ABS`, `COALESCE`, `NULLIF`, `IFNULL`, `REPLACE`, `CEIL`, `FLOOR`, `MOD`, `SUBSTR`), date helpers (`NOW()`/`CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` — timestamps are ISO text, so this is cheap and range filters stay prunable), and JSON over text columns (`JSON_EXTRACT(col, '$.a[0]')`, `->>`); `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` over expressions or aliases (`GROUP BY DATE(createdAt)`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`GROUP_CONCAT` (incl. `COUNT(DISTINCT …)`) and `HAVING`, `INNER`/`LEFT JOIN` across any number of tables including self-joins; uncorrelated subqueries (`WHERE id IN (SELECT …)`, scalar comparisons); `INSERT` (multi-row, `RETURNING`) with `ON CONFLICT` upsert; `UPDATE`/`DELETE ... WHERE`; `CREATE`/`DROP TABLE`; additive `ALTER TABLE … ADD COLUMN` (existing rows read the new column as `NULL` — and with a code-first schema, adding a plain column to `defineSchema` auto-migrates at connect).
 
-Not supported: subqueries, window functions, `UNION`, self-joins, 3+ table joins, `ALTER TABLE`, views, triggers. Every exclusion is rejected **by name, with an alternative**, and near-miss spellings are redirected (`CONCAT` → `||`, `SUBSTRING` → `SUBSTR`, `DATE_TRUNC` → `DATE`/`STRFTIME`).
+Not supported: correlated subqueries, derived tables, window functions, `UNION`, `RIGHT`/`FULL`/`CROSS` joins, `DROP COLUMN`/`RENAME`, views, triggers. Every exclusion is rejected **by name, with an alternative**, and near-miss spellings are redirected (`CONCAT` → `||`, `SUBSTRING` → `SUBSTR`, `DATE_TRUNC` → `DATE`/`STRFTIME`).
 
 `UPDATE`/`DELETE` without a `WHERE` clause requires an explicit `{ allowFullTable: true }` — the most common catastrophic agent mistake becomes a specific error instead.
 
@@ -265,7 +265,7 @@ The full design — including the rejected alternative, the consistency model, a
 
 ## Tested where it matters
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **240 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **275 checks across seven suites** run in CI on every push: a concurrent-writer stress gauntlet (zero lost updates, exact version arithmetic), randomized property workloads verified against a model, the full dialect + error catalog live against a real store, transaction/export/vacuum round-trips, and two offline chaos suites that inject 409s and 500s under the storage adapter. Details in [the repo README](https://github.com/pango07/larva-db#the-testing-story).
 
 The stress and property harnesses ship in the package for testing your own setup:
 

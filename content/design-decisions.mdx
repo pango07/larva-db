@@ -24,7 +24,7 @@ The primary user is a non-engineer building with an AI agent. Three consequences
 
 ## The dialect's admission bar
 
-A construct joins the dialect when **agents writing conservative SQL emit it routinely AND it executes within the existing engine shape** — in-memory algebra after pruning, one atomic commit per write. `HAVING`, `DISTINCT`, scalar functions, `CASE`, upsert, sequences, and composite uniques cleared it. Subqueries never will, regardless of demand — they'd change the engine's shape, and the honest answer to needing them is `larva export`.
+A construct joins the dialect when **agents writing conservative SQL emit it routinely AND it executes within the existing engine shape** — in-memory algebra after pruning, one atomic commit per write. `HAVING`, `DISTINCT`, scalar functions, `CASE`, upsert, sequences, and composite uniques cleared it first; uncorrelated subqueries (an inner query whose result feeds the outer plan), 3+ table joins, self-joins, and additive `ALTER TABLE` cleared it in 2.5. **Correlated** subqueries and window functions never will, regardless of demand — they'd change the engine's shape, and the honest answer to needing them is `larva export`.
 
 ## Honesty as strategy
 

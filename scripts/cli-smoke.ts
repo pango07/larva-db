@@ -54,8 +54,8 @@ ok("sql: SELECT prints a table", sel.code === 0 && sel.out.includes("hello from 
 const noWhere = run("sql", "UPDATE notes SET score = 0");
 ok("sql: UPDATE without WHERE is rejected, hint uses the CLI flag", noWhere.code === 1 && noWhere.err.includes("add --allow-full-table"), noWhere.err);
 ok("sql: --allow-full-table permits it", run("sql", "UPDATE notes SET score = 0", "--allow-full-table").code === 0);
-const badSql = run("sql", "SELECT * FROM notes WHERE id IN (SELECT id FROM notes)");
-ok("sql: agent-grade error on stderr", badSql.code === 1 && badSql.err.includes("subqueries"), badSql.err);
+const badSql = run("sql", "SELECT SUM(score) OVER () FROM notes");
+ok("sql: agent-grade error on stderr", badSql.code === 1 && badSql.err.includes("window"), badSql.err);
 
 // exports land on disk
 const pg = run("export", "--format", "postgres", "--out", "out.sql");

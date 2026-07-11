@@ -1,6 +1,6 @@
 import { AppendIntent, cmpScalar, ConflictError, IntentVerdict, LarvaProto, Manifest, OrderedIntent, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
-import { DatabaseSchema, SchemaError, schemaDrift, TableSchema } from "./schema";
-import { InsertStmt } from "./sql/ast";
+import { ColumnDef, DatabaseSchema, fillAbsentColumns, SchemaError, schemaDrift, TableSchema } from "./schema";
+import { hasSubquery, InsertStmt } from "./sql/ast";
 import { SqlError } from "./sql/errors";
 import { ExecOptions, Executor, PlanOutcome, QueryStats } from "./sql/executor";
 import { parse } from "./sql/parser";
@@ -145,12 +145,52 @@ export class LarvaDb {
     if (!code) return;
 
     const live = (manifest.schema ?? {}) as DatabaseSchema;
-    const drift = schemaDrift(code, live);
+    // Additive drift heals itself (Design §7, §8): a plain new column in code
+    // is exactly ALTER TABLE … ADD COLUMN, so apply it instead of failing.
+    // Anything that is not additive-safe stays a loud error below.
+    const additions: { table: string; col: string; def: ColumnDef }[] = [];
+    for (const [table, codeTable] of Object.entries(code)) {
+      const liveTable = live[table];
+      if (!liveTable) continue; // whole missing tables are created further down
+      for (const [col, def] of Object.entries(codeTable.columns)) {
+        if (liveTable.columns[col]) continue;
+        if (def.primaryKey || def.unique || def.partitionBy) continue; // needs a real migration — leave for the drift error
+        additions.push({ table, col, def });
+      }
+    }
+    const virtual = additions.length === 0 ? live : structuredClone(live);
+    for (const a of additions) virtual[a.table].columns[a.col] = a.def;
+
+    const drift = schemaDrift(code, virtual);
     if (drift.length > 0) {
       throw new SchemaError(
         "SCHEMA_DRIFT",
         `the code-first schema no longer matches the database:\n  - ${drift.join("\n  - ")}\nThe code schema is authoritative — migrate the data or update schema.ts.`,
       );
+    }
+    if (additions.length > 0) {
+      await this.proto.commit(async () => ({
+        apply: (m) => {
+          const s = structuredClone((m.schema ?? {}) as DatabaseSchema);
+          for (const { table, col, def } of additions) {
+            if (s[table] && !s[table].columns[col]) s[table].columns[col] = def;
+          }
+          m.schema = s;
+          return m;
+        },
+      }));
+      // Re-verify: a concurrent process may have added the same column with a
+      // different definition between our drift check and our commit — the
+      // apply above skips existing columns, so recheck against what actually
+      // landed rather than assuming our additions won.
+      const landed = ((await this.proto.snapshot()).manifest.schema ?? {}) as DatabaseSchema;
+      const post = schemaDrift(code, landed);
+      if (post.length > 0) {
+        throw new SchemaError(
+          "SCHEMA_DRIFT",
+          `the code-first schema no longer matches the database:\n  - ${post.join("\n  - ")}\nThe code schema is authoritative — migrate the data or update schema.ts.`,
+        );
+      }
     }
     // Tables declared in code but missing from the store are created.
     const missing = Object.keys(code).filter((t) => !manifest.tables[t]);
@@ -356,6 +396,13 @@ export class LarvaDb {
     if (stmt.columns.includes(table.primaryKey)) return null;
     if (table.uniques?.length) return null;
     if (Object.values(table.columns).some((c) => c.unique)) return null;
+    // A subquery in VALUES reads database state — not client-determined,
+    // so it takes the ordered path (where plan-time resolution runs).
+    if (stmt.rows.some((r) => r.some(hasSubquery))) return null;
+    // A column the code schema doesn't know (e.g. added by a runtime SQL
+    // ALTER) must be validated against the live manifest schema — ordered
+    // path only; the append path plans from code.
+    if (stmt.columns.some((c) => !(c in table.columns))) return null;
     return table;
   }
 
@@ -560,7 +607,9 @@ export class LarvaDb {
     const schema = (snap.manifest.schema ?? {}) as DatabaseSchema;
     const tables: Record<string, Row[]> = {};
     for (const table of Object.keys(snap.manifest.tables)) {
-      tables[table] = await this.proto.readTable(table, snap);
+      const rows = await this.proto.readTable(table, snap);
+      // Rows written before an ALTER TABLE lack the added columns — export them as NULL.
+      tables[table] = schema[table] ? fillAbsentColumns(rows, schema[table]) : rows;
     }
     if (opts.format === "json") return tables;
 
