@@ -21,6 +21,25 @@ export interface ChunkRef {
   stats?: ChunkStats;
 }
 
+/** Reference to one secondary-index blob (per table + column). Immutable and
+ * ULID-named like chunks; rewritten copy-on-write in the same commit that
+ * changes the table's chunk set. */
+export interface IndexRef {
+  id: string;
+  path: string;
+}
+
+/**
+ * On-blob content of a secondary index: chunkId → sorted distinct non-NULL
+ * values of the indexed column within that chunk. The keystone property is
+ * that a chunk id ABSENT from the map is simply never pruned — which makes
+ * every form of staleness safe by construction: an old client that writes
+ * chunks without maintaining the index, a lost index update after a rebase,
+ * or a vacuumed blob all degrade pruning, never correctness. That is why
+ * indexes need no format bump.
+ */
+export type IndexBlob = Record<string, Scalar[]>;
+
 /** Highest on-store format this client can read and write. A manifest
  * declaring a newer version is refused loudly (FormatError) — never opened.
  *
@@ -74,7 +93,15 @@ export interface Manifest {
   /** Embedded schema (serialized DatabaseSchema); absent for schemaless
    * prototype databases created via init(). */
   schema?: unknown;
-  tables: Record<string, { chunks: ChunkRef[] }>;
+  tables: Record<string, TableEntry>;
+}
+
+export interface TableEntry {
+  chunks: ChunkRef[];
+  /** Secondary indexes by column name. Pre-index clients preserve this field
+   * untouched (their apply functions only mutate `chunks`), which leaves the
+   * refs stale — safe, per the IndexBlob contract. */
+  indexes?: Record<string, IndexRef>;
 }
 
 /**
@@ -92,8 +119,11 @@ export interface LogEntry {
   /** Present only when the commit raised the store's format. */
   formatVersion?: number;
   /** Per-table chunk delta; null drops the table; an entry with empty
-   * add/remove creates it. Untouched tables are absent. */
-  tables: Record<string, { add: ChunkRef[]; remove: string[] } | null>;
+   * add/remove creates it. Untouched tables are absent. `indexes` carries
+   * re-pointed (or null = dropped) secondary-index refs; pre-index clients
+   * ignore it on replay, which only leaves their view of the index stale —
+   * safe, per the IndexBlob contract. */
+  tables: Record<string, { add: ChunkRef[]; remove: string[]; indexes?: Record<string, IndexRef | null> } | null>;
   /** Intent ids folded into this commit (format 4). Metadata only: writers
    * use it to clear pending overlays and vacuum uses it to sweep processed
    * intent blobs; replay ignores it. */
@@ -147,7 +177,17 @@ function diffManifests(base: Manifest, next: Manifest): LogEntry["tables"] {
     const nextIds = new Set(tbl.chunks.map((c) => c.id));
     const add = tbl.chunks.filter((c) => !baseIds.has(c.id));
     const remove = (baseTbl?.chunks ?? []).filter((c) => !nextIds.has(c.id)).map((c) => c.id);
-    if (add.length || remove.length || !baseTbl) out[t] = { add, remove };
+    const indexes: Record<string, IndexRef | null> = {};
+    for (const [col, ref] of Object.entries(tbl.indexes ?? {})) {
+      if (baseTbl?.indexes?.[col]?.id !== ref.id) indexes[col] = ref;
+    }
+    for (const col of Object.keys(baseTbl?.indexes ?? {})) {
+      if (!tbl.indexes?.[col]) indexes[col] = null;
+    }
+    const idxChanged = Object.keys(indexes).length > 0;
+    if (add.length || remove.length || idxChanged || !baseTbl) {
+      out[t] = { add, remove, ...(idxChanged ? { indexes } : {}) };
+    }
   }
   for (const t of Object.keys(base.tables)) if (!next.tables[t]) out[t] = null;
   return out;
@@ -168,6 +208,14 @@ function applyLogEntry(m: Manifest, e: LogEntry): void {
       tbl.chunks = tbl.chunks.filter((c) => !gone.has(c.id));
     }
     tbl.chunks.push(...d.add);
+    for (const [col, ref] of Object.entries(d.indexes ?? {})) {
+      if (ref === null) {
+        if (tbl.indexes) delete tbl.indexes[col];
+      } else {
+        (tbl.indexes ??= {})[col] = ref;
+      }
+    }
+    if (tbl.indexes && Object.keys(tbl.indexes).length === 0) delete tbl.indexes;
   }
   if (e.schema !== undefined) m.schema = e.schema;
   if (e.formatVersion !== undefined) m.formatVersion = e.formatVersion;
@@ -546,6 +594,29 @@ export class LarvaProto {
         await sleep(backoffMs(attempt));
       }
     }
+  }
+
+  /** Stage one immutable secondary-index blob (chunkId → sorted distinct values). */
+  async stageIndex(table: string, column: string, blob: IndexBlob): Promise<IndexRef> {
+    const id = ulid();
+    const path = `${this.prefix}tables/${table}/index_${column}_${id}.json`;
+    await this.putCreateOnly(path, JSON.stringify(blob));
+    return { id, path };
+  }
+
+  private indexCache = new Map<string, IndexBlob>();
+
+  /** Index blobs are immutable, so the cache can never be stale. A missing
+   * blob (vacuumed by an older client) returns null — the caller degrades to
+   * no pruning, never to an error. */
+  async readIndex(ref: IndexRef): Promise<IndexBlob | null> {
+    const cached = this.indexCache.get(ref.path);
+    if (cached) return cached;
+    const res = await this.store.get(ref.path).catch(() => null);
+    if (!res) return null;
+    const blob = JSON.parse(res.body) as IndexBlob;
+    this.indexCache.set(ref.path, blob);
+    return blob;
   }
 
   /** Chunks are immutable, so the cache can never be stale. */

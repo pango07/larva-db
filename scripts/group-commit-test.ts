@@ -616,6 +616,109 @@ const schema = defineSchema({
   ok("cross-instance contention tripped the escalation heuristic", escalated);
 }
 
+// ---------- 16. secondary indexes: prune, maintain, degrade safely ----------
+{
+  chaos = false;
+  const idxSchema = defineSchema({
+    logs: { id: t.uuid().primaryKey(), region: t.text().index(), n: t.integer() },
+  });
+  const db = larva({ schema: idxSchema, prefix: "idx/", store, commitLog: true });
+  const REGIONS = ["us", "eu", "ap", "sa"];
+  // Explicit pks keep these on the ordered path: one chunk per statement,
+  // so each region's rows land in their own chunk and pruning is observable.
+  for (const [i, r] of REGIONS.entries()) {
+    await db.sql`INSERT INTO logs (id, region, n) VALUES
+      (${`${r}-1`}, ${r}, ${i * 10 + 1}), (${`${r}-2`}, ${r}, ${i * 10 + 2}), (${`${r}-3`}, ${r}, ${i * 10 + 3})`;
+  }
+
+  const eu = await db.sql`SELECT id FROM logs WHERE region = ${"eu"}`;
+  let stats = db.lastQueryStats;
+  ok("indexed equality prunes to the matching chunk", eu.length === 3 && stats.chunksFetched === 1 && stats.chunksTotal === 4, `fetched ${stats.chunksFetched}/${stats.chunksTotal}`);
+  const inList = await db.sql`SELECT COUNT(*) AS c FROM logs WHERE region IN (${"us"}, ${"ap"})`;
+  stats = db.lastQueryStats;
+  ok("IN list prunes via the index", inList[0].c === 6 && stats.chunksFetched === 2, `fetched ${stats.chunksFetched}/${stats.chunksTotal}`);
+  const range = await db.sql`SELECT COUNT(*) AS c FROM logs WHERE region BETWEEN ${"e"} AND ${"f"}`;
+  stats = db.lastQueryStats;
+  ok("range predicate prunes via the index", range[0].c === 3 && stats.chunksFetched === 1, `fetched ${stats.chunksFetched}/${stats.chunksTotal}`);
+
+  // Maintenance: an UPDATE that moves a value re-points the index atomically.
+  await db.sql`UPDATE logs SET region = ${"mars"} WHERE id = ${"eu-2"}`;
+  const mars = await db.sql`SELECT id FROM logs WHERE region = ${"mars"}`;
+  ok("update: moved value found through the index", mars.length === 1 && db.lastQueryStats.chunksFetched === 1);
+  const euAfter = await db.sql`SELECT COUNT(*) AS c FROM logs WHERE region = ${"eu"}`;
+  ok("update: the rewritten chunk is re-indexed", euAfter[0].c === 2);
+
+  // A deleted chunk's entry goes with it — the lookup then touches nothing.
+  await db.sql`DELETE FROM logs WHERE region = ${"sa"}`;
+  const sa = await db.sql`SELECT COUNT(*) AS c FROM logs WHERE region = ${"sa"}`;
+  ok("delete: zero chunks fetched for the vanished value", sa[0].c === 0 && db.lastQueryStats.chunksFetched === 0);
+
+  // Staleness safety: a proto-level insert is exactly a pre-index client —
+  // it adds a chunk without touching the index. Absent = always fetched.
+  const proto = (db as unknown as { proto: { insert(table: string, rows: Record<string, string | number | boolean | null>[]): Promise<unknown> } }).proto;
+  await proto.insert("logs", [{ id: "legacy-1", region: "eu", n: 99 }]);
+  const euStale = await db.sql`SELECT id FROM logs WHERE region = ${"eu"}`;
+  ok("a chunk unknown to the index is always fetched (stale-safe)", euStale.length === 3 && euStale.some((r) => r.id === "legacy-1"), JSON.stringify(euStale));
+
+  // An open-ended range (`> z`) has no upper bound: the internal MAX marker
+  // must be identity-checked, not compared — a value sorting above it would
+  // otherwise be wrongly pruned out of the result.
+  await db.sql`INSERT INTO logs (id, region, n) VALUES (${"weird-1"}, ${"￿￿￿￿beyond"}, ${0})`;
+  const beyond = await db.sql`SELECT id FROM logs WHERE region > ${"z"}`;
+  ok("open-ended range keeps values above the internal sentinel", beyond.length === 1 && beyond[0].id === "weird-1", JSON.stringify(beyond));
+
+  // A missing blob (an older client's vacuum) degrades to a scan, never an error.
+  const blobKeys = [...objects.keys()].filter((k) => k.startsWith("idx/tables/logs/index_"));
+  for (const k of blobKeys) objects.delete(k);
+  const db2 = larva({ schema: idxSchema, prefix: "idx/", store, commitLog: true }); // fresh instance — no warm index cache
+  const degraded = await db2.sql`SELECT COUNT(*) AS c FROM logs WHERE region = ${"eu"}`;
+  ok(
+    "a vacuumed index blob degrades to a full scan, results intact",
+    blobKeys.length > 0 && degraded[0].c === 3 && db2.lastQueryStats.chunksFetched === db2.lastQueryStats.chunksTotal,
+    `fetched ${db2.lastQueryStats.chunksFetched}/${db2.lastQueryStats.chunksTotal}`,
+  );
+
+  // Connect syncs .index() flags both ways: dropped from code → dropped from
+  // the store; added back → rebuilt with a backfill over existing chunks.
+  const noIdxSchema = defineSchema({ logs: { id: t.uuid().primaryKey(), region: t.text(), n: t.integer() } });
+  const db3 = larva({ schema: noIdxSchema, prefix: "idx/", store, commitLog: true });
+  const scan = await db3.sql`SELECT COUNT(*) AS c FROM logs WHERE region = ${"eu"}`;
+  ok("connect auto-drops an index removed from code", scan[0].c === 3 && db3.lastQueryStats.chunksFetched === db3.lastQueryStats.chunksTotal);
+  const db4 = larva({ schema: idxSchema, prefix: "idx/", store, commitLog: true });
+  const rebuilt = await db4.sql`SELECT COUNT(*) AS c FROM logs WHERE region = ${"eu"}`;
+  ok(
+    "connect auto-creates with backfill (covers pre-index chunks)",
+    rebuilt[0].c === 3 && db4.lastQueryStats.chunksFetched < db4.lastQueryStats.chunksTotal,
+    `fetched ${db4.lastQueryStats.chunksFetched}/${db4.lastQueryStats.chunksTotal}`,
+  );
+
+  // Tier-A appends are indexed at fold time.
+  const dbA = larva({ schema: idxSchema, prefix: "idx3/", store, commitLog: true });
+  await dbA.sql`INSERT INTO logs (region, n) VALUES (${"eu"}, ${1}), (${"us"}, ${2})`; // omitted pk → append path
+  await waitFor(async () => ![...objects.keys()].some((k) => k.startsWith("idx3/queue/")));
+  const foldBlobs = [...objects.entries()].filter(([k]) => k.startsWith("idx3/tables/logs/index_region_"));
+  ok("the fold maintains indexes for appended rows", foldBlobs.length > 0 && foldBlobs.some(([, o]) => o.body.includes("eu")));
+
+  // Under chaos + two contending writers, indexed lookups must match a full
+  // scan exactly: index entries can only be wrong by ABSENCE (chunks fetched
+  // anyway), never by content — chunk ids are never reused.
+  chaos = true;
+  const w1 = larva({ schema: idxSchema, prefix: "idx2/", store, commitLog: true });
+  const w2 = larva({ schema: idxSchema, prefix: "idx2/", store, commitLog: true });
+  await Promise.all(
+    Array.from({ length: 12 }, (_, i) => (i % 2 ? w1 : w2).sql`INSERT INTO logs (id, region, n) VALUES (${`r${i}`}, ${REGIONS[i % 4]}, ${i})`),
+  );
+  chaos = false;
+  const viaIndex = (await w1.sql`SELECT id FROM logs WHERE region = ${"eu"}`).map((r) => r.id).sort();
+  const all = await w1.sql`SELECT id, region FROM logs`;
+  const truth = all.filter((r) => r.region === "eu").map((r) => r.id).sort();
+  ok(
+    "indexed lookup matches the full scan after chaos + contention",
+    truth.length === 3 && JSON.stringify(viaIndex) === JSON.stringify(truth),
+    `index=${JSON.stringify(viaIndex)} truth=${JSON.stringify(truth)}`,
+  );
+}
+
 server.stop();
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

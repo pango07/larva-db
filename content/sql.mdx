@@ -88,6 +88,15 @@ INSERT INTO customers (name, email) VALUES ('Ada', 'ada@example.com') RETURNING 
 - `CREATE TABLE` / `DROP TABLE` (agents doing interactive setup use this; a code-first schema stays authoritative).
 - `ALTER TABLE t ADD COLUMN name type` — **additive only**: a plain nullable column, no rewrite of existing data. Rows written before the `ALTER` read the new column as `NULL`; backfill with `UPDATE` if needed. (With a code-first schema you rarely write this by hand: adding a plain column to `defineSchema` auto-migrates at connect.) `DROP COLUMN` and `RENAME` are rejected — they need a migration story that respects time travel.
 
+### Secondary indexes
+
+```sql
+CREATE INDEX ON orders (customerId)
+DROP INDEX ON orders (customerId)
+```
+
+An index makes `=`, `IN`, and range filters on a non-key column **prune storage reads** instead of scanning the table. One index per column, addressed by column (an index name parses and is ignored); declare it in code with `t.text().index()` — flags sync automatically at connect, and creating one backfills from existing data in one commit. Indexes are performance-only: `CREATE UNIQUE INDEX` is rejected (uniqueness belongs to the table), and a stale or missing index can never change results — only how much gets read. The primary key and the `.partitionBy()` column never need one.
+
 ## Not supported — on purpose
 
 Correlated subqueries, derived tables (subqueries in `FROM`), window functions, `UNION`, `RIGHT`/`FULL`/`CROSS` joins, `DROP COLUMN`/`RENAME`, views, triggers, nested aggregates. Each exclusion is either rarely emitted by agents writing conservative SQL, or expressible in application code at Larva's scale.

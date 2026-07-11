@@ -145,7 +145,31 @@ export interface AlterTableStmt {
   column: { name: string; type: string };
 }
 
-export type Statement = SelectStmt | InsertStmt | UpdateStmt | DeleteStmt | CreateTableStmt | DropTableStmt | AlterTableStmt;
+/** Larva indexes are per-column (one index per column, addressed by column,
+ * not name — a given index name parses and is ignored). */
+export interface CreateIndexStmt {
+  kind: "createIndex";
+  table: string;
+  column: string;
+  ifNotExists?: boolean;
+}
+
+export interface DropIndexStmt {
+  kind: "dropIndex";
+  table: string;
+  column: string;
+}
+
+export type Statement =
+  | SelectStmt
+  | InsertStmt
+  | UpdateStmt
+  | DeleteStmt
+  | CreateTableStmt
+  | DropTableStmt
+  | AlterTableStmt
+  | CreateIndexStmt
+  | DropIndexStmt;
 
 /** True if the expression contains an aggregate anywhere (aggregates cannot nest). */
 export function hasAggregate(e: Expr): boolean {

@@ -30,7 +30,7 @@ That's the whole setup. No migrations to run, no dashboard to visit, no second b
 ## What you get
 
 - **Real SQL** — a deliberately scoped dialect that covers ~90% of what small apps write: multi-table joins, uncorrelated subqueries, `GROUP BY` over expressions, `HAVING`, upserts, JSON functions, date bucketing, additive `ALTER TABLE`. Everything outside it is rejected *by name, with an alternative*.
-- **No silently lost writes, ever.** Every commit goes through an atomic protocol; conflicts rebase, re-execute, or fail loudly. Verified by 275 checks including randomized concurrent-writer gauntlets.
+- **No silently lost writes, ever.** Every commit goes through an atomic protocol; conflicts rebase, re-execute, or fail loudly. Verified by 297 checks including randomized concurrent-writer gauntlets.
 - **Atomic transactions** — several statements, one commit, all or nothing.
 - **Time travel** — every commit is a new immutable version; `db.asOf()` reads the past and `db.rollbackTo()` is a one-line undo button.
 - **Auto IDs** — `t.uuid()` fills a time-ordered UUID on insert with nothing to coordinate; `t.sequence()` auto-numbers rows (invoice #42), unique across concurrent writers, without a server.

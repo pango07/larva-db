@@ -76,6 +76,7 @@ const schema = defineSchema(
 - `.unique()` — enforced on INSERT and upsert; usable as an `ON CONFLICT` target.
 - `.references("table.column")` — becomes a real `FOREIGN KEY` in the Postgres export (not enforced at runtime).
 - `.partitionBy()` — at most one per table; maintains zone-map statistics so range/equality filters on this column prune storage reads.
+- `.index()` — maintains a [secondary index](/docs/sql#secondary-indexes) so `=`/`IN`/range filters on this column prune storage reads. Performance-only (a stale or missing index can never change results); synced automatically at connect, with a one-commit backfill over existing data. The primary key and the `.partitionBy()` column never need it.
 
 ### `t.sequence()`
 

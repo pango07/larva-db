@@ -315,9 +315,16 @@ class Parser {
 
   private create(): Statement {
     this.expect("keyword", "CREATE");
-    for (const feature of ["VIEW", "TRIGGER", "INDEX", "UNIQUE"]) {
-      if (this.at("keyword", feature)) throw unsupported(feature === "UNIQUE" ? "INDEX" : feature);
+    for (const feature of ["VIEW", "TRIGGER"]) {
+      if (this.at("keyword", feature)) throw unsupported(feature);
     }
+    if (this.at("keyword", "UNIQUE")) {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "CREATE UNIQUE INDEX is not supported: uniqueness is declared on the table (a UNIQUE column or a composite unique in defineSchema); Larva indexes are performance-only",
+      );
+    }
+    if (this.eat("keyword", "INDEX")) return this.createIndex();
     this.expect("keyword", "TABLE");
     const table = this.ident("table name");
     this.expect("punct", "(");
@@ -347,10 +354,52 @@ class Parser {
     return { kind: "create", table, columns };
   }
 
+  /** The INDEX keyword is already consumed. `CREATE INDEX [IF NOT EXISTS]
+   * [name] ON table (column)` — the name is accepted and ignored (Larva
+   * indexes one column each, addressed by column). */
+  private createIndex(): Statement {
+    let ifNotExists = false;
+    if (this.peek().type === "ident" && this.peek().text.toUpperCase() === "IF") {
+      this.next();
+      this.expect("keyword", "NOT");
+      if (!(this.peek().type === "ident" && this.peek().text.toUpperCase() === "EXISTS")) {
+        throw this.err("expected EXISTS");
+      }
+      this.next();
+      ifNotExists = true;
+    }
+    if (this.at("ident")) this.next(); // optional index name, ignored
+    this.expect("keyword", "ON");
+    const table = this.ident("table name");
+    this.expect("punct", "(");
+    const column = this.ident("column name");
+    if (this.eat("punct", ",")) {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "composite indexes are not supported; index the single most selective column",
+      );
+    }
+    this.expect("punct", ")");
+    return { kind: "createIndex", table, column, ...(ifNotExists ? { ifNotExists } : {}) };
+  }
+
   private drop(): Statement {
     this.expect("keyword", "DROP");
-    for (const feature of ["VIEW", "TRIGGER", "INDEX"]) {
+    for (const feature of ["VIEW", "TRIGGER"]) {
       if (this.at("keyword", feature)) throw unsupported(feature);
+    }
+    if (this.eat("keyword", "INDEX")) {
+      if (!this.eat("keyword", "ON")) {
+        throw new SqlError(
+          "UNSUPPORTED_FEATURE",
+          "Larva indexes are addressed by column, not name; use DROP INDEX ON table (column)",
+        );
+      }
+      const table = this.ident("table name");
+      this.expect("punct", "(");
+      const column = this.ident("column name");
+      this.expect("punct", ")");
+      return { kind: "dropIndex", table, column };
     }
     this.expect("keyword", "TABLE");
     return { kind: "drop", table: this.ident("table name") };
