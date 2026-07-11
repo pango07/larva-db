@@ -19,7 +19,6 @@ export const UNSUPPORTED: Record<string, string> = {
   INTERSECT: "INTERSECT is not supported in Larva v1; run the queries separately and intersect in application code",
   EXCEPT: "EXCEPT is not supported in Larva v1; run the queries separately and subtract in application code",
   OVER: "window functions are not supported in Larva v1; compute windows in application code — tables at this scale fit in memory",
-  ALTER: "ALTER TABLE is not supported in Larva v1 (a migration story that respects time travel is planned); create a new table and copy rows for now",
   VIEW: "views are not supported in Larva v1; wrap the query in an application function instead",
   TRIGGER: "triggers are not supported in Larva v1; perform follow-up writes in application code, inside db.transaction",
   INDEX: "secondary indexes are not supported in Larva v1; declare .partitionBy() on the column you filter most, or let small tables scan",

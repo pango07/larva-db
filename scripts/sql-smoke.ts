@@ -33,14 +33,25 @@ async function expectSqlError(name: string, fn: () => unknown | Promise<unknown>
 
 // ---------- Part A: parser error catalog (offline) ----------
 console.log("--- parser error catalog ---");
-await expectSqlError("subquery in IN", () => parse("SELECT * FROM a WHERE id IN (SELECT id FROM b)"), "UNSUPPORTED_FEATURE", "subqueries");
-await expectSqlError("subquery in FROM", () => parse("SELECT * FROM (SELECT * FROM a)"), "UNSUPPORTED_FEATURE", "subqueries");
+ok("IN (SELECT …) parses", parse("SELECT * FROM a WHERE id IN (SELECT id FROM b)").kind === "select");
+ok("scalar subquery parses", parse("SELECT * FROM a WHERE x > (SELECT MAX(x) FROM b)").kind === "select");
+ok("NOT IN (SELECT …) parses", parse("DELETE FROM a WHERE id NOT IN (SELECT aId FROM b)").kind === "delete");
+await expectSqlError("subquery in FROM (derived table)", () => parse("SELECT * FROM (SELECT * FROM a)"), "UNSUPPORTED_FEATURE", "derived tables");
+await expectSqlError("EXISTS hints at IN or JOIN", () => parse("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b)"), "UNKNOWN_FUNCTION", "correlated");
 await expectSqlError("UNION", () => parse("SELECT * FROM a UNION SELECT * FROM b"), "UNSUPPORTED_FEATURE", "UNION");
 await expectSqlError("window function", () => parse("SELECT SUM(x) OVER () FROM a"), "UNSUPPORTED_FEATURE", "window");
-await expectSqlError("three-table join", () => parse("SELECT * FROM a JOIN b ON a.x = b.x JOIN c ON b.y = c.y"), "UNSUPPORTED_FEATURE", "at most two tables");
-await expectSqlError("self-join", () => parse("SELECT * FROM a JOIN a ON a.x = a.y"), "UNSUPPORTED_FEATURE", "self-joins");
+ok("three-table join parses", parse("SELECT * FROM a JOIN b ON a.x = b.x JOIN c ON b.y = c.y").kind === "select");
+ok("self-join with aliases parses", parse("SELECT * FROM a x JOIN a y ON x.pid = y.id").kind === "select");
+await expectSqlError("self-join without aliases", () => parse("SELECT * FROM a JOIN a ON a.x = a.y"), "DUPLICATE_TABLE_NAME", "alias");
 await expectSqlError("RIGHT JOIN", () => parse("SELECT * FROM a RIGHT JOIN b ON a.x = b.x"), "UNSUPPORTED_FEATURE", "RIGHT");
-await expectSqlError("ALTER TABLE", () => parse("ALTER TABLE a ADD COLUMN x text"), "UNSUPPORTED_FEATURE", "ALTER");
+ok("ALTER TABLE ADD COLUMN parses", parse("ALTER TABLE a ADD COLUMN x text").kind === "alter");
+ok("ADD without COLUMN keyword parses", parse("ALTER TABLE a ADD x integer").kind === "alter");
+await expectSqlError("DROP COLUMN says why", () => parse("ALTER TABLE a DROP COLUMN x"), "UNSUPPORTED_FEATURE", "time travel");
+await expectSqlError("RENAME says why", () => parse("ALTER TABLE a RENAME TO b"), "UNSUPPORTED_FEATURE", "time travel");
+await expectSqlError("ADD COLUMN NOT NULL is rejected", () => parse("ALTER TABLE a ADD COLUMN x text NOT NULL"), "UNSUPPORTED_FEATURE", "NULL");
+await expectSqlError("ADD COLUMN UNIQUE is rejected", () => parse("ALTER TABLE a ADD COLUMN x text UNIQUE"), "UNSUPPORTED_FEATURE", "retroactively");
+await expectSqlError("ADD COLUMN DEFAULT is rejected", () => parse("ALTER TABLE a ADD COLUMN x text DEFAULT 'y'"), "UNSUPPORTED_FEATURE", "backfill");
+await expectSqlError("ADD CONSTRAINT is rejected", () => parse("ALTER TABLE a ADD CONSTRAINT u UNIQUE (x)"), "UNSUPPORTED_FEATURE", "retroactively");
 await expectSqlError("CREATE VIEW", () => parse("CREATE VIEW v AS SELECT 1"), "UNSUPPORTED_FEATURE", "views");
 await expectSqlError("CREATE TRIGGER", () => parse("CREATE TRIGGER trg"), "UNSUPPORTED_FEATURE", "triggers");
 await expectSqlError("CREATE INDEX", () => parse("CREATE INDEX idx ON a (x)"), "UNSUPPORTED_FEATURE", "indexes");
@@ -140,6 +151,77 @@ const left = await db.sql`
   LEFT JOIN orders ON orders.customerId = customers.id
   WHERE orders.id IS NULL`;
 ok("LEFT JOIN finds customer with no orders", left.length === 1 && left[0].name === "Alan", fmt(left));
+
+// 3+ table joins and self-joins
+await db.sql`CREATE TABLE items (id text PRIMARY KEY, orderId text, sku text, qty integer)`;
+const firstOrders = await db.sql`SELECT id FROM orders ORDER BY createdAt LIMIT 2`;
+await db.sql`INSERT INTO items (orderId, sku, qty) VALUES (${String(firstOrders[0].id)}, ${"widget"}, ${2}), (${String(firstOrders[1].id)}, ${"gadget"}, ${1})`;
+const three = await db.sql`
+  SELECT customers.name, orders.total, items.sku FROM items
+  INNER JOIN orders ON items.orderId = orders.id
+  INNER JOIN customers ON orders.customerId = customers.id
+  ORDER BY items.sku`;
+ok("three-table join", three.length === 2 && three[0].sku === "gadget" && three.every((r) => r.name === "Ada"), fmt(three));
+const threeLeft = await db.sql`
+  SELECT customers.name, items.sku FROM customers
+  LEFT JOIN orders ON orders.customerId = customers.id
+  LEFT JOIN items ON items.orderId = orders.id
+  WHERE customers.name = ${"Alan"}`;
+ok("LEFT JOIN chain carries NULLs through", threeLeft.length === 1 && threeLeft[0].sku === null, fmt(threeLeft));
+await expectSqlError(
+  "ON must involve the joined table",
+  () => db.sql`SELECT customers.name FROM customers INNER JOIN orders ON orders.customerId = customers.id INNER JOIN items ON orders.id = customers.id`,
+  "INVALID_JOIN_CONDITION",
+);
+await db.sql`DROP TABLE items`;
+await db.sql`CREATE TABLE staff (id text PRIMARY KEY, name text, managerId text)`;
+await db.sql`INSERT INTO staff (id, name, managerId) VALUES (${"s1"}, ${"Root"}, ${null}), (${"s2"}, ${"Mid"}, ${"s1"}), (${"s3"}, ${"Leaf"}, ${"s2"})`;
+const selfJoin = await db.sql`SELECT e.name AS emp, m.name AS boss FROM staff e INNER JOIN staff m ON e.managerId = m.id ORDER BY emp`;
+ok("self-join with aliases", fmt(selfJoin) === '[{"emp":"Leaf","boss":"Mid"},{"emp":"Mid","boss":"Root"}]', fmt(selfJoin));
+const leftSelf = await db.sql`SELECT e.name AS emp FROM staff e LEFT JOIN staff m ON e.managerId = m.id WHERE m.id IS NULL`;
+ok("LEFT self-join finds the root", leftSelf.length === 1 && leftSelf[0].emp === "Root", fmt(leftSelf));
+await db.sql`DROP TABLE staff`;
+
+// uncorrelated subqueries — inner query first, result feeds the outer plan
+// (orders: Ada 100/110/120, Grace 130/140)
+const bigSpenders = await db.sql`SELECT name FROM customers WHERE id IN (SELECT customerId FROM orders WHERE total >= ${120}) ORDER BY name`;
+ok("IN (SELECT …)", fmt(bigSpenders.map((r) => r.name)) === '["Ada","Grace"]', fmt(bigSpenders));
+const orderless = await db.sql`SELECT name FROM customers WHERE id NOT IN (SELECT customerId FROM orders)`;
+ok("NOT IN (SELECT …)", orderless.length === 1 && orderless[0].name === "Alan", fmt(orderless));
+const maxOrder = await db.sql`SELECT total FROM orders WHERE total = (SELECT MAX(total) FROM orders)`;
+ok("scalar subquery (MAX)", maxOrder.length === 1 && maxOrder[0].total === 140, fmt(maxOrder));
+const aboveAvg = await db.sql`SELECT COUNT(*) AS n FROM orders WHERE total > (SELECT AVG(total) FROM orders)`;
+ok("scalar subquery in a comparison", aboveAvg[0].n === 2, fmt(aboveAvg));
+const nested = await db.sql`SELECT name FROM customers WHERE id IN (SELECT customerId FROM orders WHERE total = (SELECT MIN(total) FROM orders))`;
+ok("nested subquery", nested.length === 1 && nested[0].name === "Ada", fmt(nested));
+await db.sql`UPDATE orders SET status = ${"vip"} WHERE customerId IN (SELECT id FROM customers WHERE name = ${"Grace"})`;
+ok("subquery inside UPDATE", (await db.sql`SELECT COUNT(*) AS n FROM orders WHERE status = ${"vip"}`)[0].n === 2);
+await expectSqlError(
+  "multi-row scalar subquery is caught",
+  () => db.sql`SELECT name FROM customers WHERE id = (SELECT customerId FROM orders)`,
+  "SUBQUERY_MULTIPLE_ROWS",
+);
+await expectSqlError(
+  "multi-column subquery is caught",
+  () => db.sql`SELECT name FROM customers WHERE id IN (SELECT customerId, total FROM orders)`,
+  "SUBQUERY_SHAPE",
+);
+await expectSqlError(
+  "correlated subquery gets a pointed error",
+  () => db.sql`SELECT name FROM customers WHERE id IN (SELECT customerId FROM orders WHERE orders.customerId = customers.id)`,
+  "UNKNOWN_TABLE",
+  "correlated",
+);
+
+// additive ALTER TABLE — existing chunks untouched, absent keys read as NULL
+await db.sql`ALTER TABLE orders ADD COLUMN note text`;
+ok("added column reads NULL on existing rows", (await db.sql`SELECT COUNT(*) AS n FROM orders WHERE note IS NULL`)[0].n === 5);
+await db.sql`UPDATE orders SET note = ${"big"} WHERE total >= ${130}`;
+ok("UPDATE backfills the added column", (await db.sql`SELECT COUNT(*) AS n FROM orders WHERE note = ${"big"}`)[0].n === 2);
+const noteStar = await db.sql`SELECT * FROM orders WHERE total = ${100}`;
+ok("SELECT * includes the added column as NULL", noteStar.length === 1 && noteStar[0].note === null, fmt(noteStar));
+await expectSqlError("duplicate column is caught", () => db.sql`ALTER TABLE orders ADD COLUMN note text`, "DUPLICATE_COLUMN");
+await expectSqlError("ALTER on a missing table", () => db.sql`ALTER TABLE nope ADD COLUMN x text`, "UNKNOWN_TABLE");
 
 // GROUP BY + aggregates
 const grouped = await db.sql`
@@ -320,6 +402,23 @@ const drifted = larva({
   }),
 });
 await expectSqlError("schema drift is a loud startup error", () => drifted.sql`SELECT * FROM customers`, "SCHEMA_DRIFT", "code says integer");
+
+// additive drift auto-migrates: a plain new column in code is applied as ALTER TABLE ADD COLUMN
+const grown = larva({
+  prefix,
+  schema: defineSchema({
+    customers: {
+      id: t.text().primaryKey(),
+      name: t.text(),
+      email: t.text().unique(),
+      createdAt: t.timestamp().partitionBy(),
+      vip: t.boolean(), // new in code, not yet in the store
+    },
+    orders: { ...schemaTableClone(), note: t.text() },
+  }),
+});
+const grownRows = await grown.sql`SELECT name, vip FROM customers WHERE name = ${"Ada"}`;
+ok("additive drift auto-migrates", grownRows.length === 1 && grownRows[0].vip === null, fmt(grownRows));
 
 function schemaTableClone() {
   return {

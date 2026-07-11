@@ -48,6 +48,7 @@ const FUNC_HINTS: Record<string, string> = {
   DATE_TRUNC: "use DATE(x) for days or STRFTIME('%Y-%m', x) for months",
   DATETIME: "timestamps are ISO 8601 text; compare them directly or slice with DATE(x)",
   JSON_EXTRACT_PATH_TEXT: "use JSON_EXTRACT(column, '$.path') or the ->> operator",
+  EXISTS: "EXISTS is usually a correlated subquery, which Larva does not support; use IN (SELECT …) or a JOIN",
 };
 
 /**
@@ -106,7 +107,7 @@ class Parser {
   parseStatement(): Statement {
     const t = this.peek();
     if (t.type !== "keyword") throw this.err("expected a SQL statement");
-    for (const feature of ["UNION", "INTERSECT", "EXCEPT", "ALTER"]) {
+    for (const feature of ["UNION", "INTERSECT", "EXCEPT"]) {
       if (t.text === feature) throw unsupported(feature);
     }
 
@@ -129,6 +130,9 @@ class Parser {
         break;
       case "DROP":
         stmt = this.drop();
+        break;
+      case "ALTER":
+        stmt = this.alter();
         break;
       default:
         throw this.err(`unexpected keyword "${t.text}"`);
@@ -160,32 +164,35 @@ class Parser {
     const from = this.tableRef();
     const stmt: SelectStmt = { kind: "select", items, distinct, from };
 
-    // joins
-    const joinKeyword = this.peek();
-    if (joinKeyword.type === "keyword" && ["RIGHT", "FULL", "CROSS"].includes(joinKeyword.text)) {
-      throw new SqlError(
-        "UNSUPPORTED_FEATURE",
-        `${joinKeyword.text} JOIN is not supported in Larva v1; only INNER JOIN and LEFT JOIN are available`,
-      );
-    }
-    if (this.at("keyword", "INNER") || this.at("keyword", "LEFT") || this.at("keyword", "JOIN")) {
+    // joins — any number, left-deep, in statement order
+    const names = new Set([from.alias ?? from.table]);
+    for (;;) {
+      const joinKeyword = this.peek();
+      if (joinKeyword.type === "keyword" && ["RIGHT", "FULL", "CROSS"].includes(joinKeyword.text)) {
+        throw new SqlError(
+          "UNSUPPORTED_FEATURE",
+          `${joinKeyword.text} JOIN is not supported in Larva; only INNER JOIN and LEFT JOIN are available`,
+        );
+      }
+      if (!(this.at("keyword", "INNER") || this.at("keyword", "LEFT") || this.at("keyword", "JOIN"))) break;
       const type = this.eat("keyword", "LEFT") ? "left" : (this.eat("keyword", "INNER"), "inner" as const);
       this.eat("keyword", "OUTER");
       this.expect("keyword", "JOIN");
       this.rejectSubquery("JOIN");
       const table = this.tableRef();
-      if (table.table === from.table) {
-        throw new SqlError("UNSUPPORTED_FEATURE", "self-joins are not supported in Larva v1; fetch the table once and join in application code");
+      const name = table.alias ?? table.table;
+      if (names.has(name)) {
+        throw new SqlError(
+          "DUPLICATE_TABLE_NAME",
+          `"${name}" appears more than once in FROM/JOIN; give each occurrence its own alias (e.g. ${table.table} AS ${table.table.slice(0, 1)}2) so columns can be told apart`,
+        );
       }
+      names.add(name);
       this.expect("keyword", "ON");
       const leftCol = this.columnRef();
       this.expect("op", "=");
       const rightCol = this.columnRef();
-      stmt.join = { type, table, leftCol, rightCol };
-
-      if (this.at("keyword", "INNER") || this.at("keyword", "LEFT") || this.at("keyword", "JOIN")) {
-        throw new SqlError("UNSUPPORTED_FEATURE", "queries may join at most two tables in Larva v1; join the third table in application code");
-      }
+      (stmt.joins ??= []).push({ type, table, leftCol, rightCol });
     }
 
     if (this.eat("keyword", "WHERE")) {
@@ -349,6 +356,68 @@ class Parser {
     return { kind: "drop", table: this.ident("table name") };
   }
 
+  /** ALTER TABLE, additive only (Design §7): ADD COLUMN of a plain nullable
+   * column. Every other form is rejected by name with the reason. */
+  private alter(): Statement {
+    this.expect("keyword", "ALTER");
+    this.expect("keyword", "TABLE");
+    const table = this.ident("table name");
+
+    const word = this.peek().type === "ident" ? this.peek().text.toUpperCase() : this.peek().text;
+    if (word === "DROP") {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "ALTER TABLE … DROP COLUMN is not supported: removing a column needs a migration design that respects time travel; leave it NULL, or export/import into a new shape",
+      );
+    }
+    if (word === "RENAME") {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "ALTER TABLE … RENAME is not supported: renames need a migration design that respects time travel; add the new column and backfill it instead",
+      );
+    }
+    if (word !== "ADD") throw this.err("expected ADD COLUMN (the only supported ALTER TABLE form)");
+    this.next(); // ADD
+    if (this.peek().type === "ident" && this.peek().text.toUpperCase() === "CONSTRAINT") {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "ALTER TABLE … ADD CONSTRAINT is not supported: uniqueness on existing data cannot be enforced retroactively; declare constraints when creating the table",
+      );
+    }
+    if (this.peek().type === "ident" && this.peek().text.toUpperCase() === "COLUMN") this.next();
+
+    const name = this.ident("column name");
+    const type = this.ident("column type").toLowerCase();
+    if (this.at("keyword", "PRIMARY") || this.at("keyword", "UNIQUE")) {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "an added column must be a plain nullable column; PRIMARY KEY and UNIQUE cannot be enforced retroactively on existing rows — declare them when creating the table",
+      );
+    }
+    if (this.at("keyword", "NOT")) {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "an added column is nullable by construction — existing rows read it as NULL; backfill with UPDATE, then treat it as required in application code",
+      );
+    }
+    if (this.peek().type === "ident" && this.peek().text.toUpperCase() === "DEFAULT") {
+      throw new SqlError(
+        "UNSUPPORTED_FEATURE",
+        "DEFAULT on an added column is not supported: existing rows read the column as NULL; backfill with UPDATE … { allowFullTable: true } if every row needs a value",
+      );
+    }
+    // REFERENCES parses and is recorded nowhere, exactly as in CREATE TABLE —
+    // foreign keys are declared in the code-first schema.
+    if (this.eat("keyword", "REFERENCES")) {
+      this.ident("referenced table");
+      if (this.eat("punct", "(")) {
+        this.ident("referenced column");
+        this.expect("punct", ")");
+      }
+    }
+    return { kind: "alter", table, column: { name, type } };
+  }
+
   private returning(): SelectItem[] | null | undefined {
     if (!this.eat("keyword", "RETURNING")) return undefined;
     if (this.eat("punct", "*")) return null;
@@ -381,13 +450,27 @@ class Parser {
     return { expr, alias };
   }
 
+  /** Derived tables stay out (Design §7): a subquery is legal in expressions
+   * (WHERE/IN/scalar positions), not as a table source. */
   private rejectSubquery(where: string): void {
     if (this.at("punct", "(") && this.peek(1).type === "keyword" && this.peek(1).text === "SELECT") {
       throw new SqlError(
         "UNSUPPORTED_FEATURE",
-        `subqueries are not supported in Larva v1 (found one in ${where}); run the inner query first and interpolate its result`,
+        `a subquery cannot be a table source in ${where} (derived tables are not supported); subqueries are allowed in WHERE, e.g. WHERE id IN (SELECT …)`,
       );
     }
+  }
+
+  /** The opening paren and SELECT keyword are still un-consumed. */
+  private subquery(): SelectStmt {
+    this.expect("punct", "(");
+    const query = this.select();
+    this.expect("punct", ")");
+    return query;
+  }
+
+  private atSubquery(): boolean {
+    return this.at("punct", "(") && this.peek(1).type === "keyword" && this.peek(1).text === "SELECT";
   }
 
   // --- expressions (Pratt: OR < AND < NOT < comparison < additive/|| < multiplicative < primary) ---
@@ -417,7 +500,7 @@ class Parser {
     const negated = this.eat("keyword", "NOT");
 
     if (this.eat("keyword", "IN")) {
-      this.rejectSubquery("IN");
+      if (this.atSubquery()) return { kind: "insub", expr: left, query: this.subquery(), negated };
       this.expect("punct", "(");
       const list = [this.additive()];
       while (this.eat("punct", ",")) list.push(this.additive());
@@ -465,8 +548,8 @@ class Parser {
   }
 
   private primary(): Expr {
+    if (this.atSubquery()) return { kind: "subquery", query: this.subquery() };
     if (this.eat("punct", "(")) {
-      this.rejectSubquery("an expression");
       const inner = this.expr();
       this.expect("punct", ")");
       return inner;
@@ -490,7 +573,7 @@ class Parser {
     }
     if (this.at("ident")) return this.columnRef();
     if (this.at("keyword", "SELECT")) {
-      throw new SqlError("UNSUPPORTED_FEATURE", "subqueries are not supported in Larva v1; run the inner query first and interpolate its result");
+      throw this.err("wrap the subquery in parentheses, e.g. (SELECT …)");
     }
     throw this.err("expected a value, column, or parenthesized expression");
   }

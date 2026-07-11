@@ -31,8 +31,8 @@ Larva is built for apps where an agent writes the SQL. This page holds the promp
 Every rejection is machine-readable and names its alternative, because agents self-correct from specific messages:
 
 ```
-UNSUPPORTED_FEATURE: subqueries are not supported in Larva v1 (found one in IN);
-run the inner query first and interpolate its result
+UNSUPPORTED_FEATURE: window functions are not supported in Larva v1;
+compute windows in application code — tables at this scale fit in memory
 ```
 
 The canonical source is [`docs/larva-for-agents.md`](https://github.com/pango07/larva-db/blob/main/docs/larva-for-agents.md) in the repo — this page and `/llms.txt` render the same file, so none of the three can drift.
