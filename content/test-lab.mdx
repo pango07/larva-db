@@ -14,6 +14,10 @@ Type any statement in [the dialect](/docs/sql) and run it live. The example chip
 
 **Export buttons** produce real files — the Postgres one loads with `psql $DATABASE_URL < larva-demo.sql`. **Reset demo data** re-seeds everything; mangle freely, that's the point.
 
+## The data viewer
+
+[`/viewer`](/viewer) browses the same store visually: paged, sortable tables; a **version scrubber** that time-travels through every commit (`asOf`, live); and a chunk/zone-map internals panel powered by [`db.inspect()`](/docs/api#dbinspectversion). Scrubbing is itself a demo of the architecture — watch a table grow from one chunk to several, and the format version flip, as history replays.
+
 ## The stress lab
 
 The bottom of the home page hammers one database with concurrent writers, then audits the final state for lost updates, duplicates, and version drift — the commit protocol's core promise, tested against the real store on every click.
