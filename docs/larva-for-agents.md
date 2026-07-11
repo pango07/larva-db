@@ -48,6 +48,10 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
 - `UPDATE ... WHERE`, `DELETE ... WHERE`, `CREATE TABLE`, `DROP TABLE`.
 - `ALTER TABLE t ADD COLUMN name type` — plain nullable columns only.
   Existing rows read the new column as NULL; backfill with UPDATE if needed.
+- `CREATE INDEX ON table (column)` / `DROP INDEX ON table (column)` — one
+  index per column, addressed by column (index names are ignored). Indexes
+  make =/IN/range filters on that column prune storage reads; they are
+  performance-only and never affect results.
 
 ## Schema features to know
 
@@ -62,6 +66,10 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
   otherwise prefer `t.uuid()`.
 - Composite unique constraints come from `defineSchema`'s second argument:
   `defineSchema(spec, { uniques: { orders: [["customerId", "sku"]] } })`.
+- `.index()` on a column (e.g. `t.text().index()`) maintains a secondary
+  index so filters on it prune storage reads. Use it for columns you filter
+  on often (foreign keys, emails, statuses); the primary key and the
+  `.partitionBy()` column never need it.
 
 ## NOT supported — do not emit
 
@@ -86,10 +94,10 @@ follow it.
 
 ## Performance rules of thumb
 
-- Filters on the primary key or the one `.partitionBy()` column prune
-  storage reads aggressively. Filter on the RAW column:
-  `createdAt >= ${"2026-07-01"}` prunes; `DATE(createdAt) >= ...` scans
-  (still correct, just slower).
+- Filters on the primary key, the one `.partitionBy()` column, or any
+  `.index()`ed column prune storage reads aggressively. Filter on the RAW
+  column: `createdAt >= ${"2026-07-01"}` prunes; `DATE(createdAt) >= ...`
+  scans (still correct, just slower).
 - Everything else scans the table — fine at tens of thousands of rows.
 - Write throughput is roughly one commit per second across all writers;
   batch related statements into one transaction instead of many commits.

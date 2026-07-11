@@ -25,6 +25,12 @@ export interface ColumnDef {
    * stores). The writer invents the value, so unlike sequence there is
    * nothing to coordinate — contention-free identity. */
   uuid?: boolean;
+  /** Maintain a secondary index blob (chunkId → sorted distinct values) so
+   * equality/range/IN filters on this column prune chunks. Performance-only
+   * metadata: staleness or a missing blob degrades pruning, never results,
+   * so no format bump is required and index flags are auto-synced (not
+   * drift) at connect. */
+  indexed?: boolean;
 }
 
 export interface TableSchema {
@@ -89,6 +95,14 @@ export class ColumnBuilder<T> {
   /** @internal — use t.uuid(). */
   markUuid(): this {
     this.def.uuid = true;
+    return this;
+  }
+
+  /** Maintain a secondary index on this column so equality, range, and IN
+   * filters prune chunks. Best on selective columns (emails, foreign keys,
+   * user ids); the primary key and .partitionBy() column never need one. */
+  index(): this {
+    this.def.indexed = true;
     return this;
   }
 

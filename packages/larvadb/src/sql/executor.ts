@@ -1,4 +1,4 @@
-import { ChunkRef, cmpScalar, CommitStats, LarvaProto, Manifest, Row, Scalar, Snapshot } from "../core";
+import { ChunkRef, cmpScalar, CommitStats, IndexBlob, IndexRef, LarvaProto, Manifest, Row, Scalar, Snapshot } from "../core";
 import { DatabaseSchema, fillAbsentColumns, TableSchema, validateInsert } from "../schema";
 import {
   Aggregate,
@@ -27,6 +27,36 @@ const COLUMN_TYPES: Record<string, TableSchema["columns"][string]["type"]> = {
   float: "real", double: "real", boolean: "boolean", bool: "boolean",
   timestamp: "timestamp", datetime: "timestamp",
 };
+
+/** One chunk's entry in a secondary index: sorted distinct non-NULL values. */
+function distinctSorted(rows: Row[], col: string): Scalar[] {
+  return [...new Set(rows.map((r) => r[col] ?? null).filter((v) => v !== null))].sort(cmpScalar);
+}
+
+function sortedHas(vals: Scalar[], v: Scalar): boolean {
+  let lo = 0;
+  let hi = vals.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const c = cmpScalar(vals[mid], v);
+    if (c === 0) return true;
+    if (c < 0) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return false;
+}
+
+/** Any value in the sorted array within [lo, hi]? */
+function sortedOverlaps(vals: Scalar[], lo: Scalar, hi: Scalar): boolean {
+  let a = 0;
+  let b = vals.length;
+  while (a < b) {
+    const mid = (a + b) >> 1;
+    if (cmpScalar(vals[mid], lo) < 0) a = mid + 1;
+    else b = mid;
+  }
+  return a < vals.length && cmpScalar(vals[a], hi) <= 0;
+}
 
 export interface ExecOptions {
   allowFullTable?: boolean;
@@ -121,6 +151,10 @@ export class Executor {
         return this.planDrop(stmt.table, snap);
       case "alter":
         return this.planAlter(stmt, snap);
+      case "createIndex":
+        return this.planCreateIndex(stmt, snap);
+      case "dropIndex":
+        return this.planDropIndex(stmt, snap);
     }
   }
 
@@ -568,7 +602,7 @@ export class Executor {
   ): Promise<{ ref: ChunkRef; rows: Row[] }[]> {
     const refs = snap.manifest.tables[table]?.chunks ?? [];
     const bounds = where ? this.pruneBounds(where, schema, ctxName, params) : {};
-    const survivors = refs.filter((ref) => {
+    let survivors = refs.filter((ref) => {
       if (!ref.stats) return true;
       const pk = bounds[schema.primaryKey];
       if (pk && (cmpScalar(ref.stats.pkMax, pk.lo) < 0 || cmpScalar(ref.stats.pkMin, pk.hi) > 0)) return false;
@@ -583,6 +617,27 @@ export class Executor {
       }
       return true;
     });
+
+    // Secondary indexes: for each bounded column with an index, keep only the
+    // chunks whose distinct-value entry can satisfy the predicate. A chunk id
+    // absent from the index, or a missing index blob, means "always fetch" —
+    // staleness degrades pruning, never results.
+    const indexes = snap.manifest.tables[table]?.indexes;
+    if (indexes && survivors.length > 0) {
+      for (const [col, b] of Object.entries(bounds)) {
+        const ref = indexes[col];
+        if (!ref) continue;
+        const blob = await this.proto.readIndex(ref);
+        if (!blob) continue;
+        survivors = survivors.filter((c) => {
+          const vals = blob[c.id];
+          if (!vals) return true;
+          if (!sortedOverlaps(vals, b.lo, b.hi)) return false;
+          return b.values ? b.values.some((v) => sortedHas(vals, v)) : true;
+        });
+        if (survivors.length === 0) break;
+      }
+    }
     this.lastStats = { chunksTotal: refs.length, chunksFetched: survivors.length };
     // Chunks written before an ALTER TABLE lack the added columns — absent
     // keys read as NULL. fillAbsentColumns never mutates the cached rows.
@@ -600,17 +655,22 @@ export class Executor {
     schema: TableSchema,
     ctxName: string,
     params: Scalar[],
-  ): Record<string, { lo: Scalar; hi: Scalar }> {
-    const bounds: Record<string, { lo: Scalar; hi: Scalar }> = {};
+  ): Record<string, { lo: Scalar; hi: Scalar; values?: Scalar[] }> {
+    const bounds: Record<string, { lo: Scalar; hi: Scalar; values?: Scalar[] }> = {};
     const scalarOf = (e: Expr): Scalar | undefined =>
       e.kind === "literal" ? e.value : e.kind === "param" ? params[e.index] : undefined;
     const colOf = (e: Expr): string | undefined =>
       e.kind === "column" && (!e.table || e.table === ctxName) ? e.name : undefined;
-    const narrow = (col: string, lo: Scalar, hi: Scalar) => {
+    // `values` carries the exact =/IN candidate set for index membership
+    // checks; ranges leave it unset. Keeping either side's set on merge is a
+    // superset check — safe for pruning.
+    const narrow = (col: string, lo: Scalar, hi: Scalar, values?: Scalar[]) => {
       const cur = bounds[col];
-      bounds[col] = cur
+      const merged = cur
         ? { lo: cmpScalar(lo, cur.lo) > 0 ? lo : cur.lo, hi: cmpScalar(hi, cur.hi) < 0 ? hi : cur.hi }
         : { lo, hi };
+      const keep = cur?.values && values ? cur.values.filter((v) => values.includes(v)) : (cur?.values ?? values);
+      bounds[col] = { ...merged, ...(keep ? { values: keep } : {}) };
     };
     const MIN: Scalar = null; // null sorts first in cmpScalar → acts as -infinity
     const MAX = "￿￿￿￿"; // above any ISO timestamp / ULID / practical text
@@ -629,7 +689,7 @@ export class Executor {
         if (col === undefined || val === undefined || val === null) return;
         if (!(col in schema.columns)) return;
         if (typeof val === "number" || typeof val === "string") {
-          if (op === "=") narrow(col, val, val);
+          if (op === "=") narrow(col, val, val, [val]);
           else if (op === "<" || op === "<=") narrow(col, MIN, val);
           else narrow(col, val, MAX);
         }
@@ -647,7 +707,7 @@ export class Executor {
         const vals = e.list.map(scalarOf);
         if (col && col in schema.columns && vals.every((v) => v !== undefined && v !== null)) {
           const sorted = [...(vals as Scalar[])].sort(cmpScalar);
-          narrow(col, sorted[0], sorted[sorted.length - 1]);
+          narrow(col, sorted[0], sorted[sorted.length - 1], sorted);
         }
       }
     };
@@ -985,6 +1045,37 @@ export class Executor {
     return this.returningRows(rows, returning, table);
   }
 
+  /**
+   * Re-stage `table`'s secondary-index blobs to reflect a chunk change in the
+   * commit being planned: drop retired chunk entries, add entries for new
+   * chunks. Reads the planning snapshot's blobs (immutable, cached). Also the
+   * fold path's maintenance hook (LarvaDb). Returns {} when nothing is indexed.
+   */
+  async stageIndexUpdates(
+    snap: Snapshot,
+    table: string,
+    schema: TableSchema,
+    retiredIds: string[],
+    added: { ref: ChunkRef; rows: Row[] }[],
+  ): Promise<Record<string, IndexRef>> {
+    const cols = Object.keys(schema.columns).filter((c) => schema.columns[c].indexed);
+    if (cols.length === 0) return {};
+    const out: Record<string, IndexRef> = {};
+    for (const col of cols) {
+      const cur = snap.manifest.tables[table]?.indexes?.[col];
+      const blob: IndexBlob = { ...(cur ? ((await this.proto.readIndex(cur)) ?? {}) : {}) };
+      for (const id of retiredIds) delete blob[id];
+      for (const { ref, rows } of added) blob[ref.id] = distinctSorted(rows, col);
+      out[col] = await this.proto.stageIndex(table, col, blob);
+    }
+    return out;
+  }
+
+  /** Apply staged index refs to a manifest's table entry (inside apply()). */
+  private static repointIndexes(t: { indexes?: Record<string, IndexRef> }, updates: Record<string, IndexRef>): void {
+    for (const [col, ref] of Object.entries(updates)) (t.indexes ??= {})[col] = ref;
+  }
+
   private async planInsert(stmt: InsertStmt, params: Scalar[], snap: Snapshot): Promise<PlanOutcome> {
     const schema = this.schemaOf(snap.manifest, stmt.table);
     const incoming = await this.prepareRows(stmt, params, schema);
@@ -1159,16 +1250,26 @@ export class Executor {
 
     const statsCols = { pk: schema.primaryKey, part: schema.partitionColumn };
     const replacements: { retired: ChunkRef; replacement: ChunkRef }[] = [];
+    const staged: { ref: ChunkRef; rows: Row[] }[] = [];
     for (const ci of dirty) {
-      replacements.push({
-        retired: loaded[ci].ref,
-        replacement: await this.proto.stageChunk(stmt.table, loaded[ci].rows, statsCols),
-      });
+      const replacement = await this.proto.stageChunk(stmt.table, loaded[ci].rows, statsCols);
+      replacements.push({ retired: loaded[ci].ref, replacement });
+      staged.push({ ref: replacement, rows: loaded[ci].rows });
     }
     const appended: ChunkRef[] = [];
     for (let i = 0; i < pending.length; i += CHUNK_TARGET_ROWS) {
-      appended.push(await this.proto.stageChunk(stmt.table, pending.slice(i, i + CHUNK_TARGET_ROWS), statsCols));
+      const slice = pending.slice(i, i + CHUNK_TARGET_ROWS);
+      const ref = await this.proto.stageChunk(stmt.table, slice, statsCols);
+      appended.push(ref);
+      staged.push({ ref, rows: slice });
     }
+    const indexUpdates = await this.stageIndexUpdates(
+      snap,
+      stmt.table,
+      schema,
+      replacements.map((r) => r.retired.id),
+      staged,
+    );
 
     return {
       apply: (m) => {
@@ -1180,6 +1281,7 @@ export class Executor {
           t.chunks[idx] = replacement;
         }
         t.chunks.push(...appended);
+        Executor.repointIndexes(t, indexUpdates);
         return m;
       },
       rows: this.returningRows(resultRows, stmt.returning, stmt.table),
@@ -1229,6 +1331,7 @@ export class Executor {
       const chunks = await this.fetchTable(snap, table, schema, where, table, params);
       const affected: Row[] = [];
       const replacements: { retired: ChunkRef; replacement: ChunkRef | null }[] = [];
+      const staged: { ref: ChunkRef; rows: Row[] }[] = [];
       const statsCols = { pk: schema.primaryKey, part: schema.partitionColumn };
 
       for (const { ref, rows } of chunks) {
@@ -1253,12 +1356,18 @@ export class Executor {
           }
         }
         if (touched) {
-          replacements.push({
-            retired: ref,
-            replacement: out.length > 0 ? await this.proto.stageChunk(table, out, statsCols) : null,
-          });
+          const replacement = out.length > 0 ? await this.proto.stageChunk(table, out, statsCols) : null;
+          replacements.push({ retired: ref, replacement });
+          if (replacement) staged.push({ ref: replacement, rows: out });
         }
       }
+      const indexUpdates = await this.stageIndexUpdates(
+        snap,
+        table,
+        schema,
+        replacements.map((r) => r.retired.id),
+        staged,
+      );
 
       return {
         apply: (m) => {
@@ -1270,6 +1379,7 @@ export class Executor {
             if (replacement) t.chunks[idx] = replacement;
             else t.chunks.splice(idx, 1);
           }
+          Executor.repointIndexes(t, indexUpdates);
           return m;
         },
         rows: this.returningRows(affected, returning, table),
@@ -1330,6 +1440,75 @@ export class Executor {
           columns: { ...live.columns, [column.name]: { type, primaryKey: false, unique: false, partitionBy: false } },
         };
         m.schema = { ...((m.schema ?? {}) as DatabaseSchema), [table]: next };
+        return m;
+      },
+      rows: [],
+    };
+  }
+
+  /** Build the full index from the current chunk set, then commit the ref +
+   * schema flag atomically. Any chunk change underneath forces a rebuild via
+   * re-execution, so the initial build always covers the committed state. */
+  private async planCreateIndex(stmt: Extract<Statement, { kind: "createIndex" }>, snap: Snapshot): Promise<PlanOutcome> {
+    const schema = this.schemaOf(snap.manifest, stmt.table);
+    const { table, column } = stmt;
+    if (!(column in schema.columns)) {
+      throw new SqlError("UNKNOWN_COLUMN", `column "${column}" does not exist in table "${table}" (columns: ${Object.keys(schema.columns).join(", ")})`);
+    }
+    if (schema.columns[column].indexed) {
+      if (stmt.ifNotExists) return { apply: (m) => m, rows: [] };
+      throw new SqlError("INDEX_EXISTS", `column "${table}.${column}" is already indexed; DROP INDEX ON ${table} (${column}) first`);
+    }
+    const chunks = snap.manifest.tables[table]?.chunks ?? [];
+    const blob: IndexBlob = {};
+    for (const ref of chunks) {
+      blob[ref.id] = distinctSorted(await this.proto.readChunk(ref), column);
+    }
+    const idxRef = await this.proto.stageIndex(table, column, blob);
+    const baseSig = chunks.map((c) => c.id).join(",");
+    return {
+      apply: (m) => {
+        const t = m.tables[table];
+        if (!t || t.chunks.map((c) => c.id).join(",") !== baseSig) return null; // chunks moved — rebuild
+        (t.indexes ??= {})[column] = idxRef;
+        const s = (m.schema ?? {}) as DatabaseSchema;
+        const live = s[table];
+        if (live?.columns[column]) {
+          m.schema = {
+            ...s,
+            [table]: { ...live, columns: { ...live.columns, [column]: { ...live.columns[column], indexed: true } } },
+          };
+        }
+        return m;
+      },
+      rows: [],
+    };
+  }
+
+  private async planDropIndex(stmt: Extract<Statement, { kind: "dropIndex" }>, snap: Snapshot): Promise<PlanOutcome> {
+    const schema = this.schemaOf(snap.manifest, stmt.table);
+    const { table, column } = stmt;
+    if (!(column in schema.columns)) {
+      throw new SqlError("UNKNOWN_COLUMN", `column "${column}" does not exist in table "${table}" (columns: ${Object.keys(schema.columns).join(", ")})`);
+    }
+    if (!schema.columns[column].indexed) {
+      throw new SqlError("INDEX_NOT_FOUND", `there is no index on "${table}.${column}"`);
+    }
+    return {
+      apply: (m) => {
+        const t = m.tables[table];
+        if (!t) return null;
+        if (t.indexes) {
+          delete t.indexes[column];
+          if (Object.keys(t.indexes).length === 0) delete t.indexes;
+        }
+        const s = (m.schema ?? {}) as DatabaseSchema;
+        const live = s[table];
+        if (live?.columns[column]) {
+          const rest = { ...live.columns[column] };
+          delete rest.indexed;
+          m.schema = { ...s, [table]: { ...live, columns: { ...live.columns, [column]: rest } } };
+        }
         return m;
       },
       rows: [],

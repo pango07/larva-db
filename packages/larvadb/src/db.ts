@@ -1,4 +1,4 @@
-import { AppendIntent, cmpScalar, ConflictError, IntentVerdict, LarvaProto, Manifest, OrderedIntent, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
+import { AppendIntent, cmpScalar, ConflictError, IndexRef, IntentVerdict, LarvaProto, Manifest, OrderedIntent, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
 import { ColumnDef, DatabaseSchema, fillAbsentColumns, SchemaError, schemaDrift, TableSchema } from "./schema";
 import { hasSubquery, InsertStmt } from "./sql/ast";
 import { SqlError } from "./sql/errors";
@@ -206,6 +206,33 @@ export class LarvaDb {
           return m;
         },
       }));
+    }
+
+    // Indexes are performance metadata, never drift: .index() flags in code
+    // are synced to the store in both directions (a create backfills from the
+    // existing chunks — bounded by table size, which is small by design).
+    // Tables created above embed their flags directly and self-initialize on
+    // first write, so only pre-existing tables can disagree.
+    const flagsDiffer = Object.entries(code).some(
+      ([table, ct]) =>
+        live[table] &&
+        Object.entries(ct.columns).some(
+          ([col, def]) => (def.indexed ?? false) !== (virtual[table]?.columns[col]?.indexed ?? false),
+        ),
+    );
+    if (!flagsDiffer) return;
+    const synced = ((await this.proto.snapshot()).manifest.schema ?? {}) as DatabaseSchema;
+    for (const [table, codeTable] of Object.entries(code)) {
+      if (!live[table]) continue;
+      for (const [col, def] of Object.entries(codeTable.columns)) {
+        const liveIndexed = synced[table]?.columns[col]?.indexed ?? false;
+        if ((def.indexed ?? false) === liveIndexed) continue;
+        if (def.indexed) {
+          await this.executor.execute({ kind: "createIndex", table, column: col, ifNotExists: true }, [], {});
+        } else {
+          await this.executor.execute({ kind: "dropIndex", table, column: col }, [], {});
+        }
+      }
     }
   }
 
@@ -504,19 +531,25 @@ export class LarvaDb {
           }
         }
 
-        const staged: { table: string; ref: Awaited<ReturnType<LarvaProto["stageChunk"]>>; baseSig: string }[] = [];
+        const staged: {
+          table: string;
+          ref: Awaited<ReturnType<LarvaProto["stageChunk"]>>;
+          baseSig: string;
+          indexUpdates: Record<string, IndexRef>;
+        }[] = [];
         for (const [table, rows] of merged) {
           const ts = schema[table];
           if (!ts || !snap.manifest.tables[table]) continue; // table dropped since the append — rows go with it
           const fresh = await this.dropExisting(snap, table, ts, rows);
           if (fresh.length === 0) continue;
           const ref = await this.proto.stageChunk(table, fresh, { pk: ts.primaryKey, part: ts.partitionColumn });
-          staged.push({ table, ref, baseSig: snap.manifest.tables[table].chunks.map((c) => c.id).join(",") });
+          const indexUpdates = await this.executor.stageIndexUpdates(snap, table, ts, [], [{ ref, rows: fresh }]);
+          staged.push({ table, ref, baseSig: snap.manifest.tables[table].chunks.map((c) => c.id).join(","), indexUpdates });
         }
 
         return {
           apply: (m) => {
-            for (const { table, ref, baseSig } of staged) {
+            for (const { table, ref, baseSig, indexUpdates } of staged) {
               const t = m.tables[table];
               if (!t) continue;
               // The idempotence check ran against the planning snapshot; any
@@ -524,6 +557,7 @@ export class LarvaDb {
               // forces re-execution so it runs again. Correctness keystone.
               if (t.chunks.map((c) => c.id).join(",") !== baseSig) return null;
               t.chunks.push(ref);
+              for (const [col, r] of Object.entries(indexUpdates)) (t.indexes ??= {})[col] = r;
             }
             return m;
           },
@@ -799,23 +833,35 @@ export class LarvaDb {
       }
     }
 
+    // Index blobs live under tables/ like chunks and are retained by the
+    // same reachability rule. (A blob deleted anyway — e.g. by an older
+    // client's vacuum — only disables pruning; readIndex degrades to null.)
     const referenced = new Set<string>();
-    for (const t of Object.values(snap.manifest.tables)) for (const c of t.chunks) referenced.add(c.path);
+    const referTable = (t: Manifest["tables"][string]): void => {
+      for (const c of t.chunks) referenced.add(c.path);
+      for (const r of Object.values(t.indexes ?? {})) referenced.add(r.path);
+    };
+    for (const t of Object.values(snap.manifest.tables)) referTable(t);
     for (const v of keepVersions) {
       const m = await this.proto.historyManifest(v);
-      if (m) for (const t of Object.values(m.tables)) for (const c of t.chunks) referenced.add(c.path);
+      if (m) for (const t of Object.values(m.tables)) referTable(t);
     }
     // Chunks introduced by retained log entries are reachable by time travel;
     // the raw checkpoint's chunks guard the rare case where its twin history
     // write was lost.
     for (const v of keepEntryVersions) {
       const e = await this.proto.readLogEntry(v);
-      if (e) for (const d of Object.values(e.tables)) if (d) for (const c of d.add) referenced.add(c.path);
+      if (!e) continue;
+      for (const d of Object.values(e.tables)) {
+        if (!d) continue;
+        for (const c of d.add) referenced.add(c.path);
+        for (const r of Object.values(d.indexes ?? {})) if (r) referenced.add(r.path);
+      }
     }
     const rawCheckpoint = await this.proto.store.get(`${prefix}manifest.json`);
     if (rawCheckpoint) {
       const cp = JSON.parse(rawCheckpoint.body) as Manifest;
-      for (const t of Object.values(cp.tables)) for (const c of t.chunks) referenced.add(c.path);
+      for (const t of Object.values(cp.tables)) referTable(t);
     }
 
     const dropChunks = objects

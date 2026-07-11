@@ -6,11 +6,11 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-275_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-296_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Current release: 2.5.0.** Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Current release: 2.6.0.** Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -234,7 +234,7 @@ When you get there, congratulations: run the export and graduate — `psql $DATA
 
 ## SQL dialect
 
-Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, `CAST`, scalar functions (`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ROUND`, `ABS`, `COALESCE`, `NULLIF`, `IFNULL`, `REPLACE`, `CEIL`, `FLOOR`, `MOD`, `SUBSTR`), date helpers (`NOW()`/`CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` — timestamps are ISO text, so this is cheap and range filters stay prunable), and JSON over text columns (`JSON_EXTRACT(col, '$.a[0]')`, `->>`); `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` over expressions or aliases (`GROUP BY DATE(createdAt)`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`GROUP_CONCAT` (incl. `COUNT(DISTINCT …)`) and `HAVING`, `INNER`/`LEFT JOIN` across any number of tables including self-joins; uncorrelated subqueries (`WHERE id IN (SELECT …)`, scalar comparisons); `INSERT` (multi-row, `RETURNING`) with `ON CONFLICT` upsert — single-column or composite targets; `UPDATE`/`DELETE ... WHERE`; `CREATE`/`DROP TABLE`; additive `ALTER TABLE … ADD COLUMN` (existing rows read the new column as `NULL` — and with a code-first schema, adding a plain column to `defineSchema` auto-migrates at connect).
+Real SQL strings, deliberately scoped: `SELECT` (with `DISTINCT`) over full expressions — arithmetic, `||` concatenation, `CASE WHEN`, `CAST`, scalar functions (`UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ROUND`, `ABS`, `COALESCE`, `NULLIF`, `IFNULL`, `REPLACE`, `CEIL`, `FLOOR`, `MOD`, `SUBSTR`), date helpers (`NOW()`/`CURRENT_TIMESTAMP`, `DATE(x)`, `STRFTIME('%Y-%m', x)` — timestamps are ISO text, so this is cheap and range filters stay prunable), and JSON over text columns (`JSON_EXTRACT(col, '$.a[0]')`, `->>`); `WHERE` (`=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`, `IS NULL`), `ORDER BY`, `LIMIT`/`OFFSET`, `GROUP BY` over expressions or aliases (`GROUP BY DATE(createdAt)`) with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`GROUP_CONCAT` (incl. `COUNT(DISTINCT …)`) and `HAVING`, `INNER`/`LEFT JOIN` across any number of tables including self-joins; uncorrelated subqueries (`WHERE id IN (SELECT …)`, scalar comparisons); `INSERT` (multi-row, `RETURNING`) with `ON CONFLICT` upsert — single-column or composite targets; `UPDATE`/`DELETE ... WHERE`; `CREATE`/`DROP TABLE`; `CREATE`/`DROP INDEX` (secondary indexes — non-key filters prune storage reads; declare in code with `.index()`); additive `ALTER TABLE … ADD COLUMN` (existing rows read the new column as `NULL` — and with a code-first schema, adding a plain column to `defineSchema` auto-migrates at connect).
 
 Not supported: correlated subqueries, derived tables, window functions, `UNION`, `RIGHT`/`FULL`/`CROSS` joins, `DROP COLUMN`/`RENAME`, views, triggers. Every exclusion is rejected **by name, with an alternative**, and near-miss spellings are redirected (`CONCAT` → `||`, `SUBSTRING` → `SUBSTR`, `DATE_TRUNC` → `DATE`/`STRFTIME`).
 
@@ -268,7 +268,7 @@ The editable source for these lives at [docs/larva-architecture.excalidraw](docs
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **275 checks across seven suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **296 checks across seven suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|
@@ -329,7 +329,7 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, 
 - New SQL features need three things: parser + executor + a named, helpful rejection message for whatever adjacent thing is still unsupported.
 - Keep `LARVA-DESIGN.md` in sync — it's the spec of record, and it documents *why*, not just *what*.
 
-**Good first issues**: additional storage adapters (Azure Blob, GCS — the contract is four operations, ~200 lines), columnar chunk format, secondary index blobs, `DROP COLUMN`/`RENAME` with a time-travel-safe migration story.
+**Good first issues**: additional storage adapters (Azure Blob, GCS — the contract is four operations, ~200 lines), columnar chunk format, `DROP COLUMN`/`RENAME` with a time-travel-safe migration story.
 
 ## License
 

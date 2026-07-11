@@ -54,7 +54,12 @@ await expectSqlError("ADD COLUMN DEFAULT is rejected", () => parse("ALTER TABLE 
 await expectSqlError("ADD CONSTRAINT is rejected", () => parse("ALTER TABLE a ADD CONSTRAINT u UNIQUE (x)"), "UNSUPPORTED_FEATURE", "retroactively");
 await expectSqlError("CREATE VIEW", () => parse("CREATE VIEW v AS SELECT 1"), "UNSUPPORTED_FEATURE", "views");
 await expectSqlError("CREATE TRIGGER", () => parse("CREATE TRIGGER trg"), "UNSUPPORTED_FEATURE", "triggers");
-await expectSqlError("CREATE INDEX", () => parse("CREATE INDEX idx ON a (x)"), "UNSUPPORTED_FEATURE", "indexes");
+ok("CREATE INDEX parses (name accepted, ignored)", parse("CREATE INDEX idx ON a (x)").kind === "createIndex");
+ok("CREATE INDEX IF NOT EXISTS parses", parse("CREATE INDEX IF NOT EXISTS ON a (x)").kind === "createIndex");
+ok("DROP INDEX ON table (column) parses", parse("DROP INDEX ON a (x)").kind === "dropIndex");
+await expectSqlError("CREATE UNIQUE INDEX is rejected", () => parse("CREATE UNIQUE INDEX u ON a (x)"), "UNSUPPORTED_FEATURE", "performance-only");
+await expectSqlError("composite index is rejected", () => parse("CREATE INDEX ON a (x, y)"), "UNSUPPORTED_FEATURE", "selective");
+await expectSqlError("DROP INDEX by name hints the form", () => parse("DROP INDEX idx_name"), "UNSUPPORTED_FEATURE", "DROP INDEX ON");
 await expectSqlError("stacked statements", () => parse("SELECT * FROM a; DROP TABLE a"), "MULTIPLE_STATEMENTS", "injection");
 await expectSqlError("unknown function lists the whole catalog", () => parse("SELECT MEDIAN(x) FROM a"), "UNKNOWN_FUNCTION", "COALESCE");
 await expectSqlError("CONCAT hints at ||", () => parse("SELECT CONCAT(a, b) FROM t"), "UNKNOWN_FUNCTION", "||");
@@ -398,6 +403,18 @@ console.log(`  pruning: fetched ${stats.chunksFetched} of ${stats.chunksTotal} c
 await db.sql`SELECT name FROM customers WHERE id = ${String(grace.id)}`;
 const pkStats = db.lastQueryStats;
 ok("pk pruning skips chunks", pkStats.chunksFetched < pkStats.chunksTotal, `fetched ${pkStats.chunksFetched}/${pkStats.chunksTotal}`);
+
+// secondary indexes — non-key lookups prune (2.6)
+await db.sql`CREATE INDEX ON orders (total)`;
+const idx220 = await db.sql`SELECT total FROM orders WHERE total = ${220}`;
+const idxStats = db.lastQueryStats;
+ok("CREATE INDEX: equality on a non-key column prunes", idx220.length === 1 && idxStats.chunksFetched === 1 && idxStats.chunksTotal === 5, `fetched ${idxStats.chunksFetched}/${idxStats.chunksTotal}`);
+console.log(`  index: fetched ${idxStats.chunksFetched} of ${idxStats.chunksTotal} chunks for the total = 220 lookup`);
+await expectSqlError("duplicate index is caught", () => db.sql`CREATE INDEX ON orders (total)`, "INDEX_EXISTS");
+await db.sql`DROP INDEX ON orders (total)`;
+const scanBack = await db.sql`SELECT COUNT(*) AS n FROM orders WHERE total = ${220}`;
+ok("DROP INDEX: back to a correct full scan", scanBack[0].n === 1 && db.lastQueryStats.chunksFetched === db.lastQueryStats.chunksTotal);
+await expectSqlError("dropping a missing index is caught", () => db.sql`DROP INDEX ON orders (total)`, "INDEX_NOT_FOUND");
 
 // schema drift detection
 const drifted = larva({
