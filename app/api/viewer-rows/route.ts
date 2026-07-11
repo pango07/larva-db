@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { SqlError } from "@larva-db/core";
 import { demoDb, demoSchema } from "@/app/lib/demo";
+import { tableMeta } from "@/app/lib/viewer";
 
 export const maxDuration = 60;
 const DEFAULT_PAGE = 50;
@@ -49,10 +50,7 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({
       table,
-      columns,
-      primaryKey: spec.primaryKey,
-      partitionColumn: spec.partitionColumn ?? null,
-      types: Object.fromEntries(columns.map((c) => [c, spec.columns[c].type])),
+      ...tableMeta(table)!,
       rows,
       total: Number(n),
       limit,
