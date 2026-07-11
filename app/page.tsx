@@ -58,6 +58,12 @@ export default function Home() {
             Larva <span className="text-ink-muted font-normal">/ test lab</span>
           </h1>
           <Link
+            href="/viewer"
+            className="text-ink-secondary hover:text-foreground text-sm underline underline-offset-4"
+          >
+            data viewer
+          </Link>
+          <Link
             href="/docs"
             className="text-ink-secondary hover:text-foreground text-sm underline underline-offset-4"
           >
