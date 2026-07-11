@@ -22,6 +22,7 @@ await db.rollbackTo(past.version);                          // restore (itself u
 await db.export({ format: "postgres" });                    // the escape hatch
 await db.vacuum();                                          // reclaim storage outside retention
 await db.upgrade();                                         // one-way flip to the top format
+await db.inspect();                                         // read-only physical layout: chunks + zone maps
 ```
 
 ## `larva(options)`
@@ -121,6 +122,14 @@ Drops history outside retention (`retainDays: 7`, `retainVersions: 50` — which
 ## `db.upgrade()`
 
 Flips the store to the top format — [the ordered commit log plus two-tier fast appends](/docs/how-it-works/format-versioning) — one atomic commit, one-way, idempotent. Data, history, and rollback survive; clients older than the format then refuse loudly instead of writing through the wrong protocol.
+
+## `db.inspect(version?)`
+
+Read-only introspection of the store's **physical layout**: `version`, `committedAt`, `formatVersion`, and per-table chunk lists with each chunk's row count and primary-key/partition zone-map min/max. A *derived*, format-agnostic projection of the otherwise-private manifest (never the raw thing, so on-store format evolution can't break the contract), with no blob URLs — the private-data invariant holds. Reads manifest metadata only, never a chunk — strictly lighter than `export()`.
+
+With a version number it time-travels to any retained past version, exactly like `asOf` (throws `VERSION_NOT_FOUND` if pruned). One visibility note: [fast-append](/docs/how-it-works/commit-protocol#format-4-two-tier-writes) rows that are durable but not yet folded aren't in any chunk yet, so they don't appear here until the fold — same as for any other cross-instance reader.
+
+This is what powers [the data viewer](/viewer) — the chunk panel and version scrubber are `inspect()` calls.
 
 ## Errors
 

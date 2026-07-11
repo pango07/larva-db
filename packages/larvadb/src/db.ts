@@ -16,6 +16,34 @@ interface TxState {
   applies: PlanOutcome["apply"][];
 }
 
+/** One chunk's physical stats, as surfaced by db.inspect() — a stable
+ * projection of the manifest's zone map (never the raw ChunkRef). */
+export interface ChunkInspection {
+  /** ULID chunk id (also its blob pathname stem). Not a secret; not a URL. */
+  id: string;
+  rows: number;
+  /** Primary-key zone map: the min/max PK in this chunk (drives pruning). */
+  pk: { min: Scalar; max: Scalar } | null;
+  /** Partition-column zone map, when the table declares a partitionBy() column. */
+  partition: { min: Scalar; max: Scalar | null } | null;
+}
+
+export interface TableInspection {
+  rowCount: number;
+  chunkCount: number;
+  chunks: ChunkInspection[];
+}
+
+/** Read-only view of a store's physical layout at one version (db.inspect()). */
+export interface DbInspection {
+  version: number;
+  committedAt: string;
+  formatVersion: number;
+  /** True when this is the live head, false for a time-travelled past version. */
+  isCurrent: boolean;
+  tables: Record<string, TableInspection>;
+}
+
 /**
  * Statement handle inside db.transaction(). Reads see the transaction's own
  * uncommitted writes (a virtual manifest); nothing touches the live database
@@ -949,6 +977,49 @@ export class LarvaDb {
   async currentVersion(): Promise<number> {
     await this.ensureReady();
     return (await this.proto.snapshot()).manifest.version;
+  }
+
+  /**
+   * Read-only introspection of the store's physical layout at one version
+   * (Design §13). Projects the manifest — normally private — into a stable,
+   * format-agnostic view: the schema-declared shape, per-table chunk lists, and
+   * each chunk's row count and zone-map min/max. This is deliberately a *derived*
+   * shape, not the raw Manifest, so on-store format evolution never breaks the
+   * contract. Powers the data viewer (§14) and any store-debugging tool; it is
+   * strictly lighter than export(), reading manifest metadata and never a chunk.
+   *
+   * With no argument, the current version; with a version number, any retained
+   * past version (same resolution as asOf — throws VERSION_NOT_FOUND if pruned).
+   */
+  async inspect(version?: number): Promise<DbInspection> {
+    await this.ensureReady();
+    const current = await this.proto.snapshot();
+    let manifest: Manifest | null;
+    if (version === undefined || version === current.manifest.version) {
+      manifest = current.manifest;
+    } else {
+      manifest = await this.proto.manifestAt(version);
+      if (!manifest) {
+        throw new SqlError("VERSION_NOT_FOUND", `version ${version} is not in retained history (current version: ${current.manifest.version})`);
+      }
+    }
+    const tables: Record<string, TableInspection> = {};
+    for (const [name, table] of Object.entries(manifest.tables)) {
+      const chunks = table.chunks.map((c) => ({
+        id: c.id,
+        rows: c.rows,
+        pk: c.stats ? { min: c.stats.pkMin, max: c.stats.pkMax } : null,
+        partition: c.stats && c.stats.partMin !== undefined ? { min: c.stats.partMin, max: c.stats.partMax ?? null } : null,
+      }));
+      tables[name] = { rowCount: chunks.reduce((n, c) => n + c.rows, 0), chunkCount: chunks.length, chunks };
+    }
+    return {
+      version: manifest.version,
+      committedAt: manifest.committedAt,
+      formatVersion: manifest.formatVersion ?? 1,
+      isCurrent: manifest.version === current.manifest.version,
+      tables,
+    };
   }
 
   /** Delete the entire database (test helper; not part of the Design §13 surface). */

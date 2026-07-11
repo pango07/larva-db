@@ -94,6 +94,26 @@ ok(
   `v=${vAfter}, bounds=(${v2}, ${v2 + WRITERS * TXS}]`,
 );
 
+// --- inspect: read-only physical layout (§13) ---
+const layout = await db.inspect();
+ok("inspect reports the current version and format", layout.isCurrent && layout.version === (await db.currentVersion()) && layout.formatVersion >= 1, JSON.stringify({ v: layout.version, f: layout.formatVersion }));
+const invLayout = layout.tables.inventory;
+ok(
+  "inspect: per-table rowCount matches chunk row sums and the live table",
+  invLayout.rowCount === invLayout.chunks.reduce((n, c) => n + c.rows, 0) &&
+    invLayout.rowCount === ((await db.sql`SELECT COUNT(*) AS n FROM inventory`)[0].n as number),
+  JSON.stringify(invLayout),
+);
+ok("inspect: chunks carry primary-key zone maps", invLayout.chunkCount > 0 && invLayout.chunks.every((c) => c.pk !== null), JSON.stringify(invLayout.chunks));
+const pastLayout = await db.inspect(v0);
+ok("inspect(version) time-travels to a past layout", pastLayout.version === v0 && !pastLayout.isCurrent, JSON.stringify({ v: pastLayout.version, cur: pastLayout.isCurrent }));
+try {
+  await db.inspect(999_999);
+  ok("inspect on an unretained version fails loudly", false);
+} catch (err) {
+  ok("inspect on an unretained version fails loudly", (err as SqlError).code === "VERSION_NOT_FOUND", (err as Error).message);
+}
+
 // --- export ---
 const json = await db.export({ format: "json" });
 ok("json export has both tables", json.inventory?.length === 2 && json.orders?.length === 1);

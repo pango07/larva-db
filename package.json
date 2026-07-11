@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@larva-db/core": "workspace:*",
+    "@tanstack/react-query": "^5.101.2",
     "@vercel/blob": "^2.6.1",
     "next": "16.2.10",
     "nextra": "^4.6.1",

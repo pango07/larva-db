@@ -1,5 +1,14 @@
 /** The larvadb public surface (Design §13). */
-export { larva, LarvaDb, LarvaSnapshot, LarvaTx, type LarvaOptions } from "./db";
+export {
+  larva,
+  LarvaDb,
+  LarvaSnapshot,
+  LarvaTx,
+  type LarvaOptions,
+  type DbInspection,
+  type TableInspection,
+  type ChunkInspection,
+} from "./db";
 export {
   defineSchema,
   t,
