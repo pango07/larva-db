@@ -29,10 +29,21 @@ const ok = (name: string, cond: boolean, detail = "") => {
   console.log(`${cond ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Folds are asynchronous by design (durable at ack, visible at fold) — wait
+ * for the condition instead of guessing a fixed delay. */
+const waitFor = async (cond: () => Promise<boolean>, timeoutMs = 5_000): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await cond()) return true;
+    await sleep(100);
+  }
+  return cond();
+};
 
 // ---------- fake S3 (conditional writes + latency + chaos) ----------
 interface StoredObject { body: string; etag: string; uploadedAt: string; }
 const objects = new Map<string, StoredObject>();
+const qlog: string[] = [];
 let etagCounter = 0;
 let chaos = false;
 const LATENCY = 15;
@@ -77,9 +88,11 @@ const server = Bun.serve({
       const body = await req.text();
       const etag = `"fake-${++etagCounter}"`;
       objects.set(key, { body, etag, uploadedAt: new Date().toISOString() });
+      if (key.includes("/queue/") || key.includes("/log/")) qlog.push(`PUT ${key} ${key.includes("/log/") ? (JSON.parse(body) as { folds?: string[] }).folds?.length ?? 0 : ""}`);
       return new Response(null, { status: 200, headers: { etag } });
     }
     if (req.method === "DELETE") {
+      if (key.includes("/queue/")) qlog.push(`DEL ${key} ${objects.has(key) ? "hit" : "MISS"}`);
       objects.delete(key);
       return new Response(null, { status: 204 });
     }
@@ -418,10 +431,11 @@ const schema = defineSchema({
   const seen = await dbA.sql`SELECT COUNT(*) AS n FROM events WHERE kind = ${"signup"}`;
   ok("overlay read-your-writes: aggregate sees the un-folded append", seen[0].n === 1);
 
-  // Fold: wait out the debounce, then confirm global visibility + cleanup.
-  await sleep(400);
+  // Folds are background work: wait for visibility instead of a fixed delay.
   const dbB = larva({ schema: f4schema, prefix: "f4-append/", store, commitLog: true });
+  await waitFor(async () => (await dbB.sql`SELECT COUNT(*) AS n FROM events`)[0].n === 1);
   ok("cross-instance visibility after the fold", (await dbB.sql`SELECT COUNT(*) AS n FROM events`)[0].n === 1);
+  await waitFor(async () => ![...objects.keys()].some((k) => k.startsWith("f4-append/queue/")));
   ok("folded intents are deleted from the queue", ![...objects.keys()].some((k) => k.startsWith("f4-append/queue/")));
   const foldEntry = [...objects.entries()].find(
     ([k, o]) => k.startsWith("f4-append/log/") && (JSON.parse(o.body) as { folds?: string[] }).folds?.length,
@@ -437,13 +451,27 @@ const schema = defineSchema({
   await Promise.all(
     Array.from({ length: N }, (_, i) => (i % 2 ? dbA : dbB).sql`INSERT INTO tickets (note) VALUES (${`t${i}`})`),
   );
-  await sleep(400);
+  // Two instances' folds serialize behind one lease — wait for both to land.
+  await waitFor(async () => (await dbB.sql`SELECT num FROM tickets`).length === N);
   const nums = await dbB.sql`SELECT num FROM tickets`;
   ok(
     "appended sequence values distinct across two instances",
     nums.length === N && new Set(nums.map((r) => r.num)).size === N,
     `${new Set(nums.map((r) => r.num)).size}/${N} distinct`,
   );
+  if (process.env.LARVA_DBG && (nums.length !== N || new Set(nums.map((r) => r.num)).size !== N)) {
+    console.log("DBG rows:", JSON.stringify(nums.map((r) => r.num).sort((x, y) => Number(x) - Number(y))));
+    console.log("DBG queue:", [...objects.keys()].filter((k) => k.startsWith("f4-append/queue/")));
+    console.log("DBG qlog:\n" + qlog.filter((l) => l.includes("f4-append")).join("\n"));
+    for (const [k, o] of objects.entries()) {
+      if (!k.startsWith("f4-append/log/")) continue;
+      const e = JSON.parse(o.body) as { version: number; folds?: string[]; tables: Record<string, { add: { rows: number; path: string }[]; remove: string[] } | null> };
+      console.log(`DBG entry v${e.version}: folds=${e.folds?.length ?? 0}`, JSON.stringify(Object.entries(e.tables).map(([t, d]) => [t, d ? { add: d.add.map((c) => c.rows), rm: d.remove.length } : null])));
+    }
+    for (const [k, o] of objects.entries()) {
+      if (k.startsWith("f4-append/tables/tickets/")) console.log(`DBG chunk ${k.slice(-20)}:`, JSON.stringify((JSON.parse(o.body) as { num: number }[]).map((r) => r.num)));
+    }
+  }
 
   // The ordered-write barrier: an UPDATE right after an append must see it.
   await dbA.sql`INSERT INTO events (kind, at) VALUES (${"pending"}, ${"2026-07-10T01:00:00Z"})`;
@@ -457,7 +485,7 @@ const schema = defineSchema({
   const f4schema = defineSchema({ items: { id: t.uuid().primaryKey(), label: t.text() } });
   const db = larva({ schema: f4schema, prefix: "f4-refold/", store, commitLog: true });
   await db.sql`INSERT INTO items (label) VALUES (${"only-once"})`;
-  await sleep(400); // fold completes, intent deleted
+  await waitFor(async () => ![...objects.keys()].some((k) => k.startsWith("f4-refold/queue/"))); // fold + cleanup done
 
   // Simulate the crash window: the log entry landed but the intent blob
   // survived. Re-plant an identical intent and let the next fold find it.
@@ -476,7 +504,7 @@ const schema = defineSchema({
   });
   // Any new append triggers a fold, which must skip the replanted rows by pk.
   await db.sql`INSERT INTO items (label) VALUES (${"second"})`;
-  await sleep(400);
+  await waitFor(async () => ![...objects.keys()].some((k) => k.startsWith("f4-refold/queue/")));
   const after = await db.sql`SELECT label FROM items ORDER BY label`;
   ok(
     "re-folding a crashed folder's intent adds no duplicate rows",
@@ -484,6 +512,93 @@ const schema = defineSchema({
     JSON.stringify(after.map((r) => r.label)),
   );
   ok("the replanted intent was cleaned up by the healing fold", ![...objects.keys()].some((k) => k.startsWith("f4-refold/queue/")));
+}
+
+// ---------- 14. format 4 tier B: ordered intents, verdicts, leader batching ----------
+{
+  const f4schema = defineSchema({ counters: { id: t.text().primaryKey(), n: t.integer() } });
+  const mk = () => larva({ schema: f4schema, prefix: "f4-ordered/", store, commitLog: true });
+  const dbs = [mk(), mk(), mk()];
+  const [dbA, dbB, dbC] = dbs;
+  await dbA.sql`INSERT INTO counters (id, n) VALUES (${"hot"}, ${0})`;
+
+  // Force queue mode (normally entered by the contention heuristic) so the
+  // whole tier-B machinery runs deterministically.
+  for (const db of dbs) (db as unknown as { queueUntil: number }).queueUntil = Date.now() + 120_000;
+
+  const PER = 8;
+  await Promise.all(
+    dbs.flatMap((db) => Array.from({ length: PER }, () => db.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`)),
+  );
+  const [hot] = await dbA.sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok("queued hot counter exact across 3 instances", hot.n === 3 * PER, `n=${hot.n}, expected ${3 * PER}`);
+
+  const verdictEntries = [...objects.entries()]
+    .filter(([k]) => k.startsWith("f4-ordered/log/"))
+    .map(([, o]) => JSON.parse(o.body) as { verdicts?: Record<string, unknown> })
+    .filter((e) => e.verdicts);
+  ok("verdicts are embedded in log entries", verdictEntries.length > 0, `${verdictEntries.length} verdict entries`);
+  ok(
+    "a leader batched several writers' intents into one slot",
+    verdictEntries.some((e) => Object.keys(e.verdicts!).length > 1),
+    `batch sizes: ${verdictEntries.map((e) => Object.keys(e.verdicts!).length).join(",")}`,
+  );
+  ok("the ordered queue drained after arbitration", ![...objects.keys()].some((k) => k.startsWith("f4-ordered/queue/")));
+
+  // A failing statement becomes its verdict alone — the precise error travels
+  // back to the writer that queued it, and batchmates are unaffected.
+  const dup = await dbB.sql`INSERT INTO counters (id, n) VALUES (${"hot"}, ${9})`.then(
+    () => null,
+    (e: unknown) => e as SqlError,
+  );
+  ok("an error verdict propagates to the queued writer", dup?.code === "PRIMARY_KEY_CONFLICT", dup?.message);
+
+  // Crashed-leader window: a verdict on record with the blob left behind.
+  // Re-processing must treat it as cleanup, never as work (no double-apply).
+  const planted = {
+    kind: "ordered",
+    id: "01CRASHEDORDEREDINTENT000A",
+    writerId: "01ZOMBIEWRITER00000000000A",
+    createdAt: new Date().toISOString(),
+    baseVersion: 0,
+    sql: "UPDATE counters SET n = n + 1 WHERE id = 'hot'",
+    params: [],
+  };
+  const plantPath = "f4-ordered/queue/01ZOMBIEWRITER00000000000A/intent-000000000000.json";
+  const plant = () =>
+    objects.set(plantPath, { body: JSON.stringify(planted), etag: `"plant-${++etagCounter}"`, uploadedAt: new Date().toISOString() });
+
+  plant();
+  await dbC.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`; // leader run executes the planted intent once
+  const [afterFirst] = await dbC.sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok("a planted ordered intent executes exactly once", afterFirst.n === 3 * PER + 2, `n=${afterFirst.n}`);
+
+  plant(); // the same intent id again — its verdict is already in the log
+  await dbC.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`;
+  const [afterSecond] = await dbC.sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok(
+    "a re-planted arbitrated intent is cleanup, not work (no double-apply)",
+    afterSecond.n === 3 * PER + 3,
+    `n=${afterSecond.n}, expected ${3 * PER + 3}`,
+  );
+  ok("the re-planted blob was swept", !objects.has(plantPath));
+}
+
+// ---------- 15. format 4 tier B: the contention heuristic escalates on its own ----------
+{
+  chaos = false;
+  const f4schema = defineSchema({ counters: { id: t.text().primaryKey(), n: t.integer() } });
+  const mk = () => larva({ schema: f4schema, prefix: "f4-escalate/", store, commitLog: true });
+  const dbs = [mk(), mk(), mk(), mk()];
+  await dbs[0].sql`INSERT INTO counters (id, n) VALUES (${"hot"}, ${0})`;
+  const PER = 6;
+  await Promise.all(
+    dbs.flatMap((db) => Array.from({ length: PER }, () => db.sql`UPDATE counters SET n = n + 1 WHERE id = ${"hot"}`)),
+  );
+  const [hot] = await dbs[0].sql`SELECT n FROM counters WHERE id = ${"hot"}`;
+  ok("hot counter exact with the heuristic free to escalate", hot.n === dbs.length * PER, `n=${hot.n}, expected ${dbs.length * PER}`);
+  const escalated = dbs.some((db) => (db as unknown as { queueUntil: number }).queueUntil > 0);
+  ok("cross-instance contention tripped the escalation heuristic", escalated);
 }
 
 server.stop();

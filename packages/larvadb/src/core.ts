@@ -37,10 +37,13 @@ export interface ChunkRef {
  *       periodic checkpoint that snapshots replay the log tail onto. Entered
  *       only by explicit db.upgrade() or larva({ commitLog: true }).
  *   4 — two-tier writes (Design §6): per-writer intent queues under queue/
- *       plus a compactor lease. Constraint-free appends are durable at one
- *       create-only PUT and folded into the log later; log entries may carry
- *       fold metadata. Requires the log; entered by db.upgrade() (and
- *       larva({ commitLog: true }) births new stores here).
+ *       plus a lease. Constraint-free appends are durable at one create-only
+ *       PUT and folded into the log later; contended ordered statements queue
+ *       as intents that a lease-elected leader batches into one slot, with
+ *       per-intent verdicts embedded in the entry. Log entries may carry
+ *       folds/verdicts metadata (replay ignores both). Requires the log;
+ *       entered by db.upgrade() (and larva({ commitLog: true }) births new
+ *       stores here).
  *
  * Note: formatVersion >= 3 is also how clients detect log mode, so a
  * CAS-mode store can only ever declare 1 or 2 — new schema-level features
@@ -95,7 +98,16 @@ export interface LogEntry {
    * use it to clear pending overlays and vacuum uses it to sweep processed
    * intent blobs; replay ignores it. */
   folds?: string[];
+  /** Per-intent outcomes for leader-batched ordered intents (format 4,
+   * tier B). The entry that carries a verdict IS the arbitration record —
+   * waiting writers learn their fate from the log-tail reads they already
+   * do. Replay ignores it. */
+  verdicts?: Record<string, IntentVerdict>;
 }
+
+/** The leader's answer to one ordered intent: RETURNING rows on success, a
+ * precise machine-readable error otherwise (agents self-correct from it). */
+export type IntentVerdict = { ok: true; rows?: Row[] } | { ok: false; code: string; message: string };
 
 /** One durable-at-PUT append awaiting fold into the log (format 4). Rows are
  * fully validated and id-filled before the intent is written, so its outcome
@@ -107,6 +119,24 @@ export interface AppendIntent {
   createdAt: string;
   tables: Record<string, Row[]>;
 }
+
+/** One constraint-bearing statement awaiting a leader's slot verdict
+ * (format 4, tier B). Shippable as data — single statement + params — which
+ * is why transactions (arbitrary callbacks) never travel this path. */
+export interface OrderedIntent {
+  kind: "ordered";
+  id: string;
+  writerId: string;
+  createdAt: string;
+  /** Version horizon: a verdict for this intent can only exist in entries
+   * after this — bounds the dedupe scan a takeover leader must do. */
+  baseVersion: number;
+  sql: string;
+  params: Scalar[];
+  allowFullTable?: boolean;
+}
+
+export type Intent = AppendIntent | OrderedIntent;
 
 /** Delta between two manifests (base → next) in LogEntry form. */
 function diffManifests(base: Manifest, next: Manifest): LogEntry["tables"] {
@@ -213,6 +243,9 @@ interface CommitPlan {
   /** Intent ids this commit folds (format 4, log mode only) — recorded on the
    * log entry so writers clear overlays and vacuum sweeps the blobs. */
   folds?: string[];
+  /** Per-intent verdicts this commit arbitrates (format 4 tier B, log mode
+   * only) — embedded in the log entry for waiting writers to read. */
+  verdicts?: Record<string, IntentVerdict>;
 }
 
 /** Stage phase: write new chunk blobs (touching nothing live), return the plan. */
@@ -347,7 +380,7 @@ export class LarvaProto {
 
   /** One create-only PUT: durable at return. The path never collides — the
    * writer prefix is ours alone and seq is monotonic per instance. */
-  async putIntent(intent: AppendIntent): Promise<string> {
+  async putIntent(intent: Intent): Promise<string> {
     const path = `${this.prefix}queue/${intent.writerId}/intent-${padVersion(this.intentSeq++)}.json`;
     await this.putCreateOnly(path, JSON.stringify(intent));
     return path;
@@ -355,13 +388,13 @@ export class LarvaProto {
 
   /** Every pending intent in the store, all writers. Intent blobs are
    * immutable; they only ever disappear (fold cleanup / vacuum). */
-  async listIntents(): Promise<{ path: string; intent: AppendIntent }[]> {
+  async listIntents(): Promise<{ path: string; intent: Intent }[]> {
     const objects = await this.store.list(`${this.prefix}queue/`);
-    const out: { path: string; intent: AppendIntent }[] = [];
+    const out: { path: string; intent: Intent }[] = [];
     for (const o of objects) {
       if (!o.path.endsWith(".json")) continue;
       const res = await this.store.get(o.path, { fresh: true });
-      if (res) out.push({ path: o.path, intent: JSON.parse(res.body) as AppendIntent });
+      if (res) out.push({ path: o.path, intent: JSON.parse(res.body) as Intent });
     }
     return out;
   }
@@ -750,6 +783,7 @@ export class LarvaProto {
             ...(next.formatVersion !== snap.manifest.formatVersion ? { formatVersion: next.formatVersion } : {}),
             tables: diffManifests(snap.manifest, next),
             ...(current.folds?.length ? { folds: current.folds } : {}),
+            ...(current.verdicts && Object.keys(current.verdicts).length ? { verdicts: current.verdicts } : {}),
           };
           await this.store.put(this.logPath(next.version), JSON.stringify(entry), { createOnly: true });
           this.logCache.set(next.version, entry);

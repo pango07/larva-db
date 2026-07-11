@@ -15,7 +15,7 @@ A Larva store is **shared mutable state between independently deployed clients**
 | **1** | the original layout: manifest + chunks + history |
 | **2** | sequence columns (`t.sequence()`), auto-UUID columns (`t.uuid()`), and composite unique constraints — a store only declares 2 when its schema actually uses one, so plain stores stay readable by format-1 clients |
 | **3** | [the ordered commit log](/docs/how-it-works/commit-protocol#format-3-the-ordered-commit-log) — entered only by explicit `db.upgrade()` |
-| **4** | two-tier writes: per-writer intent queues + a compactor lease. Constraint-free INSERTs (auto-generated id, no unique constraints) become **durable at one PUT** and fold into the log in the background — zero contention, read-your-writes preserved. Entered by `db.upgrade()`; `larva({ commitLog: true })` births new stores here |
+| **4** | two-tier writes: per-writer intent queues + a lease. Constraint-free INSERTs (auto-generated id, no unique constraints) become **durable at one PUT** and fold into the log in the background — zero contention, read-your-writes preserved. Under cross-instance contention, ordered writes queue too and a **lease-elected leader batches every waiting writer's statement into one log slot**, verdicts embedded in the entry. Entered by `db.upgrade()`; `larva({ commitLog: true })` births new stores here |
 
 ## The guard
 
