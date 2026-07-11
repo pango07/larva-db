@@ -660,6 +660,13 @@ const schema = defineSchema({
   const euStale = await db.sql`SELECT id FROM logs WHERE region = ${"eu"}`;
   ok("a chunk unknown to the index is always fetched (stale-safe)", euStale.length === 3 && euStale.some((r) => r.id === "legacy-1"), JSON.stringify(euStale));
 
+  // An open-ended range (`> z`) has no upper bound: the internal MAX marker
+  // must be identity-checked, not compared — a value sorting above it would
+  // otherwise be wrongly pruned out of the result.
+  await db.sql`INSERT INTO logs (id, region, n) VALUES (${"weird-1"}, ${"￿￿￿￿beyond"}, ${0})`;
+  const beyond = await db.sql`SELECT id FROM logs WHERE region > ${"z"}`;
+  ok("open-ended range keeps values above the internal sentinel", beyond.length === 1 && beyond[0].id === "weird-1", JSON.stringify(beyond));
+
   // A missing blob (an older client's vacuum) degrades to a scan, never an error.
   const blobKeys = [...objects.keys()].filter((k) => k.startsWith("idx/tables/logs/index_"));
   for (const k of blobKeys) objects.delete(k);

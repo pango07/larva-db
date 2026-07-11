@@ -230,7 +230,10 @@ export class LarvaDb {
         if (def.indexed) {
           await this.executor.execute({ kind: "createIndex", table, column: col, ifNotExists: true }, [], {});
         } else {
-          await this.executor.execute({ kind: "dropIndex", table, column: col }, [], {});
+          // Another instance syncing the same schema may have dropped it first.
+          await this.executor.execute({ kind: "dropIndex", table, column: col }, [], {}).catch((err) => {
+            if (!(err instanceof SqlError && err.code === "INDEX_NOT_FOUND")) throw err;
+          });
         }
       }
     }

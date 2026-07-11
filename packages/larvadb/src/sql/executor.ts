@@ -33,6 +33,11 @@ function distinctSorted(rows: Row[], col: string): Scalar[] {
   return [...new Set(rows.map((r) => r[col] ?? null).filter((v) => v !== null))].sort(cmpScalar);
 }
 
+/** Marker for "no upper bound", compared by IDENTITY (===), never as a value —
+ * a real column value above any sentinel string would otherwise be wrongly
+ * pruned. A user value that happens to equal this string merely over-fetches. */
+const UNBOUNDED = "￿￿￿￿";
+
 function sortedHas(vals: Scalar[], v: Scalar): boolean {
   let lo = 0;
   let hi = vals.length - 1;
@@ -55,7 +60,7 @@ function sortedOverlaps(vals: Scalar[], lo: Scalar, hi: Scalar): boolean {
     if (cmpScalar(vals[mid], lo) < 0) a = mid + 1;
     else b = mid;
   }
-  return a < vals.length && cmpScalar(vals[a], hi) <= 0;
+  return a < vals.length && (hi === UNBOUNDED || cmpScalar(vals[a], hi) <= 0);
 }
 
 export interface ExecOptions {
@@ -605,13 +610,15 @@ export class Executor {
     let survivors = refs.filter((ref) => {
       if (!ref.stats) return true;
       const pk = bounds[schema.primaryKey];
-      if (pk && (cmpScalar(ref.stats.pkMax, pk.lo) < 0 || cmpScalar(ref.stats.pkMin, pk.hi) > 0)) return false;
+      if (pk && (cmpScalar(ref.stats.pkMax, pk.lo) < 0 || (pk.hi !== UNBOUNDED && cmpScalar(ref.stats.pkMin, pk.hi) > 0))) {
+        return false;
+      }
       const part = schema.partitionColumn ? bounds[schema.partitionColumn] : undefined;
       if (
         part &&
         ref.stats.partMin !== undefined &&
         ref.stats.partMax !== undefined &&
-        (cmpScalar(ref.stats.partMax, part.lo) < 0 || cmpScalar(ref.stats.partMin, part.hi) > 0)
+        (cmpScalar(ref.stats.partMax, part.lo) < 0 || (part.hi !== UNBOUNDED && cmpScalar(ref.stats.partMin, part.hi) > 0))
       ) {
         return false;
       }
@@ -673,7 +680,7 @@ export class Executor {
       bounds[col] = { ...merged, ...(keep ? { values: keep } : {}) };
     };
     const MIN: Scalar = null; // null sorts first in cmpScalar → acts as -infinity
-    const MAX = "￿￿￿￿"; // above any ISO timestamp / ULID / practical text
+    const MAX = UNBOUNDED; // identity-checked "no upper bound" marker, never compared as a value
 
     const walk = (e: Expr): void => {
       if (e.kind === "binary" && e.op === "AND") {
@@ -1058,6 +1065,7 @@ export class Executor {
     retiredIds: string[],
     added: { ref: ChunkRef; rows: Row[] }[],
   ): Promise<Record<string, IndexRef>> {
+    if (retiredIds.length === 0 && added.length === 0) return {}; // nothing changed — keep the current refs
     const cols = Object.keys(schema.columns).filter((c) => schema.columns[c].indexed);
     if (cols.length === 0) return {};
     const out: Record<string, IndexRef> = {};
