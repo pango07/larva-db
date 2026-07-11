@@ -1,6 +1,6 @@
 import { AppendIntent, cmpScalar, ConflictError, IntentVerdict, LarvaProto, Manifest, OrderedIntent, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
 import { ColumnDef, DatabaseSchema, fillAbsentColumns, SchemaError, schemaDrift, TableSchema } from "./schema";
-import { InsertStmt } from "./sql/ast";
+import { hasSubquery, InsertStmt } from "./sql/ast";
 import { SqlError } from "./sql/errors";
 import { ExecOptions, Executor, PlanOutcome, QueryStats } from "./sql/executor";
 import { parse } from "./sql/parser";
@@ -179,6 +179,18 @@ export class LarvaDb {
           return m;
         },
       }));
+      // Re-verify: a concurrent process may have added the same column with a
+      // different definition between our drift check and our commit — the
+      // apply above skips existing columns, so recheck against what actually
+      // landed rather than assuming our additions won.
+      const landed = ((await this.proto.snapshot()).manifest.schema ?? {}) as DatabaseSchema;
+      const post = schemaDrift(code, landed);
+      if (post.length > 0) {
+        throw new SchemaError(
+          "SCHEMA_DRIFT",
+          `the code-first schema no longer matches the database:\n  - ${post.join("\n  - ")}\nThe code schema is authoritative — migrate the data or update schema.ts.`,
+        );
+      }
     }
     // Tables declared in code but missing from the store are created.
     const missing = Object.keys(code).filter((t) => !manifest.tables[t]);
@@ -384,6 +396,13 @@ export class LarvaDb {
     if (stmt.columns.includes(table.primaryKey)) return null;
     if (table.uniques?.length) return null;
     if (Object.values(table.columns).some((c) => c.unique)) return null;
+    // A subquery in VALUES reads database state — not client-determined,
+    // so it takes the ordered path (where plan-time resolution runs).
+    if (stmt.rows.some((r) => r.some(hasSubquery))) return null;
+    // A column the code schema doesn't know (e.g. added by a runtime SQL
+    // ALTER) must be validated against the live manifest schema — ordered
+    // path only; the append path plans from code.
+    if (stmt.columns.some((c) => !(c in table.columns))) return null;
     return table;
   }
 

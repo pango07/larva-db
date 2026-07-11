@@ -222,6 +222,12 @@ const noteStar = await db.sql`SELECT * FROM orders WHERE total = ${100}`;
 ok("SELECT * includes the added column as NULL", noteStar.length === 1 && noteStar[0].note === null, fmt(noteStar));
 await expectSqlError("duplicate column is caught", () => db.sql`ALTER TABLE orders ADD COLUMN note text`, "DUPLICATE_COLUMN");
 await expectSqlError("ALTER on a missing table", () => db.sql`ALTER TABLE nope ADD COLUMN x text`, "UNKNOWN_TABLE");
+const notInNull = await db.sql`SELECT COUNT(*) AS n FROM orders WHERE status NOT IN (SELECT note FROM orders)`;
+ok("NOT IN ignores NULLs from the subquery (two-valued, not SQL's NULL trap)", notInNull[0].n === 5, fmt(notInNull));
+await db.sql`ALTER TABLE customers ADD COLUMN nickname text`;
+const upAltered = await db.sql`INSERT INTO customers (id, name, email, createdAt) VALUES (${String(ada.id)}, ${"x"}, ${"x@x.com"}, ${"2026-06-09T00:00:00Z"})
+  ON CONFLICT (id) DO UPDATE SET nickname = COALESCE(nickname, ${"the countess"}) RETURNING nickname`;
+ok("upsert SET reads an ALTERed column on a pre-ALTER row", upAltered.length === 1 && upAltered[0].nickname === "the countess", fmt(upAltered));
 
 // GROUP BY + aggregates
 const grouped = await db.sql`
@@ -412,6 +418,7 @@ const grown = larva({
       name: t.text(),
       email: t.text().unique(),
       createdAt: t.timestamp().partitionBy(),
+      nickname: t.text(), // added by the ALTER above
       vip: t.boolean(), // new in code, not yet in the store
     },
     orders: { ...schemaTableClone(), note: t.text() },

@@ -37,7 +37,9 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
 - Uncorrelated subqueries: `WHERE id IN (SELECT ...)`, `NOT IN (SELECT ...)`,
   and scalar comparisons like `WHERE total > (SELECT AVG(total) FROM orders)`.
   The subquery must NOT reference the outer query's tables (no correlation) —
-  use a JOIN for that.
+  use a JOIN for that. NULLs in the subquery result are ignored, so
+  `NOT IN (SELECT ...)` behaves the way you intend even when the inner column
+  has NULLs (unlike standard SQL's NULL trap).
 - `INSERT ... RETURNING`, multi-row, with upsert:
   `ON CONFLICT (col) DO NOTHING` or `DO UPDATE SET col = excluded.col`.
   The conflict target must be the primary key, a UNIQUE column, or the exact

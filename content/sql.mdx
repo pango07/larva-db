@@ -35,7 +35,7 @@ WHERE id IN (SELECT customerId FROM orders WHERE total > 500)
 SELECT * FROM orders WHERE total > (SELECT AVG(total) FROM orders)
 ```
 
-The inner query runs first against the same snapshot; its result feeds the outer plan as plain values (so an `IN (SELECT …)` list even participates in [zone-map pruning](/docs/how-it-works)). Scalar subqueries must yield one row and one column. **Correlated** subqueries — ones that reference the outer query's tables — are not supported and never will be; the error says so and points at `JOIN`.
+The inner query runs first against the same snapshot; its result feeds the outer plan as plain values (so an `IN (SELECT …)` list even participates in [zone-map pruning](/docs/how-it-works)). Scalar subqueries must yield one row and one column. `NULL`s in the subquery result are ignored — so `NOT IN (SELECT …)` behaves the way you intend even when the inner column has `NULL`s, instead of inheriting SQL's NULL-poisoning trap. **Correlated** subqueries — ones that reference the outer query's tables — are not supported and never will be; the error says so and points at `JOIN`.
 
 ### Scalar functions
 

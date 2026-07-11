@@ -343,7 +343,10 @@ export class Executor {
           return { kind: "literal", value: vals[0] ?? null };
         }
         case "insub": {
-          const vals = await run(e.query, "with IN");
+          // NULLs are dropped from the list: Larva is two-valued throughout
+          // (Design §7), so x IN (…) never matches NULL and x NOT IN (…)
+          // deliberately does NOT inherit SQL's NULL-poisoning trap.
+          const vals = (await run(e.query, "with IN")).filter((v) => v !== null);
           return {
             kind: "in",
             expr: await rewrite(e.expr),
@@ -1029,8 +1032,10 @@ export class Executor {
       if (!ref.stats || constraints.length > 1) return true; // unique constraints force full scan
       return pks.some((pk) => cmpScalar(ref.stats!.pkMin, pk) <= 0 && cmpScalar(ref.stats!.pkMax, pk) >= 0);
     });
+    // Copy (never mutate the chunk cache) and NULL-fill columns added by
+    // ALTER TABLE, so DO UPDATE SET expressions can read them on old rows.
     const loaded = await Promise.all(
-      candidates.map(async (ref) => ({ ref, rows: [...(await this.proto.readChunk(ref))] })),
+      candidates.map(async (ref) => ({ ref, rows: [...fillAbsentColumns(await this.proto.readChunk(ref), schema)] })),
     );
 
     // Rows are processed in statement order, each seeing the effect of the
