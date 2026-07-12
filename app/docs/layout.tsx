@@ -14,10 +14,22 @@ export default async function DocsLayout({ children }: { children: React.ReactNo
     <Layout
       navbar={
         <Navbar
-          logo={<span style={{ fontWeight: 700 }}>🐛 larvadb</span>}
+          logo={
+            <span style={{ display: "flex", alignItems: "center", gap: 10, fontWeight: 700 }}>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src="/larva-mark.png"
+                alt=""
+                width={24}
+                height={24}
+                style={{ borderRadius: 6 }}
+              />
+              larvadb
+            </span>
+          }
           projectLink="https://github.com/pango07/larva-db"
         >
-          <Link href="/" style={{ fontSize: "0.875rem" }}>
+          <Link href="/lab" style={{ fontSize: "0.875rem" }}>
             test lab
           </Link>
         </Navbar>

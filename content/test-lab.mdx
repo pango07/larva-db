@@ -6,7 +6,7 @@ import { Callout } from "nextra/components";
 
 # The test lab
 
-This site doubles as a working demo and the project's test bench. [The home page](/) runs a **real Larva database** — seeded `customers`, `orders`, and auto-numbered `invoices`, living in a private Vercel Blob store on format 3, the ordered commit log. Nothing is mocked.
+This site doubles as a working demo and the project's test bench. [The lab](/lab) runs a **real Larva database** — seeded `customers`, `orders`, and auto-numbered `invoices`, living in a private Vercel Blob store on format 3, the ordered commit log. Nothing is mocked.
 
 ## The SQL console
 
@@ -20,7 +20,7 @@ Type any statement in [the dialect](/docs/sql) and run it live. The example chip
 
 ## The stress lab
 
-The bottom of the home page hammers one database with concurrent writers, then audits the final state for lost updates, duplicates, and version drift — the commit protocol's core promise, tested against the real store on every click.
+The bottom of [the lab page](/lab) hammers one database with concurrent writers, then audits the final state for lost updates, duplicates, and version drift — the commit protocol's core promise, tested against the real store on every click.
 
 - **append** — disjoint writes; exercises the cheap *rebase* recovery path
 - **counter** — every write overlaps; forces full *re-execute* recovery

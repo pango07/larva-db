@@ -1,7 +1,7 @@
 "use client";
 
-import Link from "next/link";
 import { useState } from "react";
+import { SiteNav } from "../_components/site-nav";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type { Scalar } from "@larva-db/core";
 
@@ -146,19 +146,13 @@ export default function Viewer() {
   };
 
   return (
+    <>
+    <SiteNav current="/viewer" />
     <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
       <header className="mb-8">
-        <div className="flex items-baseline gap-4">
-          <h1 className="grow text-2xl font-semibold tracking-tight">
-            Larva <span className="text-ink-muted font-normal">/ data viewer</span>
-          </h1>
-          <Link href="/" className="text-ink-secondary hover:text-foreground text-sm underline underline-offset-4">
-            stress lab
-          </Link>
-          <Link href="/docs" className="text-ink-secondary hover:text-foreground text-sm underline underline-offset-4">
-            docs
-          </Link>
-        </div>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          The data viewer <span className="text-ink-muted font-normal">— read-only</span>
+        </h1>
         <p className="text-ink-secondary mt-2 max-w-2xl text-sm leading-relaxed">
           Browse the live demo store, scrub back through every commit (time travel is a byproduct
           of the architecture — old manifests are complete snapshots), and watch the chunk zone
@@ -423,6 +417,7 @@ export default function Viewer() {
         read-only projection of the manifest. Both hit the same demo store as the console and stress lab.
       </footer>
     </main>
+    </>
   );
 }
 

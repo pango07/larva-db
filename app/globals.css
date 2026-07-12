@@ -17,6 +17,13 @@
   --status-critical: #d03b3b;
 }
 
+:root {
+  /* brand (from the logo: lime body, amber head) */
+  --accent: #9db521;
+  --accent-ink: #0f0f10;
+  --amber: #f7ab26;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-surface: var(--surface-1);
@@ -30,6 +37,9 @@
   --color-good: var(--status-good);
   --color-good-text: var(--status-good-text);
   --color-critical: var(--status-critical);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-amber: var(--amber);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -51,8 +61,57 @@
   }
 }
 
+/* Forced-dark scope for the landing page: always dark regardless of system
+   preference. #0f0f10 matches the background baked into the logo PNGs, so
+   the artwork blends seamlessly. */
+.theme-dark {
+  --background: #0f0f10;
+  --surface-1: #17171a;
+  --foreground: #f4f4f2;
+  --ink-secondary: #b9b8b2;
+  --ink-muted: #83827c;
+  --hairline: rgba(255, 255, 255, 0.09);
+  --gridline: #2c2c2a;
+  --baseline: #383835;
+  --series-1: #3987e5;
+  --status-good: #0ca30c;
+  --status-good-text: #6cc644;
+  --status-critical: #e05252;
+  --accent: #b8d431;
+  color-scheme: dark;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: #b8d431;
+  }
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* landing entrance: one subtle fade-up, staggered via --stagger */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--stagger, 0) * 90ms);
+}
+@media (prefers-reduced-motion: reduce) {
+  .rise {
+    animation: none;
+  }
 }
