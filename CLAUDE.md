@@ -20,6 +20,7 @@ This repo contains **Larva** (`larvadb`) — a TypeScript library that turns Ver
 - `bun scripts/api-smoke.ts` — transaction atomicity + concurrent re-execution, export (json/csv/sqlite/postgres), vacuum retention
 - `bun scripts/s3-adapter-test.ts` — S3Adapter contract + stress harness over an in-process fake S3 with 409/500 chaos injection (no credentials needed)
 - `bun scripts/group-commit-test.ts` — group-commit coalescing, batch error isolation, nested-commit deadlock guard, and the property conflict harness, all over the chaos fake S3 (no credentials needed)
+- `bun scripts/guard-test.ts` — the public demo's abuse guards (`app/lib/guard.ts`): per-IP rate windows and durable CAS-backed daily budgets (commits/resets/stress lease) over a fake adapter (no credentials needed)
 - `bun scripts/bench.ts` — write-throughput benchmark over latency-simulated fake S3; compares per-instance coalescing against cross-instance contention (`--latency`, `--writers`, `--ops`)
 - `bun run --cwd packages/larvadb build` — build the npm package (bundle + d.ts); `npm pack --dry-run` there to inspect the tarball. Do not `npm publish` without the user's explicit go-ahead.
 - Deploy: `vercel deploy --prod --yes` (direct upload)

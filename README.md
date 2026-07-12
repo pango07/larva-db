@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-297_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-318_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -268,7 +268,7 @@ The editable source for these lives at [docs/larva-architecture.excalidraw](docs
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **297 checks across seven suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **318 checks across eight suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|
@@ -279,6 +279,7 @@ Correctness risk concentrates in the conflict/retry path, so that's where the te
 | `scripts/api-smoke.ts` | transaction atomicity, concurrent read-modify-write transactions, export round-trips (a real SQLite engine; Postgres DDL/COPY/FK structure), vacuum retention |
 | `scripts/s3-adapter-test.ts` | the S3 adapter under an in-process fake S3 with injected 409s and 500s — chaos the engine must absorb |
 | `scripts/group-commit-test.ts` | same-instance commit coalescing, batch error isolation, and the conflict matrix over the chaos-injected fake S3 |
+| `scripts/guard-test.ts` | the public demo's abuse guards: per-IP windows and CAS-backed daily budgets that count exactly under contention and fail closed |
 
 ## Development & CI
 
@@ -293,6 +294,7 @@ bunx tsc --noEmit                  # typecheck (includes compile-only type-infer
 bun run lint                       # eslint
 bun scripts/s3-adapter-test.ts     # storage contract + chaos, offline
 bun scripts/group-commit-test.ts   # commit coalescing + conflict matrix, offline
+bun scripts/guard-test.ts          # demo-endpoint abuse guards, offline
 
 # live suites (real Blob store)
 bun scripts/sql-smoke.ts           # the whole dialect, end to end
