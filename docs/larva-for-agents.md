@@ -1,6 +1,7 @@
 <!-- Paste this file into your agent's instructions (CLAUDE.md, AGENTS.md,
-     .cursorrules, a system prompt). It is also served at /llms.txt on any
-     deployed Larva test lab. Canonical source: docs/larva-for-agents.md -->
+     .cursorrules, a system prompt). It is also served raw at
+     https://larvadb.dev/llms.txt (and at /llms.txt on any deployed Larva
+     test lab). Canonical source: docs/larva-for-agents.md -->
 
 # Working with LarvaDB (@larva-db/core)
 

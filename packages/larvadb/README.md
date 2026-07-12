@@ -11,6 +11,8 @@
 
 Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
+**Docs & live demo: [larvadb.dev](https://larvadb.dev)** · agent prompt at [larvadb.dev/llms.txt](https://larvadb.dev/llms.txt)
+
 ## Sixty seconds to a database
 
 ```bash
@@ -275,7 +277,8 @@ import { runStress, runProperty } from "@larva-db/core/testing"; // unstable API
 
 ## Links
 
-- [Repository](https://github.com/pango07/larva-db) — development, CI, and the browser test lab (SQL console + stress lab you can deploy)
+- [Docs & live demo](https://larvadb.dev) — the docs, a live SQL console, the data viewer, and the stress lab
+- [Repository](https://github.com/pango07/larva-db) — development, CI, and the site's source
 - [Quickstart](https://github.com/pango07/larva-db/blob/main/LARVA-QUICKSTART.md)
 - [Design of record](https://github.com/pango07/larva-db/blob/main/LARVA-DESIGN.md)
 - [The agent prompt](https://github.com/pango07/larva-db/blob/main/docs/larva-for-agents.md)

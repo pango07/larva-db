@@ -305,9 +305,9 @@ export default function Landing() {
               <div className="border-hairline bg-background flex min-w-0 items-center gap-3 rounded-lg border py-2.5 pr-2 pl-4 font-mono text-sm">
                 <span className="text-accent select-none">$</span>
                 <span className="overflow-x-auto whitespace-nowrap">
-                  curl larva-db.vercel.app/llms.txt
+                  curl larvadb.dev/llms.txt
                 </span>
-                <CopyButton text="curl https://larva-db.vercel.app/llms.txt" />
+                <CopyButton text="curl https://larvadb.dev/llms.txt" />
               </div>
             </div>
           </div>
