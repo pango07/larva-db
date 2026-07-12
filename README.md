@@ -10,7 +10,9 @@
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Current release: 2.7.0.** Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Docs & live demo: [larvadb.dev](https://larvadb.dev)** — a landing page that queries its own database, the full docs, a public test lab, and the agent prompt at [larvadb.dev/llms.txt](https://larvadb.dev/llms.txt).
+
+**Current release: 2.7.1.** Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -203,7 +205,7 @@ const db = larva({
 
 ## Give this to your AI agent
 
-Larva is built for apps where an agent writes the SQL. The prompt that teaches an agent the dialect, the guardrails, and the performance rules lives in **[docs/larva-for-agents.md](docs/larva-for-agents.md)** — paste its contents into your agent's instructions (CLAUDE.md, AGENTS.md, .cursorrules, a system prompt), or point the agent at a deployed test lab's **`/llms.txt`**, which serves the same file raw. The deployed lab's `/docs` page has a one-click copy button.
+Larva is built for apps where an agent writes the SQL. The prompt that teaches an agent the dialect, the guardrails, and the performance rules lives in **[docs/larva-for-agents.md](docs/larva-for-agents.md)** — paste its contents into your agent's instructions (CLAUDE.md, AGENTS.md, .cursorrules, a system prompt), or point the agent at **[larvadb.dev/llms.txt](https://larvadb.dev/llms.txt)**, which serves the same file raw. The [docs site](https://larvadb.dev/docs) has a one-click copy button.
 
 The short version of what it teaches:
 
@@ -313,7 +315,7 @@ bun run --cwd packages/larvadb build   # build the npm package
 
 ## Try it in a browser
 
-The repo doubles as a test lab — a Next.js dashboard with a SQL console over a seeded demo database (with Postgres/JSON/CSV export), a commit-protocol stress lab, and a `/docs` page that serves the agent prompt (raw at `/llms.txt`, with a copy button). [docs/test-lab.md](docs/test-lab.md) explains all of it. Deploy it to your own Vercel account:
+The repo doubles as the site behind **[larvadb.dev](https://larvadb.dev)** — a landing page running live queries, a SQL console over a seeded demo database (with Postgres/JSON/CSV export), a commit-protocol stress lab, and docs that serve the agent prompt (raw at [/llms.txt](https://larvadb.dev/llms.txt), with a copy button). [docs/test-lab.md](docs/test-lab.md) explains all of it. Deploy it to your own Vercel account:
 
 ```bash
 git clone https://github.com/pango07/larva-db && cd larva-db

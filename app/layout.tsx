@@ -13,9 +13,23 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://larvadb.dev"),
   title: "LarvaDB — a real SQL database, living in your object store",
   description:
     "Larva turns Vercel Blob, S3, or R2 into a durable SQL database with transactions, time travel, and a Postgres escape hatch. No server, no connection string — just a bucket.",
+  openGraph: {
+    title: "LarvaDB — a real SQL database, living in your object store",
+    description:
+      "Real SQL, atomic transactions, time travel, and a Postgres escape hatch — inside the bucket you already have.",
+    url: "https://larvadb.dev",
+    siteName: "LarvaDB",
+    images: [{ url: "/og.png", width: 1200, height: 630, alt: "larvadb" }],
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    images: ["/og.png"],
+  },
 };
 
 export default function RootLayout({
