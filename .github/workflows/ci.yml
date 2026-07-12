@@ -36,6 +36,9 @@ jobs:
       - name: Group commit + conflict-matrix property test (offline)
         run: bun scripts/group-commit-test.ts
 
+      - name: Demo-endpoint abuse guards (offline)
+        run: bun scripts/guard-test.ts
+
       - name: Live Blob-store tests
         env:
           BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}

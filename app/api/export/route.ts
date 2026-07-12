@@ -1,9 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { demoDb } from "@/app/lib/demo";
+import { clientIp, rateLimit } from "@/app/lib/guard";
 
 export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
+  // Read-only, but each export walks every chunk and ships the whole
+  // database out — worth a per-IP ceiling against download loops.
+  if (!rateLimit("export", clientIp(req), 6)) {
+    return NextResponse.json(
+      { error: { code: "RATE_LIMITED", message: "too many exports from your address — the demo database doesn't change that fast" } },
+      { status: 429 },
+    );
+  }
   const format = req.nextUrl.searchParams.get("format") ?? "json";
   const db = await demoDb();
 

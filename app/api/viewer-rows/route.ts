@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { SqlError } from "@larva-db/core";
 import { demoDb, demoSchema } from "@/app/lib/demo";
+import { clientIp, rateLimit } from "@/app/lib/guard";
 import { tableMeta } from "@/app/lib/viewer";
 
 export const maxDuration = 60;
@@ -17,6 +18,13 @@ const MAX_PAGE = 200;
  * show the zone maps doing their job.
  */
 export async function GET(req: NextRequest) {
+  // Generous — paging and scrubbing fire these in bursts — but bounded.
+  if (!rateLimit("viewer-rows", clientIp(req), 120)) {
+    return NextResponse.json(
+      { error: { code: "RATE_LIMITED", message: "too many requests — slow down a little" } },
+      { status: 429 },
+    );
+  }
   const p = req.nextUrl.searchParams;
   const table = p.get("table") ?? "";
   const spec = demoSchema[table];

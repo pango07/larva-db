@@ -88,9 +88,10 @@ export function Console() {
   async function reset() {
     setResetting(true);
     try {
-      await fetch("/api/demo-reset", { method: "POST" });
+      const res = await fetch("/api/demo-reset", { method: "POST" });
+      const body = (await res.json().catch(() => ({}))) as { error?: SqlErrorBody };
       setResult(null);
-      setError(null);
+      setError(body.error ?? null); // surfaces the reset cooldown / daily cap
     } finally {
       setResetting(false);
     }

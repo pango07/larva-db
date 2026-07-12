@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { SqlError } from "@larva-db/core";
 import { demoDb } from "@/app/lib/demo";
+import { clientIp, rateLimit } from "@/app/lib/guard";
 import { schemaMeta } from "@/app/lib/viewer";
 
 export const maxDuration = 60;
@@ -14,6 +15,13 @@ export const maxDuration = 60;
  * structure before a single row loads.
  */
 export async function GET(req: NextRequest) {
+  // Generous — the viewer's scrubber fires these in bursts — but bounded.
+  if (!rateLimit("inspect", clientIp(req), 120)) {
+    return NextResponse.json(
+      { error: { code: "RATE_LIMITED", message: "too many requests — slow down a little" } },
+      { status: 429 },
+    );
+  }
   const versionParam = req.nextUrl.searchParams.get("version");
   try {
     const db = await demoDb();

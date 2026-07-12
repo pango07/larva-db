@@ -28,8 +28,13 @@ The bottom of [the lab page](/lab) hammers one database with concurrent writers,
 
 ## Guardrails (a public toy, not a public liability)
 
-- Statements cap at 5,000 characters.
-- Writes draw from a **budget of 400 commits between resets** — every commit bumps the version, so budget × statement cap bounds total storage no matter what the console is fed. Exhausting it returns `WRITE_BUDGET_EXHAUSTED` (HTTP 429); reset restarts it.
+Storage is bounded per reset, and — the part a reset can't launder — *operations* are bounded per day, because blob bills count both. All budget checks live server-side (`app/lib/guard.ts`) and fail closed.
+
+- **Statements cap at 5,000 characters**, and the console runs **SELECT / INSERT / UPDATE / DELETE only**. Schema statements (`CREATE`, `ALTER`, `DROP`, `CREATE INDEX`) are blocked — not for safety, but because they amplify the op count of every later commit. Clone the repo for the full dialect.
+- **Row ceilings**: 50 rows per INSERT, 2,000 rows per table (`DEMO_TABLE_FULL` → reset to continue).
+- Writes draw from a **budget of 400 commits between resets** — budget × statement cap bounds total storage no matter what the console is fed. Exhausting it returns `WRITE_BUDGET_EXHAUSTED` (HTTP 429); reset restarts it.
+- **Global daily budgets**, durable in the store itself and updated with the same CAS the commit protocol uses, shared across serverless instances: 600 console commits, 24 resets (with a 5-minute cooldown, so a reset loop can't launder the write budget), and 30 stress runs — which also take a **single-flight lease**: one run at a time, abandoned leases expire on their own.
+- **Per-IP rate limits** on every endpoint (reads included), and browser writes from foreign origins are refused outright.
 - Stress runs always clean up after themselves, and reset also sweeps blobs left by failed harness runs.
 
 ## API routes (what the buttons call)
@@ -54,7 +59,7 @@ bun run dev                       # http://localhost:3000
 vercel deploy --prod --yes        # or ship it
 ```
 
-## The test suites — 297 checks across seven suites
+## The test suites — 318 checks across eight suites
 
 Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate. All of it runs in CI on every push; merges to `main` publish to npm.
 
@@ -65,6 +70,7 @@ bun run lint
 # offline — no credentials needed
 bun scripts/s3-adapter-test.ts     # storage contract + injected 409/500 chaos
 bun scripts/group-commit-test.ts   # coalescing, conflict matrix, formats 3–4, upgrade flow
+bun scripts/guard-test.ts          # the demo-endpoint abuse guards above
 
 # live — need BLOB_READ_WRITE_TOKEN in .env.local
 bun scripts/sql-smoke.ts           # the whole dialect, end to end
@@ -84,6 +90,7 @@ bun scripts/bench.ts               # write throughput, both formats
 | `cli-smoke.ts` | the CLI: arguments, exit codes, files on disk, upgrade/rollback |
 | `s3-adapter-test.ts` | the storage contract under injected chaos |
 | `group-commit-test.ts` | coalescing, the conflict matrix, the ordered commit log under chaos |
+| `guard-test.ts` | the public lab's abuse guards: budgets count exactly under CAS contention, fail closed |
 
 <Callout>
   The stress and property harnesses ship in the package —
