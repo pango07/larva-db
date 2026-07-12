@@ -13,9 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Larva — commit-protocol stress lab",
+  title: "LarvaDB — a real SQL database, living in your object store",
   description:
-    "Concurrent-writer stress tests for Larva's Vercel Blob commit protocol: zero lost updates, or it fails loudly.",
+    "Larva turns Vercel Blob, S3, or R2 into a durable SQL database with transactions, time travel, and a Postgres escape hatch. No server, no connection string — just a bucket.",
 };
 
 export default function RootLayout({
