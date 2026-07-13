@@ -332,6 +332,7 @@ class Parser {
     do {
       const name = this.ident("column name");
       const type = this.ident("column type").toLowerCase();
+      const scale = this.typeArgs(type);
       let primaryKey = false;
       let unique = false;
       for (;;) {
@@ -348,7 +349,7 @@ class Parser {
           }
         } else break;
       }
-      columns.push({ name, type, primaryKey, unique });
+      columns.push({ name, type, ...(scale !== undefined ? { scale } : {}), primaryKey, unique });
     } while (this.eat("punct", ","));
     this.expect("punct", ")");
     return { kind: "create", table, columns };
@@ -437,6 +438,7 @@ class Parser {
 
     const name = this.ident("column name");
     const type = this.ident("column type").toLowerCase();
+    const scale = this.typeArgs(type);
     if (this.at("keyword", "PRIMARY") || this.at("keyword", "UNIQUE")) {
       throw new SqlError(
         "UNSUPPORTED_FEATURE",
@@ -464,7 +466,34 @@ class Parser {
         this.expect("punct", ")");
       }
     }
-    return { kind: "alter", table, column: { name, type } };
+    return { kind: "alter", table, column: { name, type, ...(scale !== undefined ? { scale } : {}) } };
+  }
+
+  /** Optional (precision[, scale]) after a type name. SQL semantics: one
+   * argument is precision, two is (precision, scale). Precision is accepted
+   * and ignored — Larva decimals are arbitrary-precision BigInt; varchar(255)
+   * and friends parse and ignore their argument too. Returns the scale for
+   * decimal/numeric, undefined for every other type. */
+  private typeArgs(type: string): number | undefined {
+    const isDecimal = type === "decimal" || type === "numeric";
+    if (!this.eat("punct", "(")) {
+      if (isDecimal) {
+        throw new SqlError(
+          "UNKNOWN_TYPE",
+          "DECIMAL needs a declared scale, e.g. DECIMAL(18, 2) — the second number is the fraction digits (use scale 0 for exact integers)",
+        );
+      }
+      return undefined;
+    }
+    this.expect("number"); // precision — parsed, ignored
+    let scale = 0;
+    if (this.eat("punct", ",")) scale = Number(this.expect("number").text);
+    this.expect("punct", ")");
+    if (!isDecimal) return undefined;
+    if (!Number.isInteger(scale) || scale < 0 || scale > 12) {
+      throw new SqlError("UNKNOWN_TYPE", `DECIMAL scale must be an integer between 0 and 12, got ${scale}`);
+    }
+    return scale;
   }
 
   private returning(): SelectItem[] | null | undefined {
@@ -608,7 +637,10 @@ class Parser {
       this.next();
       return { kind: "param", index: this.paramCount++ };
     }
-    if (this.at("number")) return { kind: "literal", value: Number(this.next().text) };
+    if (this.at("number")) {
+      const text = this.next().text;
+      return { kind: "literal", value: Number(text), text };
+    }
     if (this.at("string")) return { kind: "literal", value: this.next().text };
     if (this.eat("keyword", "NULL")) return { kind: "literal", value: null };
     if (this.eat("keyword", "CURRENT_TIMESTAMP")) return { kind: "func", name: "NOW", args: [] };

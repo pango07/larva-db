@@ -1,4 +1,5 @@
 import { Row, Scalar, ulid, uuidv7 } from "./core";
+import { canonDecimal, MAX_SCALE } from "./decimal";
 
 /**
  * Code-first schema (Design §8). The canonical schema lives in the app repo so
@@ -9,10 +10,14 @@ import { Row, Scalar, ulid, uuidv7 } from "./core";
  * the error can say so precisely.
  */
 
-export type ColumnType = "text" | "integer" | "real" | "boolean" | "timestamp";
+export type ColumnType = "text" | "integer" | "real" | "boolean" | "timestamp" | "decimal";
 
 export interface ColumnDef {
   type: ColumnType;
+  /** decimal only: fixed number of fraction digits (0–12). Values are stored
+   * as canonical strings and computed exactly with BigInt (Design §8;
+   * requires format 5). */
+  scale?: number;
   primaryKey: boolean;
   unique: boolean;
   references?: string;
@@ -61,11 +66,18 @@ export class ColumnBuilder<T> {
   declare readonly $type: T;
   private def: ColumnDef;
 
-  constructor(type: ColumnType) {
+  constructor(type: ColumnType, scale?: number) {
     this.def = { type, primaryKey: false, unique: false, partitionBy: false };
+    if (scale !== undefined) this.def.scale = scale;
   }
 
   primaryKey(): ColumnBuilder<NonNullable<T>> {
+    if (this.def.type === "decimal") {
+      throw new SchemaError(
+        "INVALID_PRIMARY_KEY",
+        "a decimal column cannot be the primary key — money is not identity; use t.uuid() (or t.sequence() for human-facing numbers)",
+      );
+    }
     this.def.primaryKey = true;
     return this as unknown as ColumnBuilder<NonNullable<T>>;
   }
@@ -117,6 +129,22 @@ export const t = {
   real: () => new ColumnBuilder<number | null>("real"),
   boolean: () => new ColumnBuilder<boolean | null>("boolean"),
   timestamp: () => new ColumnBuilder<string | null>("timestamp"),
+  /** Exact decimal with a fixed scale (fraction digits) — the money type.
+   * Stored and returned as canonical strings ("123.45"), computed exactly
+   * with BigInt: SUM never drifts, equality never misfires, and there is no
+   * float rounding anywhere. Accepts string or number on INSERT; rejects
+   * values with more fraction digits than the scale (round explicitly).
+   * Requires the commit-log store format (format 5) — new stores are created
+   * on it automatically; older stores need db.upgrade() first. */
+  decimal: (scale: number) => {
+    if (!Number.isInteger(scale) || scale < 0 || scale > MAX_SCALE) {
+      throw new SchemaError(
+        "INVALID_SCALE",
+        `t.decimal(scale) needs an integer scale between 0 and ${MAX_SCALE}, got ${scale}`,
+      );
+    }
+    return new ColumnBuilder<string | null>("decimal", scale);
+  },
   /** Auto-assigned integer: omit it on INSERT and Larva fills the next number.
    * Numbers are unique across concurrent processes (disjoint CAS-claimed
    * ranges) but gappy on crash — same contract as a Postgres sequence. */
@@ -231,6 +259,10 @@ const typeOk = (type: ColumnType, v: Scalar): boolean => {
       return typeof v === "number";
     case "boolean":
       return typeof v === "boolean";
+    case "decimal":
+      // Inputs are canonicalized before this check; anything else is a bug
+      // in the caller, not the user's value.
+      return typeof v === "string";
   }
 };
 
@@ -254,6 +286,16 @@ export function validateInsert(table: string, schema: TableSchema, row: Row): Ro
     }
     if (v === null && def.uuid) v = uuidv7();
     if (v === null && name === schema.primaryKey) v = ulid();
+    if (v !== null && def.type === "decimal") {
+      if (typeof v !== "string" && typeof v !== "number") {
+        throw new SchemaError("TYPE_MISMATCH", `column "${table}.${name}" is decimal(${def.scale}), got ${JSON.stringify(v)}`);
+      }
+      try {
+        v = canonDecimal(v, def.scale ?? 0, `column "${table}.${name}"`);
+      } catch (err) {
+        throw new SchemaError("TYPE_MISMATCH", err instanceof Error ? err.message : String(err));
+      }
+    }
     if (!typeOk(def.type, v)) {
       throw new SchemaError(
         "TYPE_MISMATCH",
@@ -295,6 +337,9 @@ export function schemaDrift(code: DatabaseSchema, manifest: DatabaseSchema): str
       const liveCol = live.columns[col];
       if (!liveCol) drift.push(`table "${table}": column "${col}" is in code but not in the store`);
       else if (liveCol.type !== def.type) drift.push(`table "${table}.${col}": code says ${def.type}, store says ${liveCol.type}`);
+      else if (def.type === "decimal" && (liveCol.scale ?? 0) !== (def.scale ?? 0)) {
+        drift.push(`table "${table}.${col}": code says decimal(${def.scale}), store says decimal(${liveCol.scale})`);
+      }
     }
     for (const col of Object.keys(live.columns)) {
       if (!codeTable.columns[col]) drift.push(`table "${table}": column "${col}" exists in the store but not in code`);

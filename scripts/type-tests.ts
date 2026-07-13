@@ -81,3 +81,14 @@ const orderRef: string | null = order.ref;
 const orderIdNum: number = order.id;
 
 void [v2, invoiceNumber, invoiceNumberStr, v2nullable, counter, withUuid, orderId, orderRef, orderIdNum];
+
+// decimal columns infer as string (exactness demands it — like every Postgres driver)
+const withDecimal = defineSchema({ invoices: { id: t.uuid().primaryKey(), total: t.decimal(2) } });
+type DecInvoice = InferRow<typeof withDecimal, "invoices">;
+declare const decInvoice: DecInvoice;
+const decTotal: string | null = decInvoice.total;
+
+// @ts-expect-error decimal values are canonical strings, never numbers
+const decTotalNum: number | null = decInvoice.total;
+
+void [withDecimal, decTotal, decTotalNum];

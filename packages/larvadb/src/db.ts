@@ -1,4 +1,4 @@
-import { AppendIntent, cmpScalar, ConflictError, IndexRef, IntentVerdict, LarvaProto, Manifest, OrderedIntent, Row, Scalar, Snapshot, SUPPORTED_FORMAT_VERSION, ulid } from "./core";
+import { AppendIntent, cmpScalar, ConflictError, IndexRef, IntentVerdict, LarvaProto, Manifest, OrderedIntent, requiredFormatVersion, Row, Scalar, Snapshot, TOP_PROTOCOL_FORMAT, ulid } from "./core";
 import { ColumnDef, DatabaseSchema, fillAbsentColumns, SchemaError, schemaDrift, TableSchema } from "./schema";
 import { hasSubquery, InsertStmt } from "./sql/ast";
 import { SqlError } from "./sql/errors";
@@ -197,6 +197,15 @@ export class LarvaDb {
       );
     }
     if (additions.length > 0) {
+      // A decimal column raises the store to format 5, which implies log
+      // mode — a CAS-mode store cannot express it (Design §8). Loud, with
+      // the one-command fix, instead of silently corrupting the format.
+      if (additions.some((a) => a.def.type === "decimal") && this.format < 3) {
+        throw new SchemaError(
+          "FORMAT_REQUIRED",
+          "the schema adds a decimal column, which requires the commit-log store format (format 5): run db.upgrade() once (one-way, data survives), then redeploy",
+        );
+      }
       await this.proto.commit(async () => ({
         apply: (m) => {
           const s = structuredClone((m.schema ?? {}) as DatabaseSchema);
@@ -573,7 +582,11 @@ export class LarvaDb {
           if (!ts || !snap.manifest.tables[table]) continue; // table dropped since the append — rows go with it
           const fresh = await this.dropExisting(snap, table, ts, rows);
           if (fresh.length === 0) continue;
-          const ref = await this.proto.stageChunk(table, fresh, { pk: ts.primaryKey, part: ts.partitionColumn });
+          const ref = await this.proto.stageChunk(table, fresh, {
+            pk: ts.primaryKey,
+            part: ts.partitionColumn,
+            partDecimal: ts.partitionColumn ? ts.columns[ts.partitionColumn]?.type === "decimal" : undefined,
+          });
           const indexUpdates = await this.executor.stageIndexUpdates(snap, table, ts, [], [{ ref, rows: fresh }]);
           staged.push({ table, ref, baseSig: snap.manifest.tables[table].chunks.map((c) => c.id).join(","), indexUpdates });
         }
@@ -712,7 +725,9 @@ export class LarvaDb {
         "sqlite export needs the Bun runtime (run it via a script: bun scripts/export.ts); json and csv formats work everywhere",
       );
     }
-    const SQLITE_TYPE: Record<string, string> = { text: "TEXT", timestamp: "TEXT", integer: "INTEGER", real: "REAL", boolean: "INTEGER" };
+    // decimal → TEXT: SQLite has no exact decimal type, and NUMERIC affinity
+    // would silently float-ify — TEXT preserves the digits (documented).
+    const SQLITE_TYPE: Record<string, string> = { text: "TEXT", timestamp: "TEXT", integer: "INTEGER", real: "REAL", boolean: "INTEGER", decimal: "TEXT" };
     const file = new Database(":memory:");
     for (const [table, rows] of Object.entries(tables)) {
       const cols = columnsOf(table);
@@ -766,7 +781,8 @@ export class LarvaDb {
       const cols = columnsOf(table);
       const defs = cols.map((c) => {
         const def = schema[table]?.columns[c];
-        const parts = [q(c), PG_TYPE[def?.type ?? "text"]];
+        const pgType = def?.type === "decimal" ? `numeric(38, ${def.scale ?? 0})` : PG_TYPE[def?.type ?? "text"];
+        const parts = [q(c), pgType];
         if (def?.primaryKey) parts.push("PRIMARY KEY");
         if (def?.unique) parts.push("UNIQUE");
         return `  ${parts.join(" ")}`;
@@ -944,17 +960,21 @@ export class LarvaDb {
     await this.ensureReady();
     const current = await this.proto.snapshot();
     this.format = Math.max(this.format, current.manifest.formatVersion ?? 1);
-    if ((current.manifest.formatVersion ?? 1) >= SUPPORTED_FORMAT_VERSION) {
+    // The protocol ceiling, raised further only when the schema demands it
+    // (decimal → 5) — a store never locks out older clients for a feature
+    // it doesn't use.
+    const target = Math.max(TOP_PROTOCOL_FORMAT, requiredFormatVersion(current.manifest.schema));
+    if ((current.manifest.formatVersion ?? 1) >= target) {
       return { version: current.manifest.version, formatVersion: current.manifest.formatVersion };
     }
     const result = await this.proto.commit(async () => ({
       apply: (m) => {
-        m.formatVersion = Math.max(m.formatVersion ?? 1, SUPPORTED_FORMAT_VERSION);
+        m.formatVersion = Math.max(m.formatVersion ?? 1, target);
         return m;
       },
     }));
-    this.format = SUPPORTED_FORMAT_VERSION;
-    return { version: result.version, formatVersion: SUPPORTED_FORMAT_VERSION };
+    this.format = target;
+    return { version: result.version, formatVersion: target };
   }
 
   /** Restore a past version. Itself a commit — non-destructive and rollbackable (Design §9). */

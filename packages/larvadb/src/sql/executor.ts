@@ -1,4 +1,5 @@
 import { ChunkRef, cmpScalar, CommitStats, IndexBlob, IndexRef, LarvaProto, Manifest, Row, Scalar, Snapshot } from "../core";
+import { canonDecimal, divHalfUp, formatDecimal, fracLen, isCanonicalDecimal, parseDecimal, rescale } from "../decimal";
 import { DatabaseSchema, fillAbsentColumns, TableSchema, validateInsert } from "../schema";
 import {
   Aggregate,
@@ -26,11 +27,142 @@ const COLUMN_TYPES: Record<string, TableSchema["columns"][string]["type"]> = {
   text: "text", varchar: "text", integer: "integer", int: "integer", real: "real",
   float: "real", double: "real", boolean: "boolean", bool: "boolean",
   timestamp: "timestamp", datetime: "timestamp",
+  decimal: "decimal", numeric: "decimal",
 };
 
-/** One chunk's entry in a secondary index: sorted distinct non-NULL values. */
-function distinctSorted(rows: Row[], col: string): Scalar[] {
-  return [...new Set(rows.map((r) => r[col] ?? null).filter((v) => v !== null))].sort(cmpScalar);
+/** One chunk's entry in a secondary index: sorted distinct non-NULL values.
+ * Decimal columns sort numerically — the binary searches below assume it. */
+function distinctSorted(rows: Row[], col: string, dec = false): Scalar[] {
+  return [...new Set(rows.map((r) => r[col] ?? null).filter((v) => v !== null))].sort(dec ? decCmpValues : cmpScalar);
+}
+
+/** Numeric ordering for decimal values (strings or numbers), null-first like
+ * cmpScalar. Throws TYPE_MISMATCH on non-numerals — a decimal column compared
+ * against text should scream, not sort lexicographically. */
+function decCmpValues(a: Scalar, b: Scalar): number {
+  if (a === null && b === null) return 0;
+  if (a === null) return -1;
+  if (b === null) return 1;
+  if (typeof a === "boolean" || typeof b === "boolean") {
+    throw new SqlError("TYPE_MISMATCH", `cannot compare a decimal with ${JSON.stringify(typeof a === "boolean" ? a : b)}`);
+  }
+  const ta = String(a);
+  const tb = String(b);
+  const sa = fracLen(ta);
+  const sb = fracLen(tb);
+  const sc = Math.max(sa, sb);
+  const na = rescale(parseDecimal(ta, sa, "decimal comparison"), sa, sc);
+  const nb = rescale(parseDecimal(tb, sb, "decimal comparison"), sb, sc);
+  return na < nb ? -1 : na > nb ? 1 : 0;
+}
+
+/**
+ * Static numeric classification of expressions: "dec" (exact decimal),
+ * "real" (float column), or null (everything else). Populated per statement
+ * before evaluation (WeakMap-keyed by AST node, so concurrent statements
+ * never collide); evalExpr and aggregate() consult it to route decimal
+ * operands through exact BigInt paths. Mixing decimal with real in one
+ * expression is rejected here — a silent float fallback is exactly the bug
+ * class t.decimal() exists to eliminate.
+ */
+type NumInfo = "dec" | "real" | null;
+const NUMINFO = new WeakMap<Expr, NumInfo>();
+
+const mixError = () =>
+  new SqlError(
+    "TYPE_MISMATCH",
+    "the expression mixes a decimal column with a real column — that would silently lose exactness; CAST the decimal side explicitly (CAST(x AS real)) if float math is intended",
+  );
+
+function combineNumeric(infos: NumInfo[]): NumInfo {
+  const dec = infos.includes("dec");
+  const real = infos.includes("real");
+  if (dec && real) throw mixError();
+  return dec ? "dec" : real ? "real" : null;
+}
+
+function annotateNumerics(e: Expr, colInfo: (c: ColumnRef) => NumInfo): NumInfo {
+  const walk = (n: Expr): NumInfo => {
+    const info = classify(n);
+    NUMINFO.set(n, info);
+    return info;
+  };
+  const classify = (n: Expr): NumInfo => {
+    switch (n.kind) {
+      case "column":
+        return colInfo(n);
+      case "literal":
+      case "param":
+        return null; // decimal-ness is contextual: the operand coercion handles them
+      case "cast":
+        walk(n.expr);
+        return n.to === "real" ? "real" : null;
+      case "not":
+        walk(n.expr);
+        return null;
+      case "isnull":
+        walk(n.expr);
+        return null;
+      case "like":
+        walk(n.expr);
+        walk(n.pattern);
+        return null;
+      case "in": {
+        const v = walk(n.expr);
+        const items = n.list.map(walk);
+        if ((v === "dec" && items.includes("real")) || (v === "real" && items.includes("dec"))) throw mixError();
+        return null;
+      }
+      case "between": {
+        const parts = [walk(n.expr), walk(n.lo), walk(n.hi)];
+        if (parts.includes("dec") && parts.includes("real")) throw mixError();
+        return null;
+      }
+      case "case": {
+        for (const b of n.branches) walk(b.when);
+        const outs = n.branches.map((b) => walk(b.then));
+        if (n.else !== undefined) outs.push(walk(n.else));
+        return combineNumeric(outs);
+      }
+      case "func": {
+        const args = n.args.map(walk);
+        switch (n.name) {
+          case "ROUND":
+          case "ABS":
+          case "CEIL":
+          case "FLOOR":
+            return args[0] ?? null;
+          case "MOD":
+            return combineNumeric(args);
+          case "COALESCE":
+          case "IFNULL":
+          case "NULLIF":
+            return combineNumeric(args);
+          default:
+            return null;
+        }
+      }
+      case "aggregate": {
+        const arg = n.arg ? walk(n.arg) : null;
+        if (n.sep) walk(n.sep);
+        return n.func === "SUM" || n.func === "AVG" || n.func === "MIN" || n.func === "MAX" ? arg : null;
+      }
+      case "subquery":
+      case "insub":
+        return null; // rewritten into literals before annotation
+      case "binary": {
+        const l = walk(n.left);
+        const r = walk(n.right);
+        if (n.op === "AND" || n.op === "OR" || n.op === "||" || n.op === "->>") return null;
+        if ((l === "dec" && r === "real") || (l === "real" && r === "dec")) throw mixError();
+        if (["+", "-", "*", "/"].includes(n.op)) {
+          return l === "dec" || r === "dec" ? "dec" : l === "real" || r === "real" ? "real" : null;
+        }
+        return null; // comparisons produce booleans; operand infos drive evaluation
+      }
+    }
+  };
+  return walk(e);
 }
 
 /** Marker for "no upper bound", compared by IDENTITY (===), never as a value —
@@ -38,12 +170,12 @@ function distinctSorted(rows: Row[], col: string): Scalar[] {
  * pruned. A user value that happens to equal this string merely over-fetches. */
 const UNBOUNDED = "￿￿￿￿";
 
-function sortedHas(vals: Scalar[], v: Scalar): boolean {
+function sortedHas(vals: Scalar[], v: Scalar, cmp: (a: Scalar, b: Scalar) => number = cmpScalar): boolean {
   let lo = 0;
   let hi = vals.length - 1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    const c = cmpScalar(vals[mid], v);
+    const c = cmp(vals[mid], v);
     if (c === 0) return true;
     if (c < 0) lo = mid + 1;
     else hi = mid - 1;
@@ -52,15 +184,15 @@ function sortedHas(vals: Scalar[], v: Scalar): boolean {
 }
 
 /** Any value in the sorted array within [lo, hi]? */
-function sortedOverlaps(vals: Scalar[], lo: Scalar, hi: Scalar): boolean {
+function sortedOverlaps(vals: Scalar[], lo: Scalar, hi: Scalar, cmp: (a: Scalar, b: Scalar) => number = cmpScalar): boolean {
   let a = 0;
   let b = vals.length;
   while (a < b) {
     const mid = (a + b) >> 1;
-    if (cmpScalar(vals[mid], lo) < 0) a = mid + 1;
+    if (cmp(vals[mid], lo) < 0) a = mid + 1;
     else b = mid;
   }
-  return a < vals.length && (hi === UNBOUNDED || cmpScalar(vals[a], hi) <= 0);
+  return a < vals.length && (hi === UNBOUNDED || cmp(vals[a], hi) <= 0);
 }
 
 export interface ExecOptions {
@@ -226,6 +358,27 @@ export class Executor {
           `JOIN ${joinName} … ON must compare a column of "${joinName}" with a column of an earlier table`,
         );
       }
+      {
+        // Decimal join keys hash by canonical string, so both sides must be
+        // decimal at the SAME scale — equal values at different scales have
+        // different canonical forms and would silently never match.
+        const defOf = (side: { name: string; isJoined: boolean }, col: ColumnRef) =>
+          (side.isJoined ? joinSchema : scopes.find((sc) => sc.name === side.name)?.schema)?.columns[col.name];
+        const lDef = defOf(left, join.leftCol);
+        const rDef = defOf(right, join.rightCol);
+        if ((lDef?.type === "decimal") !== (rDef?.type === "decimal")) {
+          throw new SqlError(
+            "TYPE_MISMATCH",
+            `JOIN … ON compares ${lDef?.type ?? "?"} with ${rDef?.type ?? "?"} — a decimal column only joins another decimal column of the same scale`,
+          );
+        }
+        if (lDef?.type === "decimal" && (lDef.scale ?? 0) !== (rDef?.scale ?? 0)) {
+          throw new SqlError(
+            "TYPE_MISMATCH",
+            `JOIN … ON compares decimal(${lDef.scale ?? 0}) with decimal(${rDef?.scale ?? 0}) — align the scales; equal values at different scales have different canonical forms`,
+          );
+        }
+      }
       const joinKey = (left.isJoined ? join.leftCol : join.rightCol).name;
       const prior = left.isJoined ? { name: right.name, col: join.rightCol.name } : { name: left.name, col: join.leftCol.name };
 
@@ -244,6 +397,22 @@ export class Executor {
       scopes.push({ name: joinName, schema: joinSchema });
     }
 
+    // Classify every expression as decimal/real/other now that all table
+    // scopes are known — evaluation dispatches on it (see NUMINFO).
+    const colInfo = (c: ColumnRef): NumInfo => {
+      const def = c.table
+        ? scopes.find((sc) => sc.name === c.table)?.schema.columns[c.name]
+        : (() => {
+            const owners = scopes.filter((sc) => c.name in sc.schema.columns);
+            return owners.length === 1 ? owners[0].schema.columns[c.name] : undefined;
+          })();
+      return def?.type === "decimal" ? "dec" : def?.type === "real" ? "real" : null;
+    };
+    if (stmt.where) annotateNumerics(stmt.where, colInfo);
+    for (const item of stmt.items ?? []) annotateNumerics(item.expr, colInfo);
+    for (const g of stmt.groupBy ?? []) annotateNumerics(g, colInfo);
+    if (stmt.having) annotateNumerics(stmt.having, colInfo);
+
     if (stmt.where) {
       contexts = contexts.filter((ctx) => this.truthy(this.evalExpr(stmt.where as Expr, ctx, params)));
     }
@@ -251,7 +420,7 @@ export class Executor {
     let output: Row[];
     const hasAggregates = stmt.items?.some((i) => hasAggregate(i.expr)) ?? false;
     if (stmt.groupBy || stmt.having || hasAggregates) {
-      output = this.grouped(stmt, contexts, params, realCols);
+      output = this.grouped(stmt, contexts, params, realCols, colInfo);
       if (stmt.orderBy) {
         for (const { column } of stmt.orderBy) {
           if (output.length > 0 && !(column.name in output[0])) {
@@ -261,7 +430,11 @@ export class Executor {
             );
           }
         }
-        output.sort((a, b) => this.orderCmp(a, b, stmt.orderBy as { column: ColumnRef; desc: boolean }[]));
+        const decOutputs: Record<string, boolean> = {};
+        (stmt.items ?? []).forEach((item, i) => {
+          decOutputs[this.outputName(item, i)] = NUMINFO.get(item.expr) === "dec";
+        });
+        output.sort((a, b) => this.orderCmp(a, b, stmt.orderBy as { column: ColumnRef; desc: boolean }[], decOutputs));
       }
     } else {
       if (stmt.orderBy) {
@@ -273,9 +446,15 @@ export class Executor {
           const viaAlias = !column.table ? aliased.get(column.name) : undefined;
           return viaAlias ? this.evalExpr(viaAlias, ctx, params) : this.resolveColumn(column, ctx);
         };
+        const orderDec = (stmt.orderBy as { column: ColumnRef; desc: boolean }[]).map(({ column }) => {
+          const viaAlias = !column.table ? aliased.get(column.name) : undefined;
+          return viaAlias ? NUMINFO.get(viaAlias) === "dec" : colInfo(column) === "dec";
+        });
         contexts.sort((a, b) => {
+          let i = 0;
           for (const { column, desc } of stmt.orderBy as { column: ColumnRef; desc: boolean }[]) {
-            const c = cmpScalar(sortKey(column, a), sortKey(column, b));
+            const cmp = orderDec[i++] ? decCmpValues : cmpScalar;
+            const c = cmp(sortKey(column, a), sortKey(column, b));
             if (c !== 0) return desc ? -c : c;
           }
           return 0;
@@ -470,7 +649,7 @@ export class Executor {
     }
   }
 
-  private grouped(stmt: SelectStmt, contexts: Ctx[], params: Scalar[], realCols: Set<string>): Row[] {
+  private grouped(stmt: SelectStmt, contexts: Ctx[], params: Scalar[], realCols: Set<string>, colInfo: (c: ColumnRef) => NumInfo): Row[] {
     const items = stmt.items;
     if (!items) throw new SqlError("PARSE_ERROR", "SELECT * cannot be combined with GROUP BY, HAVING, or aggregates; list columns explicitly");
 
@@ -483,6 +662,9 @@ export class Executor {
       mapColumnRefs(e, (c) => (!c.table && !realCols.has(c.name) && aliased.has(c.name) ? (aliased.get(c.name) as Expr) : null));
 
     const groupBy = (stmt.groupBy ?? []).map(dealias);
+    // dealias may rebuild nodes (alias → item expression), so annotate the
+    // dealiased trees too — NUMINFO is keyed by node identity.
+    for (const g of groupBy) annotateNumerics(g, colInfo);
     const requireGrouped = (expr: Expr, where: string) => {
       if (coveredByGroupBy(expr, groupBy)) return;
       const names = new Set(groupBy.filter((g) => g.kind === "column").map((g) => (g as ColumnRef).name));
@@ -497,6 +679,7 @@ export class Executor {
     let having = stmt.having;
     if (having) {
       having = dealias(having);
+      annotateNumerics(having, colInfo);
       requireGrouped(having, "HAVING");
     }
 
@@ -527,19 +710,38 @@ export class Executor {
     const arg = agg.arg;
     let values = rows.map((ctx) => this.evalExpr(arg, ctx, params)).filter((v) => v !== null);
     if (agg.distinct) values = [...new Set(values)];
+    const dec = NUMINFO.get(arg) === "dec";
     switch (agg.func) {
       case "COUNT":
         return values.length;
       case "MIN":
-        return values.length ? values.reduce((a, b) => (cmpScalar(a, b) <= 0 ? a : b)) : null;
+        return values.length ? values.reduce((a, b) => ((dec ? decCmpValues : cmpScalar)(a, b) <= 0 ? a : b)) : null;
       case "MAX":
-        return values.length ? values.reduce((a, b) => (cmpScalar(a, b) >= 0 ? a : b)) : null;
+        return values.length ? values.reduce((a, b) => ((dec ? decCmpValues : cmpScalar)(a, b) >= 0 ? a : b)) : null;
       case "SUM":
       case "AVG": {
+        if (values.length === 0) return null;
+        if (dec) {
+          // Exact: scaled BigInt accumulation — SUM cannot drift or overflow.
+          // AVG divides at four extra digits, half-up (documented).
+          let scale = 0;
+          let acc = 0n;
+          for (const v of values) {
+            const t = String(v);
+            const vs = fracLen(t);
+            const n = parseDecimal(t, vs, `${agg.func}(…)`);
+            if (vs > scale) {
+              acc = rescale(acc, scale, vs);
+              scale = vs;
+            }
+            acc += rescale(n, vs, scale);
+          }
+          if (agg.func === "SUM") return formatDecimal(acc, scale);
+          return formatDecimal(divHalfUp(acc * 10_000n, BigInt(values.length)), scale + 4);
+        }
         if (values.some((v) => typeof v !== "number")) {
           throw new SqlError("TYPE_MISMATCH", `${agg.func}(…) requires a numeric argument`);
         }
-        if (values.length === 0) return null;
         const sum = (values as number[]).reduce((a, b) => a + b, 0);
         return agg.func === "SUM" ? sum : sum / values.length;
       }
@@ -579,9 +781,10 @@ export class Executor {
     return out;
   }
 
-  private orderCmp(a: Row, b: Row, orderBy: { column: ColumnRef; desc: boolean }[]): number {
+  private orderCmp(a: Row, b: Row, orderBy: { column: ColumnRef; desc: boolean }[], decOutputs?: Record<string, boolean>): number {
     for (const { column, desc } of orderBy) {
-      const c = cmpScalar(a[column.name] ?? null, b[column.name] ?? null);
+      const cmp = decOutputs?.[column.name] ? decCmpValues : cmpScalar;
+      const c = cmp(a[column.name] ?? null, b[column.name] ?? null);
       if (c !== 0) return desc ? -c : c;
     }
     return 0;
@@ -607,6 +810,7 @@ export class Executor {
   ): Promise<{ ref: ChunkRef; rows: Row[] }[]> {
     const refs = snap.manifest.tables[table]?.chunks ?? [];
     const bounds = where ? this.pruneBounds(where, schema, ctxName, params) : {};
+    const cmpFor = (col: string) => (schema.columns[col]?.type === "decimal" ? decCmpValues : cmpScalar);
     let survivors = refs.filter((ref) => {
       if (!ref.stats) return true;
       const pk = bounds[schema.primaryKey];
@@ -614,11 +818,12 @@ export class Executor {
         return false;
       }
       const part = schema.partitionColumn ? bounds[schema.partitionColumn] : undefined;
+      const cmpPart = schema.partitionColumn ? cmpFor(schema.partitionColumn) : cmpScalar;
       if (
         part &&
         ref.stats.partMin !== undefined &&
         ref.stats.partMax !== undefined &&
-        (cmpScalar(ref.stats.partMax, part.lo) < 0 || (part.hi !== UNBOUNDED && cmpScalar(ref.stats.partMin, part.hi) > 0))
+        (cmpPart(ref.stats.partMax, part.lo) < 0 || (part.hi !== UNBOUNDED && cmpPart(ref.stats.partMin, part.hi) > 0))
       ) {
         return false;
       }
@@ -636,11 +841,12 @@ export class Executor {
         if (!ref) continue;
         const blob = await this.proto.readIndex(ref);
         if (!blob) continue;
+        const cmp = cmpFor(col);
         survivors = survivors.filter((c) => {
           const vals = blob[c.id];
           if (!vals) return true;
-          if (!sortedOverlaps(vals, b.lo, b.hi)) return false;
-          return b.values ? b.values.some((v) => sortedHas(vals, v)) : true;
+          if (!sortedOverlaps(vals, b.lo, b.hi, cmp)) return false;
+          return b.values ? b.values.some((v) => sortedHas(vals, v, cmp)) : true;
         });
         if (survivors.length === 0) break;
       }
@@ -671,13 +877,37 @@ export class Executor {
     // `values` carries the exact =/IN candidate set for index membership
     // checks; ranges leave it unset. Keeping either side's set on merge is a
     // superset check — safe for pruning.
+    const isDec = (col: string) => schema.columns[col]?.type === "decimal";
     const narrow = (col: string, lo: Scalar, hi: Scalar, values?: Scalar[]) => {
+      const cmp = isDec(col) ? decCmpValues : cmpScalar;
       const cur = bounds[col];
+      // UNBOUNDED is identity-checked, never handed to a comparator — the
+      // decimal comparator would (rightly) refuse to parse it.
       const merged = cur
-        ? { lo: cmpScalar(lo, cur.lo) > 0 ? lo : cur.lo, hi: cmpScalar(hi, cur.hi) < 0 ? hi : cur.hi }
+        ? {
+            lo: cmp(lo, cur.lo) > 0 ? lo : cur.lo,
+            hi: hi === UNBOUNDED ? cur.hi : cur.hi === UNBOUNDED ? hi : cmp(hi, cur.hi) < 0 ? hi : cur.hi,
+          }
         : { lo, hi };
       const keep = cur?.values && values ? cur.values.filter((v) => values.includes(v)) : (cur?.values ?? values);
       bounds[col] = { ...merged, ...(keep ? { values: keep } : {}) };
+    };
+    /** =/IN membership values on a decimal column are canonicalized to the
+     * column's scale so they match the stored canonical strings; a value the
+     * scale cannot represent can equal no stored row — represented as an
+     * empty candidate set, which prunes everything (correctly). */
+    const decMembers = (col: string, vals: Scalar[]): Scalar[] => {
+      const scale = schema.columns[col]?.scale ?? 0;
+      const out: Scalar[] = [];
+      for (const v of vals) {
+        if (typeof v !== "string" && typeof v !== "number") continue;
+        try {
+          out.push(canonDecimal(v, scale, "pruning"));
+        } catch {
+          /* unrepresentable at this scale — matches nothing */
+        }
+      }
+      return out;
     };
     const MIN: Scalar = null; // null sorts first in cmpScalar → acts as -infinity
     const MAX = UNBOUNDED; // identity-checked "no upper bound" marker, never compared as a value
@@ -696,8 +926,10 @@ export class Executor {
         if (col === undefined || val === undefined || val === null) return;
         if (!(col in schema.columns)) return;
         if (typeof val === "number" || typeof val === "string") {
-          if (op === "=") narrow(col, val, val, [val]);
-          else if (op === "<" || op === "<=") narrow(col, MIN, val);
+          if (op === "=") {
+            const vals = isDec(col) ? decMembers(col, [val]) : [val];
+            narrow(col, vals[0] ?? val, vals[0] ?? val, vals);
+          } else if (op === "<" || op === "<=") narrow(col, MIN, val);
           else narrow(col, val, MAX);
         }
         return;
@@ -713,7 +945,16 @@ export class Executor {
         const col = colOf(e.expr);
         const vals = e.list.map(scalarOf);
         if (col && col in schema.columns && vals.every((v) => v !== undefined && v !== null)) {
-          const sorted = [...(vals as Scalar[])].sort(cmpScalar);
+          const members = isDec(col) ? decMembers(col, vals as Scalar[]) : (vals as Scalar[]);
+          if (members.length === 0) {
+            // No IN value is representable at the column's scale: nothing can
+            // match. An empty candidate set makes the index path prune every
+            // chunk; evaluation returns no rows regardless.
+            const raw = [...(vals as Scalar[])].sort(isDec(col) ? decCmpValues : cmpScalar);
+            narrow(col, raw[0], raw[raw.length - 1], []);
+            return;
+          }
+          const sorted = [...members].sort(isDec(col) ? decCmpValues : cmpScalar);
           narrow(col, sorted[0], sorted[sorted.length - 1], sorted);
         }
       }
@@ -762,8 +1003,13 @@ export class Executor {
         }
         return this.aggregate(e, group, params);
       }
-      case "func":
-        return this.scalarFunc(e.name, e.args.map((a) => this.evalExpr(a, ctx, params, group)));
+      case "func": {
+        const args = e.args.map((a) => this.evalExpr(a, ctx, params, group));
+        if (NUMINFO.get(e) === "dec" && ["ROUND", "ABS", "CEIL", "FLOOR", "MOD"].includes(e.name)) {
+          return this.decFunc(e.name, e.args, args);
+        }
+        return this.scalarFunc(e.name, args);
+      }
       case "case": {
         for (const b of e.branches) {
           if (this.truthy(this.evalExpr(b.when, ctx, params, group))) return this.evalExpr(b.then, ctx, params, group);
@@ -790,15 +1036,25 @@ export class Executor {
       }
       case "in": {
         const v = this.evalExpr(e.expr, ctx, params, group);
-        const hit = v !== null && e.list.some((item) => this.evalExpr(item, ctx, params, group) === v);
+        const dec = NUMINFO.get(e.expr) === "dec" || e.list.some((i) => NUMINFO.get(i) === "dec");
+        const hit =
+          v !== null &&
+          e.list.some((item) => {
+            const iv = this.evalExpr(item, ctx, params, group);
+            if (iv === null) return false;
+            return dec ? this.decCompare(e.expr, v, item, iv) === 0 : iv === v;
+          });
         return e.negated ? !hit : hit;
       }
       case "between": {
         const v = this.evalExpr(e.expr, ctx, params, group);
         if (v === null) return false;
-        const hit =
-          cmpScalar(v, this.evalExpr(e.lo, ctx, params, group)) >= 0 &&
-          cmpScalar(v, this.evalExpr(e.hi, ctx, params, group)) <= 0;
+        const dec = [e.expr, e.lo, e.hi].some((n) => NUMINFO.get(n) === "dec");
+        const lo = this.evalExpr(e.lo, ctx, params, group);
+        const hi = this.evalExpr(e.hi, ctx, params, group);
+        const hit = dec
+          ? lo !== null && hi !== null && this.decCompare(e.expr, v, e.lo, lo) >= 0 && this.decCompare(e.expr, v, e.hi, hi) <= 0
+          : cmpScalar(v, lo) >= 0 && cmpScalar(v, hi) <= 0;
         return e.negated ? !hit : hit;
       }
       case "like": {
@@ -833,12 +1089,25 @@ export class Executor {
         }
         if (["+", "-", "*", "/"].includes(e.op)) {
           if (l === null || r === null) return null;
+          if (NUMINFO.get(e) === "dec") return this.decArith(e.op, e.left, l, e.right, r);
           if (typeof l !== "number" || typeof r !== "number") {
             throw new SqlError("TYPE_MISMATCH", `arithmetic needs numbers, got ${JSON.stringify(l)} ${e.op} ${JSON.stringify(r)}`);
           }
           return e.op === "+" ? l + r : e.op === "-" ? l - r : e.op === "*" ? l * r : l / r;
         }
         if (l === null || r === null) return false; // SQL null semantics, two-valued
+        if (NUMINFO.get(e.left) === "dec" || NUMINFO.get(e.right) === "dec") {
+          const c = this.decCompare(e.left, l, e.right, r);
+          switch (e.op) {
+            case "=": return c === 0;
+            case "!=": return c !== 0;
+            case "<": return c < 0;
+            case "<=": return c <= 0;
+            case ">": return c > 0;
+            case ">=": return c >= 0;
+            default: throw new SqlError("PARSE_ERROR", `unexpected operator "${e.op}"`);
+          }
+        }
         switch (e.op) {
           case "=":
             return l === r;
@@ -856,6 +1125,78 @@ export class Executor {
             throw new SqlError("PARSE_ERROR", `unexpected operator "${e.op}"`);
         }
       }
+    }
+  }
+
+  /** Coerce one operand of a decimal operation to scaled BigInt. Numeric
+   * literals ride their source text so the author's exact digits survive;
+   * runtime numbers use String(n) — the shortest round-trip representation. */
+  private decOperand(node: Expr | undefined, v: Scalar, what: string): { n: bigint; s: number } {
+    if (v === null || typeof v === "boolean") {
+      throw new SqlError("TYPE_MISMATCH", `${what}: got ${JSON.stringify(v)} where a decimal was expected`);
+    }
+    const text = typeof v === "number" ? (node?.kind === "literal" && node.text ? node.text : String(v)) : v;
+    const sc = fracLen(text);
+    return { n: parseDecimal(text, sc, what), s: sc };
+  }
+
+  private decCompare(lNode: Expr, l: Scalar, rNode: Expr, r: Scalar): number {
+    const a = this.decOperand(lNode, l, "decimal comparison");
+    const b = this.decOperand(rNode, r, "decimal comparison");
+    const sc = Math.max(a.s, b.s);
+    const an = rescale(a.n, a.s, sc);
+    const bn = rescale(b.n, b.s, sc);
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  }
+
+  /** Exact decimal arithmetic (Design §8): + and − at the wider scale, × at
+   * the sum of scales — all exact; ÷ carries four extra digits, half-up.
+   * x / 0 is NULL (SQLite semantics, matching the float path's dialect). */
+  private decArith(op: string, lNode: Expr, l: Scalar, rNode: Expr, r: Scalar): Scalar {
+    const a = this.decOperand(lNode, l, "decimal arithmetic");
+    const b = this.decOperand(rNode, r, "decimal arithmetic");
+    if (op === "*") return formatDecimal(a.n * b.n, a.s + b.s);
+    if (op === "/") {
+      if (b.n === 0n) return null;
+      return formatDecimal(divHalfUp(a.n * 10n ** BigInt(4 + b.s), b.n), a.s + 4);
+    }
+    const sc = Math.max(a.s, b.s);
+    const an = rescale(a.n, a.s, sc);
+    const bn = rescale(b.n, b.s, sc);
+    return formatDecimal(op === "+" ? an + bn : an - bn, sc);
+  }
+
+  /** Decimal-exact ROUND/ABS/CEIL/FLOOR/MOD (annotation routes here). */
+  private decFunc(name: string, argNodes: Expr[], args: Scalar[]): Scalar {
+    if (args[0] === null) return null;
+    const a = this.decOperand(argNodes[0], args[0], name);
+    switch (name) {
+      case "ABS":
+        return formatDecimal(a.n < 0n ? -a.n : a.n, a.s);
+      case "ROUND": {
+        const digits = args.length > 1 && args[1] !== null ? args[1] : 0;
+        if (typeof digits !== "number" || !Number.isInteger(digits) || digits < 0) {
+          throw new SqlError("TYPE_MISMATCH", `ROUND digits must be a non-negative integer, got ${JSON.stringify(digits)}`);
+        }
+        return formatDecimal(rescale(a.n, a.s, digits), digits); // narrowing rounds half-up
+      }
+      case "CEIL":
+      case "FLOOR": {
+        const step = 10n ** BigInt(a.s);
+        const q = a.n / step; // BigInt division truncates toward zero
+        const rem = a.n % step;
+        const out = name === "CEIL" ? (rem > 0n ? q + 1n : q) : rem < 0n ? q - 1n : q;
+        return formatDecimal(out, 0);
+      }
+      case "MOD": {
+        if (args[1] === null) return null;
+        const b = this.decOperand(argNodes[1], args[1], name);
+        if (b.n === 0n) return null; // SQL: x MOD 0 is NULL, matching the float path
+        const sc = Math.max(a.s, b.s);
+        return formatDecimal(rescale(a.n, a.s, sc) % rescale(b.n, b.s, sc), sc);
+      }
+      default:
+        throw new SqlError("INTERNAL", `decimal path for ${name} is missing`); // unreachable — the dispatch list is closed
     }
   }
 
@@ -1028,7 +1369,14 @@ export class Executor {
     const rawRows: Row[] = stmt.rows.map((values) => {
       const raw: Row = {};
       stmt.columns.forEach((col, i) => {
-        raw[col] = this.evalExpr(values[i], {}, params);
+        const expr = values[i];
+        let v = this.evalExpr(expr, {}, params);
+        // Decimal columns take the literal's source text: the author's exact
+        // digits, not the nearest float64 (validateInsert canonicalizes).
+        if (schema.columns[col]?.type === "decimal" && expr.kind === "literal" && typeof v === "number" && expr.text) {
+          v = expr.text;
+        }
+        raw[col] = v;
       });
       return raw;
     });
@@ -1073,7 +1421,8 @@ export class Executor {
       const cur = snap.manifest.tables[table]?.indexes?.[col];
       const blob: IndexBlob = { ...(cur ? ((await this.proto.readIndex(cur)) ?? {}) : {}) };
       for (const id of retiredIds) delete blob[id];
-      for (const { ref, rows } of added) blob[ref.id] = distinctSorted(rows, col);
+      const dec = schema.columns[col]?.type === "decimal";
+      for (const { ref, rows } of added) blob[ref.id] = distinctSorted(rows, col, dec);
       out[col] = await this.proto.stageIndex(table, col, blob);
     }
     return out;
@@ -1225,11 +1574,17 @@ export class Executor {
           }
           return { kind: "literal", value: row[c.name] ?? null };
         });
-        next[column] = this.evalExpr(substituted, { [stmt.table]: existing }, params);
+        annotateNumerics(substituted, this.tableColInfo(stmt.table, schema));
+        next[column] = this.coerceDecimalWrite(
+          stmt.table,
+          column,
+          schema.columns[column],
+          this.evalExpr(substituted, { [stmt.table]: existing }, params),
+        );
       }
       const invalid = Object.entries(schema.columns).find(([n, def]) => {
         const v = next[n] ?? null;
-        return v !== null && !validTypeQuick(def.type, v);
+        return v !== null && !validTypeQuick(def, v);
       });
       if (invalid) {
         throw new SqlError("TYPE_MISMATCH", `column "${stmt.table}.${invalid[0]}" is ${invalid[1].type}, got ${JSON.stringify(next[invalid[0]])}`);
@@ -1256,7 +1611,11 @@ export class Executor {
       resultRows.push(next);
     }
 
-    const statsCols = { pk: schema.primaryKey, part: schema.partitionColumn };
+    const statsCols = {
+      pk: schema.primaryKey,
+      part: schema.partitionColumn,
+      partDecimal: schema.partitionColumn ? schema.columns[schema.partitionColumn]?.type === "decimal" : undefined,
+    };
     const replacements: { retired: ChunkRef; replacement: ChunkRef }[] = [];
     const staged: { ref: ChunkRef; rows: Row[] }[] = [];
     for (const ci of dirty) {
@@ -1296,7 +1655,31 @@ export class Executor {
     };
   }
 
+  /** Numeric classification resolver for single-table statement expressions. */
+  private tableColInfo(table: string, schema: TableSchema): (c: ColumnRef) => NumInfo {
+    return (c) => {
+      if (c.table && c.table !== table && c.table !== "excluded") return null;
+      const def = schema.columns[c.name];
+      return def?.type === "decimal" ? "dec" : def?.type === "real" ? "real" : null;
+    };
+  }
+
+  /** Canonicalize a value being written into a decimal column; loud on
+   * anything the scale can't represent — never a silent rounding. */
+  private coerceDecimalWrite(table: string, column: string, def: TableSchema["columns"][string], v: Scalar): Scalar {
+    if (v === null || def.type !== "decimal") return v;
+    if (typeof v !== "string" && typeof v !== "number") {
+      throw new SqlError("TYPE_MISMATCH", `column "${table}.${column}" is decimal(${def.scale ?? 0}), got ${JSON.stringify(v)}`);
+    }
+    return canonDecimal(v, def.scale ?? 0, `column "${table}.${column}"`);
+  }
+
   private async planUpdate(stmt: UpdateStmt, params: Scalar[], opts: ExecOptions, snap: Snapshot): Promise<PlanOutcome> {
+    {
+      const schema = this.schemaOf(snap.manifest, stmt.table);
+      const colInfo = this.tableColInfo(stmt.table, schema);
+      for (const { value } of stmt.set) annotateNumerics(value, colInfo);
+    }
     return this.planRewrite(snap, stmt.table, stmt.where, opts, stmt.returning, (row, schema) => {
       const next = { ...row };
       for (const { column, value } of stmt.set) {
@@ -1307,7 +1690,12 @@ export class Executor {
           throw new SqlError("UNSUPPORTED_FEATURE", "updating the primary key is not supported in Larva v1; DELETE and re-INSERT instead");
         }
         // Evaluated against the pre-update row, so SET count = count - 1 works.
-        next[column] = this.evalExpr(value, { [stmt.table]: row }, params);
+        next[column] = this.coerceDecimalWrite(
+          stmt.table,
+          column,
+          schema.columns[column],
+          this.evalExpr(value, { [stmt.table]: row }, params),
+        );
       }
       return next;
     }, params, "UPDATE");
@@ -1336,11 +1724,16 @@ export class Executor {
     }
     {
       const schema = this.schemaOf(snap.manifest, table);
+      if (where) annotateNumerics(where, this.tableColInfo(table, schema));
       const chunks = await this.fetchTable(snap, table, schema, where, table, params);
       const affected: Row[] = [];
       const replacements: { retired: ChunkRef; replacement: ChunkRef | null }[] = [];
       const staged: { ref: ChunkRef; rows: Row[] }[] = [];
-      const statsCols = { pk: schema.primaryKey, part: schema.partitionColumn };
+      const statsCols = {
+        pk: schema.primaryKey,
+        part: schema.partitionColumn,
+        partDecimal: schema.partitionColumn ? schema.columns[schema.partitionColumn]?.type === "decimal" : undefined,
+      };
 
       for (const { ref, rows } of chunks) {
         const out: Row[] = [];
@@ -1357,7 +1750,7 @@ export class Executor {
           if (next !== null) {
             const invalid = Object.entries(schema.columns).find(([n, def]) => {
               const v = next[n] ?? null;
-              return v !== null && !validTypeQuick(def.type, v);
+              return v !== null && !validTypeQuick(def, v);
             });
             if (invalid) throw new SqlError("TYPE_MISMATCH", `column "${table}.${invalid[0]}" is ${invalid[1].type}, got ${JSON.stringify(next[invalid[0]])}`);
             out.push(next);
@@ -1402,10 +1795,20 @@ export class Executor {
     for (const col of stmt.columns) {
       const type = COLUMN_TYPES[col.type];
       if (!type) {
-        throw new SqlError("UNKNOWN_TYPE", `type "${col.type}" is not available; Larva v1 types are text, integer, real, boolean, timestamp`);
+        throw new SqlError("UNKNOWN_TYPE", `type "${col.type}" is not available; Larva types are text, integer, real, boolean, timestamp, decimal(p, s)`);
       }
-      columns[col.name] = { type, primaryKey: col.primaryKey, unique: col.unique, partitionBy: false };
+      if (type === "decimal" && col.primaryKey) {
+        throw new SqlError("INVALID_PRIMARY_KEY", "a decimal column cannot be the primary key — money is not identity; use a text/uuid column");
+      }
+      columns[col.name] = {
+        type,
+        ...(type === "decimal" ? { scale: col.scale ?? 0 } : {}),
+        primaryKey: col.primaryKey,
+        unique: col.unique,
+        partitionBy: false,
+      };
     }
+    this.requireDecimalFormat(snap, Object.values(columns).some((c) => c.type === "decimal"));
     const pks = stmt.columns.filter((c) => c.primaryKey);
     if (pks.length > 1) throw new SqlError("PARSE_ERROR", `table "${stmt.table}" declares ${pks.length} primary keys; declare exactly one`);
     if (pks.length === 0 && !columns.id) {
@@ -1433,8 +1836,9 @@ export class Executor {
     const schema = this.schemaOf(snap.manifest, stmt.table);
     const type = COLUMN_TYPES[stmt.column.type];
     if (!type) {
-      throw new SqlError("UNKNOWN_TYPE", `type "${stmt.column.type}" is not available; Larva types are text, integer, real, boolean, timestamp`);
+      throw new SqlError("UNKNOWN_TYPE", `type "${stmt.column.type}" is not available; Larva types are text, integer, real, boolean, timestamp, decimal(p, s)`);
     }
+    this.requireDecimalFormat(snap, type === "decimal");
     if (stmt.column.name in schema.columns) {
       throw new SqlError("DUPLICATE_COLUMN", `column "${stmt.column.name}" already exists in table "${stmt.table}"`);
     }
@@ -1445,13 +1849,36 @@ export class Executor {
         if (!live || column.name in live.columns) return null; // changed underneath us — re-execute for the precise error
         const next: TableSchema = {
           ...live,
-          columns: { ...live.columns, [column.name]: { type, primaryKey: false, unique: false, partitionBy: false } },
+          columns: {
+            ...live.columns,
+            [column.name]: {
+              type,
+              ...(type === "decimal" ? { scale: column.scale ?? 0 } : {}),
+              primaryKey: false,
+              unique: false,
+              partitionBy: false,
+            },
+          },
         };
         m.schema = { ...((m.schema ?? {}) as DatabaseSchema), [table]: next };
         return m;
       },
       rows: [],
     };
+  }
+
+  /** Decimal columns require format 5, which implies the commit-log store
+   * format (Design §8): a pre-5 client would order decimal strings
+   * lexicographically — silently wrong, the exact hazard the format guard
+   * exists to prevent. CAS-mode stores must upgrade() first. */
+  private requireDecimalFormat(snap: Snapshot, hasDecimal: boolean): void {
+    if (!hasDecimal) return;
+    if ((snap.manifest.formatVersion ?? 1) < 3) {
+      throw new SqlError(
+        "FORMAT_REQUIRED",
+        "decimal columns require the commit-log store format (format 5): run db.upgrade() once (one-way, data survives), then re-run this statement",
+      );
+    }
   }
 
   /** Build the full index from the current chunk set, then commit the ref +
@@ -1470,7 +1897,7 @@ export class Executor {
     const chunks = snap.manifest.tables[table]?.chunks ?? [];
     const blob: IndexBlob = {};
     for (const ref of chunks) {
-      blob[ref.id] = distinctSorted(await this.proto.readChunk(ref), column);
+      blob[ref.id] = distinctSorted(await this.proto.readChunk(ref), column, schema.columns[column].type === "decimal");
     }
     const idxRef = await this.proto.stageIndex(table, column, blob);
     const baseSig = chunks.map((c) => c.id).join(",");
@@ -1539,8 +1966,8 @@ export class Executor {
   }
 }
 
-function validTypeQuick(type: string, v: Scalar): boolean {
-  switch (type) {
+function validTypeQuick(def: TableSchema["columns"][string], v: Scalar): boolean {
+  switch (def.type) {
     case "text":
     case "timestamp":
       return typeof v === "string";
@@ -1550,6 +1977,9 @@ function validTypeQuick(type: string, v: Scalar): boolean {
       return typeof v === "number";
     case "boolean":
       return typeof v === "boolean";
+    case "decimal":
+      // Writers canonicalize before this check — anything else is a bug.
+      return typeof v === "string" && isCanonicalDecimal(v, def.scale ?? 0);
     default:
       return true;
   }

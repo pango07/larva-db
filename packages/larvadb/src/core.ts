@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 import { CasConflictError, isTransientStorageError, StorageAdapter } from "./storage";
+import { cmpDecimal } from "./decimal";
 
 export type Scalar = string | number | boolean | null;
 export type Row = Record<string, Scalar>;
@@ -63,22 +64,40 @@ export type IndexBlob = Record<string, Scalar[]>;
  *       folds/verdicts metadata (replay ignores both). Requires the log;
  *       entered by db.upgrade() (and larva({ commitLog: true }) births new
  *       stores here).
+ *   5 — exact decimal columns (t.decimal(scale), Design §8): values are
+ *       canonical strings compared and aggregated via scaled BigInt. A bump
+ *       is required because a format-4 client would order the strings
+ *       lexicographically — silently wrong results, the exact hazard this
+ *       guard exists for (contrast secondary indexes, which are wrong only
+ *       by absence and needed no bump). A store only declares 5 when its
+ *       schema actually contains a decimal column.
  *
  * Note: formatVersion >= 3 is also how clients detect log mode, so a
- * CAS-mode store can only ever declare 1 or 2 — new schema-level features
- * must extend format 2's meaning, and new storage-protocol levels stack
- * above 3. */
-export const SUPPORTED_FORMAT_VERSION = 4;
+ * CAS-mode store can only ever declare 1 or 2 — schema features an old
+ * client would *misread* (like decimal) can therefore only exist on
+ * log-mode stores; adding one to a CAS-mode store demands upgrade() first. */
+export const SUPPORTED_FORMAT_VERSION = 5;
+
+/** The storage-protocol ceiling (the log plus two-tier writes). Distinct from
+ * SUPPORTED_FORMAT_VERSION: format 5 adds no protocol, only decimal-aware
+ * read semantics, so upgrade()/commitLog target this and let
+ * requiredFormatVersion raise it further only when the schema demands it —
+ * a store never locks out older clients for a feature it doesn't use. */
+export const TOP_PROTOCOL_FORMAT = 4;
 
 /** The lowest format a store with this schema can declare. Kept minimal so
- * stores that don't use v2 features remain openable by older clients. */
+ * stores that don't use newer features remain openable by older clients. */
 export function requiredFormatVersion(schema: unknown): number {
   const s = (schema ?? {}) as import("./schema").DatabaseSchema;
+  let required = 1;
   for (const table of Object.values(s)) {
-    if (table.uniques?.length) return 2;
-    for (const col of Object.values(table.columns ?? {})) if (col.sequence || col.uuid) return 2;
+    if (table.uniques?.length) required = Math.max(required, 2);
+    for (const col of Object.values(table.columns ?? {})) {
+      if (col.sequence || col.uuid) required = Math.max(required, 2);
+      if (col.type === "decimal") required = Math.max(required, 5);
+    }
   }
-  return 1;
+  return required;
 }
 
 export interface Manifest {
@@ -487,8 +506,11 @@ export class LarvaProto {
   /** Create the empty database. Fails if one already exists at this prefix. */
   async init(tables: string[], schema?: unknown, opts?: { commitLog?: boolean }): Promise<void> {
     const manifest: Manifest = {
-      // commitLog births at the current top format: the log plus two-tier writes.
-      formatVersion: opts?.commitLog ? SUPPORTED_FORMAT_VERSION : requiredFormatVersion(schema),
+      // commitLog births at the top protocol format (log + two-tier writes);
+      // schema features (sequences → 2, decimal → 5) can raise it further.
+      // A decimal schema forces ≥5 even without commitLog — format 5 implies
+      // log mode, so such stores are simply born on the log.
+      formatVersion: Math.max(opts?.commitLog ? TOP_PROTOCOL_FORMAT : 1, requiredFormatVersion(schema)),
       version: 0,
       commitId: ulid(),
       committedAt: new Date().toISOString(),
@@ -496,7 +518,7 @@ export class LarvaProto {
       tables: Object.fromEntries(tables.map((t) => [t, { chunks: [] }])),
     };
     await this.putCreateOnly(this.manifestPath(), JSON.stringify(manifest));
-    if (opts?.commitLog) {
+    if (manifest.formatVersion >= 3) {
       // Retain v0 as the base-of-time checkpoint: once maybeCheckpoint
       // advances manifest.json, this is what lets manifestAt reconstruct
       // versions older than the first periodic checkpoint.
@@ -517,6 +539,11 @@ export class LarvaProto {
     const res = await this.store.get(this.logPath(version), { fresh: true });
     if (!res) return null;
     const entry = JSON.parse(res.body) as LogEntry;
+    // A log entry can raise the store's format mid-log (e.g. the commit that
+    // introduces a decimal column, format 5). Replaying past it with older
+    // semantics would be silently wrong — the checkpoint-time check alone
+    // can't catch a transition that happened after the checkpoint.
+    if ((entry.formatVersion ?? 1) > SUPPORTED_FORMAT_VERSION) throw new FormatError(entry.formatVersion!);
     this.logCache.set(version, entry);
     return entry;
   }
@@ -538,16 +565,21 @@ export class LarvaProto {
         applyLogEntry(manifest, entry);
         if (entry.folds?.length) this.onFold?.(entry.folds);
       }
+      // Replay can raise the format (readLogEntry throws on entries beyond
+      // us, but a checkpoint written by a newer client may already carry it).
+      if ((manifest.formatVersion ?? 1) > SUPPORTED_FORMAT_VERSION) throw new FormatError(manifest.formatVersion);
     }
     return { manifest, etag: res.etag };
   }
 
   /** Stage one immutable chunk. When statsCols is given, rows are sorted by
-   * pk and zone-map min/max recorded for pruning. */
+   * pk and zone-map min/max recorded for pruning. partDecimal marks the
+   * partition column as decimal so its min/max are ordered numerically —
+   * lexicographic stats on decimal strings would mis-prune (Design §8). */
   async stageChunk(
     table: string,
     rows: Row[],
-    statsCols?: { pk: string; part?: string },
+    statsCols?: { pk: string; part?: string; partDecimal?: boolean },
   ): Promise<ChunkRef> {
     const id = ulid();
     const path = `${this.prefix}tables/${table}/chunk_${id}.json`;
@@ -559,10 +591,13 @@ export class LarvaProto {
       rows = sorted;
       stats = { pkMin: sorted[0][statsCols.pk], pkMax: sorted[sorted.length - 1][statsCols.pk] };
       if (statsCols.part) {
+        const cmp = statsCols.partDecimal
+          ? (a: Scalar, b: Scalar) => cmpDecimal(String(a), String(b))
+          : cmpScalar;
         const parts = sorted.map((r) => r[statsCols.part as string]).filter((v) => v !== null);
         if (parts.length > 0) {
-          stats.partMin = parts.reduce((a, b) => (cmpScalar(a, b) <= 0 ? a : b));
-          stats.partMax = parts.reduce((a, b) => (cmpScalar(a, b) >= 0 ? a : b));
+          stats.partMin = parts.reduce((a, b) => (cmp(a, b) <= 0 ? a : b));
+          stats.partMax = parts.reduce((a, b) => (cmp(a, b) >= 0 ? a : b));
         }
       }
     }
@@ -859,7 +894,16 @@ export class LarvaProto {
           await this.store.put(this.logPath(next.version), JSON.stringify(entry), { createOnly: true });
           this.logCache.set(next.version, entry);
           this.trace?.(`attempt ${attempt}: OK slot v${next.version}`);
-          void this.maybeCheckpoint(next, snap.etag); // best-effort, off the commit's latency
+          if (entry.formatVersion !== undefined && entry.formatVersion > (snap.manifest.formatVersion ?? 1)) {
+            // This commit raised the store's format. Checkpoint NOW (awaited,
+            // not best-effort): until the checkpoint carries the new version,
+            // an older client passes the manifest check and replays a log it
+            // cannot read correctly. Forcing the checkpoint shrinks that
+            // window to this one commit.
+            await this.maybeCheckpoint(next, snap.etag, { force: true });
+          } else {
+            void this.maybeCheckpoint(next, snap.etag); // best-effort, off the commit's latency
+          }
           return finish(next.version);
         }
         await this.store.put(this.manifestPath(), JSON.stringify(next), {
@@ -1006,14 +1050,23 @@ export class LarvaProto {
    * missed checkpoint only lengthens replay; the ifMatch chain keeps
    * checkpoint advancement linear, so it can never regress.
    */
-  private async maybeCheckpoint(next: Manifest, checkpointEtag: string): Promise<void> {
-    if (next.version % CHECKPOINT_EVERY !== 0) return;
+  private async maybeCheckpoint(next: Manifest, checkpointEtag: string, opts?: { force?: boolean }): Promise<void> {
+    if (!opts?.force && next.version % CHECKPOINT_EVERY !== 0) return;
     await this.store
       .put(`${this.prefix}history/manifest.v${next.version}.json`, JSON.stringify(next), { createOnly: true })
       .catch(() => {});
-    await this.store
-      .put(this.manifestPath(), JSON.stringify(next), { ifMatch: checkpointEtag })
-      .catch(() => {});
+    try {
+      await this.store.put(this.manifestPath(), JSON.stringify(next), { ifMatch: checkpointEtag });
+    } catch {
+      if (!opts?.force) return; // periodic checkpoints are best-effort; the next one advances
+      // A forced checkpoint carries a format transition — it is what locks
+      // pre-transition clients out (see the commit site). One fresh-etag
+      // retry, skipped only if someone already checkpointed past us.
+      const cur = await this.store.get(this.manifestPath(), { fresh: true }).catch(() => null);
+      if (cur && ((JSON.parse(cur.body) as Manifest).version ?? 0) < next.version) {
+        await this.store.put(this.manifestPath(), JSON.stringify(next), { ifMatch: cur.etag }).catch(() => {});
+      }
+    }
   }
 
   /** Fetch a retained past manifest (time travel). Null when outside retention

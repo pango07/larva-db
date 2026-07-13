@@ -59,7 +59,7 @@ bun run dev                       # http://localhost:3000
 vercel deploy --prod --yes        # or ship it
 ```
 
-## The test suites — 318 checks across eight suites
+## The test suites — 343 checks across eight suites
 
 Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate. All of it runs in CI on every push; merges to `main` publish to npm.
 
@@ -89,7 +89,7 @@ bun scripts/bench.ts               # write throughput, both formats
 | `api-smoke.ts` | transaction atomicity, export round-trips, vacuum retention, format 3 live |
 | `cli-smoke.ts` | the CLI: arguments, exit codes, files on disk, upgrade/rollback |
 | `s3-adapter-test.ts` | the storage contract under injected chaos |
-| `group-commit-test.ts` | coalescing, the conflict matrix, the ordered commit log under chaos |
+| `group-commit-test.ts` | coalescing, the conflict matrix, the ordered commit log under chaos, exact decimals (format 5) |
 | `guard-test.ts` | the public lab's abuse guards: budgets count exactly under CAS contention, fail closed |
 
 <Callout>
