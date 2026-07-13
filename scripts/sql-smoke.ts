@@ -454,6 +454,27 @@ function schemaTableClone() {
   };
 }
 
+// ---------- t.decimal live: exact money on the real store (format 5) ----------
+console.log("\n— decimal —");
+const decDb = larva({
+  prefix: `${prefix}dec/`,
+  schema: defineSchema({
+    invoices: { id: t.uuid().primaryKey(), customer: t.text(), total: t.decimal(2) },
+  }),
+});
+await decDb.sql`INSERT INTO invoices (customer, total) VALUES
+  (${"ada"}, ${"0.10"}), (${"ada"}, ${"0.20"}), (${"ada"}, ${"0.70"}), (${"bob"}, ${"1149.99"})`;
+const [decSum] = await decDb.sql`SELECT SUM(total) AS t FROM invoices WHERE customer = ${"ada"}`;
+ok("live: SUM(0.10 + 0.20 + 0.70) is exactly 1.00", decSum.t === "1.00", fmt([decSum]));
+const decCmp = await decDb.sql`SELECT customer FROM invoices WHERE total > 999`;
+ok("live: decimal comparison is numeric, not lexicographic", decCmp.length === 1 && decCmp[0].customer === "bob", fmt(decCmp));
+await decDb.sql`UPDATE invoices SET total = ROUND(total * 1.08, 2) WHERE customer = ${"bob"}`;
+const [taxed] = await decDb.sql`SELECT total FROM invoices WHERE customer = ${"bob"}`;
+ok("live: exact tax bump lands canonically", taxed.total === "1241.99", fmt([taxed]));
+const decInspect = await decDb.inspect();
+ok("live: decimal store declares format 5 on the real Blob store", decInspect.formatVersion === 5, String(decInspect.formatVersion));
+if (failed === 0) await decDb.destroy();
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed === 0) await db.destroy();
 else console.log(`keeping ${prefix} for inspection`);

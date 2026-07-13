@@ -97,6 +97,22 @@ DROP INDEX ON orders (customerId)
 
 An index makes `=`, `IN`, and range filters on a non-key column **prune storage reads** instead of scanning the table. One index per column, addressed by column (an index name parses and is ignored); declare it in code with `t.text().index()` — flags sync automatically at connect, and creating one backfills from existing data in one commit. Indexes are performance-only: `CREATE UNIQUE INDEX` is rejected (uniqueness belongs to the table), and a stale or missing index can never change results — only how much gets read. The primary key and the `.partitionBy()` column never need one.
 
+### Exact decimals — `t.decimal(scale)`
+
+```sql
+SELECT SUM(total) AS revenue FROM invoices          -- exact: never 0.9999999999999999
+UPDATE invoices SET total = ROUND(total * 1.08, 2) WHERE id = 'inv_42'
+```
+
+Money belongs in `decimal`, not `real`. A [`t.decimal(scale)`](/docs/api#tdecimalscale) column stores canonical strings (`"123.45"`, exactly `scale` fraction digits) and computes with arbitrary-precision integers, so the number on the dashboard is the number that was entered:
+
+- **Comparisons, `ORDER BY`, `GROUP BY`, joins, `MIN`/`MAX`, and `SUM` are exact.** `SUM` cannot drift or overflow. Zone maps and secondary indexes on decimal columns prune numerically.
+- **Results come back as strings** (`"123.45"`) — exactly like every Postgres driver returns `NUMERIC`, because a JS `number` would betray the exactness.
+- **Numeric literals keep their digits**: `WHERE total > 10.50` and `SET total = total * 1.08` use the digits you wrote, not the nearest float64. (Pass large-precision *parameters* as strings.)
+- **Documented rounding, nowhere else**: `+` and `-` are exact at the wider scale; `*` is exact at the sum of scales (`9.50 * 1.08` → `10.2600`); `/` and `AVG` carry four extra fraction digits, rounded half-up; `ROUND(x, n)` is half-up.
+- **Loud, not lossy**: a value with more fraction digits than the scale is rejected (`ROUND` it explicitly — nothing rounds silently), and mixing a decimal with a `real` column in one expression is a `TYPE_MISMATCH` with a `CAST` hint rather than a silent float fallback.
+- In DDL: `CREATE TABLE … (total DECIMAL(18, 2))` / `ALTER TABLE … ADD COLUMN balance DECIMAL(18, 2)` — the second number is the scale. Decimal columns require [format 5](/docs/how-it-works/format-versioning) (run `db.upgrade()` once on pre-existing stores; new stores with decimal schemas are born on it).
+
 ## Not supported — on purpose
 
 Correlated subqueries, derived tables (subqueries in `FROM`), window functions, `UNION`, `RIGHT`/`FULL`/`CROSS` joins, `DROP COLUMN`/`RENAME`, views, triggers, nested aggregates. Each exclusion is either rarely emitted by agents writing conservative SQL, or expressible in application code at Larva's scale.

@@ -17,6 +17,11 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
   and column names.
 - Timestamps are ISO 8601 text. Compare them directly as strings:
   `WHERE createdAt >= ${"2026-07-01"}`.
+- ALWAYS annotate result types explicitly — inference cannot read the SQL
+  text. Whole-table shapes: `db.sql<InferRow<typeof schema, "invoices">>`.
+  Projections/aggregates: an inline generic, e.g.
+  `db.sql<{ day: string; revenue: string }>`. Unannotated queries return
+  `Record<string, Scalar>`.
 
 ## Supported SQL
 
@@ -71,6 +76,15 @@ S3 / R2 object store. You query it with real SQL through tagged templates.
   index so filters on it prune storage reads. Use it for columns you filter
   on often (foreign keys, emails, statuses); the primary key and the
   `.partitionBy()` column never need it.
+- MONEY ALWAYS GOES IN `t.decimal(scale)`, never `t.real()` — floats drift in
+  SUM and misfire on equality. Decimal is exact end to end and comes back as
+  a STRING (`"123.45"`), like Postgres NUMERIC: display it directly, do
+  arithmetic in SQL (exact), or Number() it only for display math. Values
+  finer than the scale are rejected — `ROUND(expr, scale)` explicitly in
+  UPDATE/INSERT expressions (e.g. `SET total = ROUND(total * 1.08, 2)`).
+  Never mix a decimal column with a real column in one expression (loud
+  error — CAST explicitly if you truly want floats). In DDL the type is
+  `DECIMAL(18, 2)` — the second number is the fraction digits.
 
 ## NOT supported — do not emit
 

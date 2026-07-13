@@ -39,7 +39,7 @@ export const schema = defineSchema({
   orders: {
     id: t.text().primaryKey(),
     customerId: t.text().references("customers.id"),
-    total: t.real(),
+    total: t.decimal(2), // money: exact, never a float — SUM can't drift
     status: t.text(),
     createdAt: t.timestamp().partitionBy(),
   },

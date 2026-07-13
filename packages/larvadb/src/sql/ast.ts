@@ -9,6 +9,9 @@ export interface ColumnRef {
 export interface Literal {
   kind: "literal";
   value: Scalar;
+  /** Source text of a numeric literal — decimal operations use it so the
+   * author's exact digits survive (a float64 round-trip would not). */
+  text?: string;
 }
 
 export interface Param {
@@ -129,7 +132,7 @@ export interface DeleteStmt {
 export interface CreateTableStmt {
   kind: "create";
   table: string;
-  columns: { name: string; type: string; primaryKey: boolean; unique: boolean }[];
+  columns: { name: string; type: string; scale?: number; primaryKey: boolean; unique: boolean }[];
 }
 
 export interface DropTableStmt {
@@ -142,7 +145,7 @@ export interface DropTableStmt {
 export interface AlterTableStmt {
   kind: "alter";
   table: string;
-  column: { name: string; type: string };
+  column: { name: string; type: string; scale?: number };
 }
 
 /** Larva indexes are per-column (one index per column, addressed by column,

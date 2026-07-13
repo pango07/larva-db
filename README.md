@@ -6,13 +6,13 @@
 
 [![CI](https://github.com/pango07/larva-db/actions/workflows/ci.yml/badge.svg)](https://github.com/pango07/larva-db/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40larva-db%2Fcore)](https://www.npmjs.com/package/@larva-db/core)
-[![test checks](https://img.shields.io/badge/test_checks-318_passing-brightgreen)](#the-testing-story)
+[![test checks](https://img.shields.io/badge/test_checks-343_passing-brightgreen)](#the-testing-story)
 [![types](https://img.shields.io/badge/types-included-blue)](packages/larvadb/src/index.ts)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **Docs & live demo: [larvadb.dev](https://larvadb.dev)** — a landing page that queries its own database, the full docs, a public test lab, and the agent prompt at [larvadb.dev/llms.txt](https://larvadb.dev/llms.txt).
 
-**Current release: 2.7.1.** Real SQL (time series, upserts, JSON, multi-table joins, subqueries), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
+**Current release: 2.8.0.** Real SQL (time series, upserts, JSON, multi-table joins, subqueries), **exact decimals for money** (`t.decimal` — SUM never drifts), atomic transactions, time travel, and a guaranteed exit path to SQLite *or* Postgres.
 
 ## Sixty seconds to a database
 
@@ -270,7 +270,7 @@ The editable source for these lives at [docs/larva-architecture.excalidraw](docs
 
 ## The testing story
 
-Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **318 checks across eight suites**, all run in CI on every push:
+Correctness risk concentrates in the conflict/retry path, so that's where the tests concentrate — **343 checks across eight suites**, all run in CI on every push:
 
 | Suite | What it proves |
 |---|---|

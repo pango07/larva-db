@@ -22,7 +22,7 @@ export {
 } from "./schema";
 export { SqlError } from "./sql/errors";
 export { parse } from "./sql/parser";
-export { ConflictError, FormatError, SUPPORTED_FORMAT_VERSION, ulid, type Row, type Scalar } from "./core";
+export { ConflictError, FormatError, SUPPORTED_FORMAT_VERSION, TOP_PROTOCOL_FORMAT, ulid, type Row, type Scalar } from "./core";
 export {
   CasConflictError,
   VercelBlobAdapter,

@@ -18,7 +18,7 @@
  *
  *   bun scripts/group-commit-test.ts
  */
-import { defineSchema, larva, S3Adapter, SqlError, SUPPORTED_FORMAT_VERSION, t } from "@larva-db/core";
+import { defineSchema, larva, S3Adapter, SqlError, SUPPORTED_FORMAT_VERSION, TOP_PROTOCOL_FORMAT, t } from "@larva-db/core";
 import { runProperty } from "@larva-db/core/testing";
 
 let passed = 0;
@@ -335,7 +335,7 @@ const schema = defineSchema({
   const preVersion = await db.currentVersion();
 
   const up = await db.upgrade();
-  ok("upgrade() flips to the top format", up.formatVersion === SUPPORTED_FORMAT_VERSION);
+  ok("upgrade() flips to the top protocol format (5 is decimal-only)", up.formatVersion === TOP_PROTOCOL_FORMAT);
   ok("upgrade() is idempotent", (await db.upgrade()).version === up.version);
 
   await db.sql`INSERT INTO notes (id, body, score) VALUES (${"post"}, ${"after upgrade"}, ${2})`;
@@ -353,7 +353,7 @@ const schema = defineSchema({
   const rolled = await db.sql`SELECT id FROM notes`;
   const raw = JSON.parse(objects.get("log-upgrade/manifest.json")!.body) as { formatVersion: number };
   ok("rollback across the boundary restores data", rolled.length === 1 && rolled[0].id === "pre");
-  ok("rollback preserves the format version (never re-admits old writers)", raw.formatVersion === SUPPORTED_FORMAT_VERSION);
+  ok("rollback preserves the format version (never re-admits old writers)", raw.formatVersion === TOP_PROTOCOL_FORMAT);
   const postRollback = await db.asOf((await db.currentVersion()) - 1);
   ok("the rollback itself is rollbackable", (await postRollback.sql`SELECT COUNT(*) AS n FROM notes`)[0].n === 2);
 }
@@ -419,7 +419,7 @@ const schema = defineSchema({
   const dbA = larva({ schema: f4schema, prefix: "f4-append/", store, commitLog: true });
   await dbA.sql`SELECT COUNT(*) AS n FROM events`; // force init
   const born = JSON.parse(objects.get("f4-append/manifest.json")!.body) as { formatVersion: number };
-  ok("commitLog:true births stores at the top format", born.formatVersion === SUPPORTED_FORMAT_VERSION);
+  ok("commitLog:true births stores at the top protocol format", born.formatVersion === TOP_PROTOCOL_FORMAT);
 
   // The ack point: RETURNING resolves while the write is still only an intent.
   const [ev] = await dbA.sql`INSERT INTO events (kind, at) VALUES (${"signup"}, ${"2026-07-10T00:00:00Z"}) RETURNING id`;
@@ -717,6 +717,106 @@ const schema = defineSchema({
     truth.length === 3 && JSON.stringify(viaIndex) === JSON.stringify(truth),
     `index=${JSON.stringify(viaIndex)} truth=${JSON.stringify(truth)}`,
   );
+}
+
+// ---------- 17. t.decimal — exact money (format 5) ----------
+{
+  const decSchema = defineSchema({
+    products: {
+      id: t.uuid().primaryKey(),
+      name: t.text(),
+      price: t.decimal(2).index(),
+      weight: t.real(),
+      qty: t.integer(),
+    },
+  });
+  // A decimal schema is born at format 5 (log mode) even without commitLog.
+  const db = larva({ schema: decSchema, prefix: "dec/", store });
+  await db.sql`INSERT INTO products (name, price, weight, qty) VALUES
+    (${"a"}, ${"0.10"}, ${1.5}, ${3}), (${"b"}, ${"0.20"}, ${2.5}, ${1}), (${"c"}, ${"0.70"}, ${0.5}, ${2})`;
+  const insp = await db.inspect();
+  ok("decimal schema births the store at format 5", insp.formatVersion === 5, `format ${insp.formatVersion}`);
+
+  const [sum] = await db.sql`SELECT SUM(price) AS total FROM products`;
+  ok("SUM over 0.10 + 0.20 + 0.70 is exactly 1.00 (floats say 0.9999…)", sum.total === "1.00", JSON.stringify(sum));
+
+  const eq = await db.sql`SELECT name FROM products WHERE price = 0.2`;
+  ok("equality matches across scales (0.2 finds the stored 0.20)", eq.length === 1 && eq[0].name === "b", JSON.stringify(eq));
+
+  await db.sql`INSERT INTO products (name, price, weight, qty) VALUES (${"d"}, ${"9.50"}, ${1}, ${1}), (${"e"}, ${"10.50"}, ${1}, ${1})`;
+  const gt = await db.sql`SELECT name FROM products WHERE price > 9.99 ORDER BY price`;
+  ok(
+    'numeric ordering, not lexicographic ("9.50" > "10.50" as strings)',
+    gt.length === 1 && gt[0].name === "e",
+    JSON.stringify(gt),
+  );
+  const ordered = await db.sql`SELECT price FROM products ORDER BY price DESC LIMIT 2`;
+  ok("ORDER BY sorts decimals numerically", ordered[0].price === "10.50" && ordered[1].price === "9.50", JSON.stringify(ordered));
+
+  const [tax] = await db.sql`SELECT name, price * 1.08 AS gross FROM products WHERE name = ${"d"}`;
+  ok("multiplication is exact at the sum of scales", tax.gross === "10.2600", JSON.stringify(tax));
+
+  const [avg] = await db.sql`SELECT AVG(price) AS avg FROM products WHERE name IN (${"d"}, ${"e"})`;
+  ok("AVG carries four extra digits, half-up (documented)", avg.avg === "10.000000", JSON.stringify(avg));
+
+  await db.sql`UPDATE products SET price = ROUND(price * 1.10, 2) WHERE name = ${"d"}`;
+  const [bumped] = await db.sql`SELECT price FROM products WHERE name = ${"d"}`;
+  ok("UPDATE with ROUND writes the exact canonical value", bumped.price === "10.45", JSON.stringify(bumped));
+
+  const tooFine = await db
+    .sql`INSERT INTO products (name, price, weight, qty) VALUES (${"f"}, ${"1.005"}, ${1}, ${1})`
+    .then(() => null)
+    .catch((e) => e);
+  ok(
+    "a value finer than the scale is rejected loudly, never rounded silently",
+    tooFine !== null && /fraction digits/.test(String(tooFine?.message)),
+    String(tooFine?.message ?? "no error"),
+  );
+
+  const mixed = await db.sql`SELECT price + weight AS nope FROM products`.then(() => null).catch((e) => e);
+  ok(
+    "mixing decimal with real is a loud TYPE_MISMATCH with a CAST hint",
+    mixed instanceof SqlError && mixed.code === "TYPE_MISMATCH" && /CAST/.test(mixed.message),
+    String(mixed?.message ?? "no error"),
+  );
+
+  const intMix = await db.sql`SELECT price * qty AS line FROM products WHERE name = ${"e"}`;
+  ok("decimal × integer column stays exact (integers are exact)", intMix[0].line === "10.50", JSON.stringify(intMix));
+
+  // indexed decimal: canonical-form membership across scales
+  const viaIdx = await db.sql`SELECT name FROM products WHERE price = 10.5`;
+  ok("indexed equality canonicalizes the probe (10.5 finds 10.50)", viaIdx.length === 1 && viaIdx[0].name === "e", JSON.stringify(viaIdx));
+
+  const pg = await db.export({ format: "postgres" });
+  ok(
+    "Postgres export declares a real NUMERIC(38, 2) and copies digits verbatim",
+    pg.includes("numeric(38, 2)") && pg.includes("10.50"),
+    pg.split("\n").find((l) => l.includes("price")) ?? "",
+  );
+
+  // format guard: a CAS-mode store refuses decimal DDL until upgrade()
+  const casDb = larva({ schema, prefix: "dec-cas/", store });
+  await casDb.sql`INSERT INTO notes (id, body, score) VALUES (${"n1"}, ${"x"}, ${1})`;
+  const guard = await casDb
+    .query("ALTER TABLE notes ADD COLUMN balance DECIMAL(18, 2)")
+    .then(() => null)
+    .catch((e) => e);
+  ok(
+    "ALTER … DECIMAL on a CAS-mode store fails loudly with the upgrade() pointer",
+    guard instanceof SqlError && guard.code === "FORMAT_REQUIRED" && /upgrade/.test(guard.message),
+    String(guard?.message ?? "no error"),
+  );
+  await casDb.upgrade();
+  await casDb.query("ALTER TABLE notes ADD COLUMN balance DECIMAL(18, 2)");
+  await casDb.sql`UPDATE notes SET balance = 12.34 WHERE id = ${"n1"}`;
+  const [bal] = await casDb.sql`SELECT balance FROM notes WHERE id = ${"n1"}`;
+  const casInsp = await casDb.inspect();
+  ok(
+    "after upgrade(), decimal DDL works and the store declares format 5",
+    bal.balance === "12.34" && casInsp.formatVersion === 5,
+    `balance=${JSON.stringify(bal.balance)} format=${casInsp.formatVersion}`,
+  );
+  ok("SUPPORTED_FORMAT_VERSION is 5", SUPPORTED_FORMAT_VERSION === 5, String(SUPPORTED_FORMAT_VERSION));
 }
 
 server.stop();
