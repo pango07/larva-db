@@ -256,11 +256,7 @@ The whole story in three pictures:
 
 **The layers** — SQL goes in at the top; everything below is just files in your object store:
 
-![How LarvaDB works — the layer cake: your app's SQL, LarvaDB the orchestrator, and the object store holding one mutable manifest plus immutable chunks](docs/how-larva-db-works-1.png)
-
 **Concurrency** — two writers race one compare-and-swap; the loser rebases or re-executes, and nothing is ever lost:
-
-![How LarvaDB works — two writers, one manifest: the CAS race, the 412 loser, rebase vs re-execute recovery, and the zero-lost-updates guarantee](docs/how-larva-db-works-2.png)
 
 **Growing up** — one command out of Larva, one command into Postgres:
 
