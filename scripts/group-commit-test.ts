@@ -15,6 +15,8 @@
  *   - format 4 tier-A appends: durable at one PUT, overlay read-your-writes,
  *     fold visibility + cleanup, the ordered-write barrier, and idempotent
  *     re-folds after a simulated folder crash.
+ *   - concurrent inserts of one primary key or UNIQUE value from separate
+ *     instances land exactly once (losers re-check instead of rebasing).
  *
  *   bun scripts/group-commit-test.ts
  */
@@ -817,6 +819,41 @@ const schema = defineSchema({
     `balance=${JSON.stringify(bal.balance)} format=${casInsp.formatVersion}`,
   );
   ok("SUPPORTED_FORMAT_VERSION is 5", SUPPORTED_FORMAT_VERSION === 5, String(SUPPORTED_FORMAT_VERSION));
+}
+
+// ---------- 18. cross-instance inserts of one key: exactly one lands ----------
+{
+  // Each instance checks uniqueness against its own snapshot, so the losers
+  // must re-check at commit time rather than rebase blindly onto the winner.
+  const dedupSchema = defineSchema({
+    events: { id: t.text().primaryKey(), handle: t.text().unique(), writer: t.text() },
+  });
+  const N = 8;
+  for (const commitLog of [false, true]) {
+    for (const viaTx of [false, true]) {
+      const prefix = `dedup-${commitLog ? "log" : "cas"}-${viaTx ? "tx" : "stmt"}/`;
+      const seed = larva({ schema: dedupSchema, prefix, store, commitLog });
+      await seed.sql`SELECT COUNT(*) AS n FROM events`; // force init
+      const dbs = Array.from({ length: N }, () => larva({ schema: dedupSchema, prefix, store }));
+      const insertOnce = (db: (typeof dbs)[number], i: number, id: string, handle: string) => {
+        const run = (q: typeof db.sql) =>
+          q`INSERT INTO events (id, handle, writer) VALUES (${id}, ${handle}, ${String(i)}) ON CONFLICT (id) DO NOTHING RETURNING id`;
+        return viaTx ? db.transaction((tx) => run(tx.sql)) : run(db.sql);
+      };
+      const label = `${commitLog ? "log" : "cas"} ${viaTx ? "transaction" : "statement"}`;
+
+      const firsts = await Promise.all(dbs.map((db, i) => insertOnce(db, i, "evt-1", `h-pk-${i}`)));
+      const rows = await seed.sql`SELECT id FROM events WHERE id = ${"evt-1"}`;
+      const reported = firsts.filter((r) => r.length > 0).length;
+      ok(`${label}: concurrent same-pk ON CONFLICT DO NOTHING lands once`, rows.length === 1 && reported === 1, `rows=${rows.length} firsts=${reported}`);
+
+      const results = await Promise.allSettled(dbs.map((db, i) => insertOnce(db, i, `evt-u${i}`, "h-shared")));
+      const landed = results.filter((r) => r.status === "fulfilled").length;
+      const uniqueErrs = results.filter((r) => r.status === "rejected" && (r.reason as SqlError).code === "UNIQUE_CONFLICT").length;
+      const urows = await seed.sql`SELECT id FROM events WHERE handle = ${"h-shared"}`;
+      ok(`${label}: concurrent same UNIQUE value lands once`, urows.length === 1 && landed === 1 && uniqueErrs === N - 1, `rows=${urows.length} landed=${landed} unique_conflicts=${uniqueErrs}`);
+    }
+  }
 }
 
 server.stop();

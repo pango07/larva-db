@@ -1472,14 +1472,15 @@ export class Executor {
       }
     }
 
-    // Conflict detection against the snapshot (pruned lookup). Note:
-    // snapshot-isolated — two concurrent inserts of the same pk are write
-    // skew (Design §6) and not detected; ULID defaults make this moot.
+    // Conflict detection against the snapshot (pruned lookup). A concurrent
+    // insert of the same key is caught at apply time: see the recheck below.
     const pks = incoming.map((r) => r[schema.primaryKey]);
-    const candidates = (snap.manifest.tables[stmt.table]?.chunks ?? []).filter((ref) => {
+    const mayHold = (ref: ChunkRef): boolean => {
       if (!ref.stats || constraints.length > 1) return true; // unique constraints force full scan
       return pks.some((pk) => cmpScalar(ref.stats!.pkMin, pk) <= 0 && cmpScalar(ref.stats!.pkMax, pk) >= 0);
-    });
+    };
+    const plannedIds = new Set((snap.manifest.tables[stmt.table]?.chunks ?? []).map((c) => c.id));
+    const candidates = (snap.manifest.tables[stmt.table]?.chunks ?? []).filter(mayHold);
     // Copy (never mutate the chunk cache) and NULL-fill columns added by
     // ALTER TABLE, so DO UPDATE SET expressions can read them on old rows.
     const loaded = await Promise.all(
@@ -1642,6 +1643,11 @@ export class Executor {
       apply: (m) => {
         const t = m.tables[stmt.table];
         if (!t) return null;
+        // Uniqueness was checked against the planning snapshot only. A chunk
+        // that landed since (a racing insert, a rewrite) may hold a key we
+        // would duplicate — re-execute so the check runs against it. Without
+        // this, two disjoint-looking inserts of one pk both rebase and land.
+        if (resultRows.length > 0 && t.chunks.some((c) => !plannedIds.has(c.id) && mayHold(c))) return null;
         for (const { retired, replacement } of replacements) {
           const idx = t.chunks.findIndex((c) => c.id === retired.id);
           if (idx < 0) return null; // a touched chunk changed underneath us — re-execute
